@@ -1,0 +1,12 @@
+# Build outputs
+Output/
+Listings/
+
+# Keil IDE - user specific
+Project/DebugConfig/
+Project/JLinkLog.txt
+Project/JLinkSettings.ini
+Project/*.uvguix.*
+
+# Editor
+.vscode/
