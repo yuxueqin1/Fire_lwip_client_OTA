@@ -91,10 +91,10 @@
     "SubProType": 2,
     "FenjiNum": 10,
     "QueryPeriod": 100,
-    "SlaveModuelNum": 1,
+    "SlaveModuelNum": 2,
     "SlaveModuelAddress": [
       1,
-      0,
+      2,
       0,
       0,
       0,
@@ -128,7 +128,7 @@
     ],
     "SlaveModuelType": [
       49,
-      0,
+      50,
       0,
       0,
       0,

@@ -245,7 +245,7 @@ static void Test1_Task(void *parameter)
 {
     (void)parameter;
     while (1) {
-        LED1_TOGGLE;   //红色
+        // LED1_TOGGLE;   //红色
         vTaskDelay(1000);
     }
 }
@@ -275,7 +275,7 @@ static void App_Task_TcpSend(void *pvParameters)
          * 此处清零表示"发送任务仍在正常运行".
          */
         WDTTCPSENDFLAG = 0;
-        LED2_TOGGLE;  //debug:绿色 
+        
 
         /*
          * 调用 client.c 的发送函数:
@@ -456,7 +456,7 @@ static void uart_task_handler(void *pvParameters)
 
     while (1) {
 
-        LED3_TOGGLE;  //debug:蓝色
+        LED1_TOGGLE;  //debug:红色
         /* ---- 清零本端口 WDT 计数器 (告知 App_TaskStart 本任务存活) ---- */
         WDTUARTFLAG[port_idx] = 0;
         runtime.data_len = 0;

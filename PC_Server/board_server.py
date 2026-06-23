@@ -116,7 +116,7 @@ BAUD_RATE_MAP = {0: "未配置", 1: 9600, 2: 19200, 3: 38400, 4: 57600}
 # 每个模块类型对应: input_regs(输入寄存器数), holding_regs(保持寄存器数),
 #   has_alarm, uses_custom_curve, realtime_bytes
 MODULE_PROFILES = {
-    0x31: {"input_regs": 13,  "holding_regs": 0,   "has_alarm": 1, "uses_custom_curve": 0, "realtime_bytes": 0},
+    0x31: {"input_regs": 13,  "holding_regs": 11,   "has_alarm": 1, "uses_custom_curve": 0, "realtime_bytes": 0},
     0x32: {"input_regs": 13,  "holding_regs": 11,  "has_alarm": 1, "uses_custom_curve": 0, "realtime_bytes": 0},
     0x33: {"input_regs": 34,  "holding_regs": 32,  "has_alarm": 1, "uses_custom_curve": 0, "realtime_bytes": 0},
     0x34: {"input_regs": 10,  "holding_regs": 8,   "has_alarm": 1, "uses_custom_curve": 0, "realtime_bytes": 0},

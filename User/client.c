@@ -240,6 +240,8 @@ void client_send_pending(void)
         } while (retry-- > 0U);
 
         if (err == ERR_OK) {
+
+            LED2_TOGGLE;  //debug:绿色 
             /* 发送成功: 清空槽位 */
             if (tcp_queue_lock != NULL) {
                 xSemaphoreTake(tcp_queue_lock, portMAX_DELAY);

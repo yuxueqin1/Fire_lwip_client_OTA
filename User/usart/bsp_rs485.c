@@ -163,7 +163,7 @@ const UART_HW_Config_t uart_hw_config[UART_PORT_COUNT] = {
 static const UART_ModuleProfile_t uart_module_profiles[] = {
     /*  type,         in, hold, alarm, custom, rtbytes, dat_off, len_off, flag_off, seq_off, dir_off, branches */
     /* ---- 普通 Modbus 模块 (uses_custom_curve=0, 无曲线相关偏移) ---- */
-    {FLFXG_XHJ_KGL,  13, 0,    1,     0,      0,       0,       0,       0,        0,       0,       0},
+    {FLFXG_XHJ_KGL,  13, 11,    1,     0,      0,       0,       0,       0,        0,       0,       0},
     {FLFXG_XHJ,      13, 11,   1,     0,      0,       0,       0,       0,        0,       0,       0},
     {FLFXG_GD_25_J,  34, 32,   1,     0,      0,       0,       0,       0,        0,       0,       0},
     {FLFXG_DC_AC,    10, 8,    1,     0,      0,       0,       0,       0,        0,       0,       0},
@@ -523,6 +523,7 @@ void uart_wait_until_configured(uint8_t port_idx)
             WDTUARTFLAG[port_idx] = 0;  /* 喂狗: 告知看门狗本任务存活 */
         }
         vTaskDelay(pdMS_TO_TICKS(100));
+        
     }
 }
 
