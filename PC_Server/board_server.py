@@ -75,10 +75,11 @@ sys.stderr = _FilteredStderr(_sys_stderr)  # type: ignore[assignment]
 
 SERVER_PORT      = 5001
 LISTEN_BACKLOG   = 1
-RECV_BUF_SIZE    = 4096
+RECV_BUF_SIZE    = 16384
 UART_PORT_COUNT  = 6
 BOARD_CONFIG_BYTES = 450       # 6 ports × 75 bytes
 UART_MODULE_MAX_COUNT = 32
+MAX_FRAME_DATA_LEN  = 16384    # 最大允许的帧数据长度 (支持大寄存器模块)
 CONFIG_FILE      = "board_config.json"
 
 # ---- 命令字 ----
@@ -479,7 +480,7 @@ class TcpBoardServer(threading.Thread):
             data_len_field = self._recv_buf[offset + 5] | (self._recv_buf[offset + 6] << 8)
 
             # 合理性检查: data_len 不应超过合理范围 (最大约 RECV_BUF_SIZE)
-            if data_len_field > RECV_BUF_SIZE:
+            if data_len_field > MAX_FRAME_DATA_LEN:
                 # 非预期数据 (例如 debug testBuf), 跳过 1 字节后重试
                 offset += 1
                 continue
@@ -1038,7 +1039,7 @@ class BoardServerGUI:
             if slave_count > 0:
                 slaves = ", ".join(
                     f"0x{port['SlaveModuelType'][j]:02X}"
-                    for j in range(min(slave_count, 8))
+                    for j in range(slave_count)
                 )
                 self._log("info",
                     f"  端口{i+1}: {PORT_TYPE_MAP.get(port['PortType'], '?')} "
@@ -1168,7 +1169,8 @@ class ConfigEditorWindow:
         self.config = config
         self.window = tk.Toplevel(parent)
         self.window.title("板卡配置编辑器")
-        self.window.geometry("650x500")
+        self.window.geometry("780x680")
+        self.window.minsize(700, 600)
         self.window.resizable(True, True)
         self.window.transient(parent)
         self.window.grab_set()
@@ -1201,6 +1203,8 @@ class ConfigEditorWindow:
         ttk.Button(btn_frame, text="取消 (Cancel)", command=self.window.destroy).pack(
             side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="加载默认配置", command=self._load_defaults).pack(
+            side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="满配置 (13×0x48)", command=self._load_max_config).pack(
             side=tk.LEFT, padx=5)
 
     def _build_port_page(self, parent, port: dict, port_idx: int):
@@ -1461,6 +1465,91 @@ class ConfigEditorWindow:
                             "  端口2 (USART2): Modbus主站, 19200/8N1,\n"
                             "                  从机1台 (0x31 信号机开关量)\n"
                             "  其余端口: 未配置")
+
+    def _load_max_config(self):
+        """加载满配置: 端口2 = 13 × 0x48 (高频25Hz轨道接收, 133寄存器/台)。"""
+        FULL_COUNT = 13
+        FULL_TYPE = 0x48
+
+        for port_idx in range(UART_PORT_COUNT):
+            port = self.config.ports[port_idx]
+
+            if port_idx == 1:
+                defaults = {
+                    "PortNum":       2,
+                    "PortType":      4,     # Modbus主站
+                    "BautRate":      2,     # 19200
+                    "DataBit":       8,
+                    "StopBit":       1,
+                    "Parity":        0,
+                    "MainProType":   1,
+                    "SubProType":    2,
+                    "FenjiNum":      10,
+                    "QueryPeriod":   100,
+                    "SlaveModuelNum": FULL_COUNT,
+                }
+            else:
+                defaults = {
+                    "PortNum":       port_idx + 1,
+                    "PortType":      0,
+                    "BautRate":      2,
+                    "DataBit":       8,
+                    "StopBit":       1,
+                    "Parity":        0,
+                    "MainProType":   0,
+                    "SubProType":    0,
+                    "FenjiNum":      port_idx + 1,
+                    "QueryPeriod":   100,
+                    "SlaveModuelNum": 0,
+                }
+
+            for key, val in defaults.items():
+                port[key] = val
+                var = self.field_vars.get(f"{port_idx}_{key}")
+                if var is None:
+                    continue
+                choices = self.field_vars.get(f"{port_idx}_{key}_choices")
+                if choices is not None:
+                    display_text = None
+                    for text, v in choices:
+                        if v == val:
+                            display_text = text
+                            break
+                    if display_text is not None:
+                        var.set(display_text)
+                else:
+                    var.set(val)
+
+            # 清空所有从机
+            for i in range(UART_MODULE_MAX_COUNT):
+                port["SlaveModuelAddress"][i] = 0
+                port["SlaveModuelType"][i] = 0
+                addr_var = self.slave_vars.get(f"{port_idx}_addr_{i}")
+                if addr_var:
+                    addr_var.set(0)
+                type_var = self.slave_vars.get(f"{port_idx}_type_{i}")
+                if type_var:
+                    type_var.set("未配置")
+
+            # 端口2: 填充 13 台 0x48
+            if port_idx == 1:
+                for i in range(FULL_COUNT):
+                    port["SlaveModuelAddress"][i] = i + 1
+                    port["SlaveModuelType"][i]    = FULL_TYPE
+                    addr_var = self.slave_vars.get(f"{port_idx}_addr_{i}")
+                    if addr_var:
+                        addr_var.set(i + 1)
+                    type_var = self.slave_vars.get(f"{port_idx}_type_{i}")
+                    if type_var:
+                        type_var.set(f"0x{FULL_TYPE:02X} - 高频25Hz轨道接收器")
+
+        total_regs = FULL_COUNT * 133
+        messagebox.showinfo("满配置",
+            f"已加载满配置:\n"
+            f"  端口2 (USART2): Modbus主站, 19200/8N1,\n"
+            f"  从机: {FULL_COUNT} 台 0x48 (高频25Hz轨道接收器)\n"
+            f"  每台 133 个输入寄存器, 共 {total_regs} 个寄存器\n"
+            f"  总帧长约 {total_regs * 2 + 11} 字节")
 
 
 # ============================================================================

@@ -9,22 +9,6 @@
     "rs485_delay_ms": 1
   },
   "devices": [
-    {"address": 1,  "module_type": "0x31", "comment": "信号机开关量"},
-    {"address": 2,  "module_type": "0x32", "comment": "信号机"},
-    {"address": 3,  "module_type": "0x33", "comment": "25Hz轨道接收"},
-    {"address": 4,  "module_type": "0x34", "comment": "DC/AC转换器"},
-    {"address": 5,  "module_type": "0x35", "comment": "25Hz轨道发送"},
-    {"address": 6,  "module_type": "0x36", "comment": "采集模块"},
-    {"address": 7,  "module_type": "0x37", "curve_mode": "realtime", "comment": "交流转辙机(仅实时)"},
-    {"address": 8,  "module_type": "0x38", "curve_mode": "curve",   "comment": "直流四线制(带曲线)"},
-    {"address": 9,  "module_type": "0x39", "curve_mode": "realtime", "comment": "直流六线制(仅实时)"},
-    {"address": 10, "module_type": "0x47", "comment": "高频信号机"},
-    {"address": 11, "module_type": "0x48", "allow_extended_read": true, "comment": "高频轨道接收(133寄存器)"},
-    {"address": 12, "module_type": "0x49", "comment": "高频轨道发送"},
-    {"address": 13, "module_type": "0x4A", "comment": "高频采集"},
-    {"address": 14, "module_type": "0x4B", "curve_mode": "curve",   "comment": "高频交流转辙机(带曲线)"},
-    {"address": 15, "module_type": "0x4C", "curve_mode": "realtime", "comment": "高频直流四线制(仅实时)"},
-    {"address": 16, "module_type": "0x4D", "curve_mode": "curve",   "comment": "高频直流六线制(带曲线)"}
   ],
   "simulation": {
     "alarm_probability": 0.02,

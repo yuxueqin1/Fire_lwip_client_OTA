@@ -374,6 +374,76 @@ class SimulatorThread(threading.Thread):
                          f"设备 0x{addr:02X} 已更新为 0x{module_type:02X} {name}")
         return name
 
+    def add_device(self, addr: int, module_type, *,
+                   curve_mode: str = "realtime",
+                   allow_extended_read: bool = False,
+                   curve_frames_per_cycle: int = 8,
+                   curve_points_per_frame: int = 25,
+                   silent: bool = False) -> Optional[str]:
+        """运行时添加一台新设备。返回新模块名称或 None (地址冲突时)。
+
+        Args:
+            silent: True 时不发事件通知 (用于批量操作, 如满配置)。
+        """
+        if isinstance(module_type, str):
+            module_type = int(module_type, 16) if module_type.startswith("0x") else int(module_type)
+
+        with self._lock:
+            if addr in self._devices:
+                if not silent:
+                    self._post_event("warning",
+                                     f"地址 0x{addr:02X} 已被占用, 请先删除或编辑该设备")
+                return None
+
+            sim_cfg = self._config.get("simulation", {})
+            device = SlaveDevice(
+                address=addr,
+                module_type=module_type,
+                curve_mode=curve_mode,
+                curve_frames_per_cycle=curve_frames_per_cycle,
+                curve_points_per_frame=curve_points_per_frame,
+                allow_extended_read=allow_extended_read,
+                alarm_probability=sim_cfg.get("alarm_probability", 0.02),
+                sine_period_s=sim_cfg.get("sine_period_seconds", 10.0),
+                random_walk_step=sim_cfg.get("random_walk_step", 5.0),
+            )
+            self._devices[addr] = device
+
+        name = get_module_name(module_type)
+        if not silent:
+            self._post_event("device_added", {
+                "address": addr,
+                "module_type": device.module_type,
+                "name": name,
+                "is_curve_capable": device.is_curve_capable,
+                "curve_mode": device.curve_mode or "N/A",
+                "input_regs": device.profile.input_regs,
+                "is_high_frequency": device.profile.is_high_frequency,
+            })
+            self._post_event("info",
+                             f"已添加设备 0x{addr:02X} — 0x{module_type:02X} {name}")
+        return name
+
+    def remove_device(self, addr: int) -> bool:
+        """运行时删除一台设备。返回 True 成功。"""
+        with self._lock:
+            if addr not in self._devices:
+                return False
+            del self._devices[addr]
+        self._post_event("device_removed", addr)
+        self._post_event("info", f"已删除设备 0x{addr:02X}")
+        return True
+
+    def remove_all_devices(self, silent: bool = False) -> int:
+        """删除所有设备。返回删除数量。"""
+        with self._lock:
+            count = len(self._devices)
+            self._devices.clear()
+        if not silent:
+            self._post_event("devices_cleared", count)
+            self._post_event("info", f"已清除全部 {count} 台设备")
+        return count
+
     def get_device(self, addr: int) -> Optional[SlaveDevice]:
         with self._lock:
             return self._devices.get(addr)
@@ -600,9 +670,16 @@ class SlaveSimulatorGUI:
 
         btn_row2 = ttk.Frame(act_frame)
         btn_row2.pack(fill=tk.X)
+        ttk.Button(btn_row2, text="添加设备",
+                   command=self._add_device).pack(side=tk.LEFT, padx=(0, 5))
+
         self.edit_btn = ttk.Button(btn_row2, text="编辑设备",
                                    command=self._edit_device, state=tk.DISABLED)
         self.edit_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.del_btn = ttk.Button(btn_row2, text="删除设备",
+                                  command=self._delete_device, state=tk.DISABLED)
+        self.del_btn.pack(side=tk.LEFT, padx=(0, 5))
 
         self.curve_btn = ttk.Button(btn_row2, text="切换曲线模式",
                                     command=self._toggle_curve, state=tk.DISABLED)
@@ -638,8 +715,16 @@ class SlaveSimulatorGUI:
                                    font=("Microsoft YaHei", 8), foreground="gray")
         self.cfg_label.pack(anchor=tk.W)
 
-        ttk.Button(cfg_frame, text="重新加载配置",
-                   command=self._reload_config).pack(fill=tk.X, pady=(5, 0))
+        cfg_btn_row = ttk.Frame(cfg_frame)
+        cfg_btn_row.pack(fill=tk.X, pady=(5, 0))
+        ttk.Button(cfg_btn_row, text="重新加载配置",
+                   command=self._reload_config).pack(side=tk.LEFT, fill=tk.X,
+                   expand=True, padx=(0, 3))
+        ttk.Button(cfg_btn_row, text="满配置",
+                   command=self._fill_max_config).pack(side=tk.RIGHT,
+                   padx=(3, 0))
+        ttk.Button(cfg_btn_row, text="清空设备",
+                   command=self._clear_all_devices).pack(side=tk.RIGHT)
 
     def _build_log_panel(self, parent):
         """右侧日志区。"""
@@ -716,22 +801,20 @@ class SlaveSimulatorGUI:
         self.sim = SimulatorThread()
 
         if not self.sim.load_config(self._config_path):
-            self._log("warning", "未找到配置文件, 使用默认配置")
-            # 创建最小默认配置
-            default_cfg = {
+            self._log("warning", "未找到配置文件, 使用空白配置 (请手动添加从机设备)")
+            # 空白配置: 不预创建任何从机设备, 由用户逐个添加
+            self.sim._config = {
                 "serial": {"port": "COM5", "baudrate": 19200, "bytesize": 8,
                           "parity": "N", "stopbits": 1, "timeout": 0.005,
                           "rs485_delay_ms": 1},
-                "devices": [
-                    {"address": i + 1, "module_type": f"0x{0x30 + i + 1:02X}"}
-                    for i in range(6)
-                ],
+                "devices": [],
                 "simulation": {},
             }
-            self.sim._config = default_cfg
 
         self.sim.create_devices()
         self._populate_device_list()
+        if len(self.sim.get_devices()) == 0:
+            self._log("info", "当前无设备 — 请使用「添加设备」按钮手动添加从机")
         self.sim.start()
 
         self._draw_status_dot("gray")
@@ -882,6 +965,45 @@ class SlaveSimulatorGUI:
         elif etype == "simulator_stopped":
             self._log("warning", str(msg))
 
+        elif etype == "device_removed":
+            # 从设备列表中移除
+            iid = str(msg)
+            if self.dev_tree.exists(iid):
+                self.dev_tree.delete(iid)
+            # 如果寄存器监视器正在监视该设备, 关闭它
+            if (self.register_watch is not None
+                    and self.register_watch.address == msg):
+                try:
+                    self.register_watch.window.destroy()
+                except tk.TclError:
+                    pass
+                self.register_watch = None
+            # 如果被删除的是当前选中的设备, 清除选中状态
+            if self._selected_addr == msg:
+                self._selected_addr = None
+                self.curve_btn.config(state=tk.DISABLED)
+                self.watch_btn.config(state=tk.DISABLED)
+                self.edit_btn.config(state=tk.DISABLED)
+                self.del_btn.config(state=tk.DISABLED)
+                self.sel_dev_label.config(text="请从列表中选中一台设备")
+                self.sel_dev_info.config(text="")
+
+        elif etype == "devices_cleared":
+            # 清空设备列表
+            for item in self.dev_tree.get_children():
+                self.dev_tree.delete(item)
+            self._selected_addr = None
+            self.curve_btn.config(state=tk.DISABLED)
+            self.watch_btn.config(state=tk.DISABLED)
+            self.edit_btn.config(state=tk.DISABLED)
+            self.del_btn.config(state=tk.DISABLED)
+            self.sel_dev_label.config(text="请从列表中选中一台设备")
+            self.sel_dev_info.config(text="")
+            self._log("warning", f"已清除全部 {msg} 台设备")
+
+        elif etype == "warning":
+            self._log("warning", str(msg))
+
         elif etype == "info":
             self._log("info", str(msg))
 
@@ -992,6 +1114,7 @@ class SlaveSimulatorGUI:
             self.curve_btn.config(state=tk.DISABLED)
             self.watch_btn.config(state=tk.DISABLED)
             self.edit_btn.config(state=tk.DISABLED)
+            self.del_btn.config(state=tk.DISABLED)
             self.sel_dev_label.config(text="请从列表中选中一台设备")
             self.sel_dev_info.config(text="")
             return
@@ -1027,6 +1150,7 @@ class SlaveSimulatorGUI:
 
         self.watch_btn.config(state=tk.NORMAL)
         self.edit_btn.config(state=tk.NORMAL)
+        self.del_btn.config(state=tk.NORMAL)
 
     # ================================================================
     #  按钮操作
@@ -1106,6 +1230,96 @@ class SlaveSimulatorGUI:
         self._log("info",
                   f"已打开设备 {self._selected_addr} 的寄存器监视器")
 
+    def _add_device(self):
+        """打开添加设备对话框。"""
+        dialog = AddDeviceDialog(self.root, self.sim)
+        self.root.wait_window(dialog.window)
+
+        if dialog.result is None:
+            return
+
+        addr = dialog.result["address"]
+        mtype = dialog.result["module_type"]
+        self.sim.add_device(
+            addr, mtype,
+            curve_mode=dialog.result["curve_mode"],
+            allow_extended_read=dialog.result["allow_extended_read"],
+            curve_frames_per_cycle=dialog.result["curve_frames_per_cycle"],
+            curve_points_per_frame=dialog.result["curve_points_per_frame"],
+        )
+        # add_device() 内部已发事件通知, 此处不再重复日志
+        self._populate_device_list()
+        # 选中新设备
+        iid = str(addr)
+        if self.dev_tree.exists(iid):
+            self.dev_tree.selection_set(iid)
+            self.dev_tree.see(iid)
+            self._on_device_select(None)
+
+    def _delete_device(self):
+        """删除选中的设备。"""
+        if self._selected_addr is None or self.sim is None:
+            return
+        addr = self._selected_addr
+        if not messagebox.askyesno("确认删除",
+                                   f"确定要删除设备 0x{addr:02X} 吗？"):
+            return
+        if self.sim.remove_device(addr):
+            self._log("warning", f"已删除设备 0x{addr:02X}")
+
+    def _clear_all_devices(self):
+        """清空全部设备。"""
+        if self.sim is None:
+            return
+        devices = self.sim.get_devices()
+        if not devices:
+            self._log("info", "当前无设备, 无需清空")
+            return
+        if not messagebox.askyesno("确认清空",
+                                   f"确定要删除全部 {len(devices)} 台设备吗？"):
+            return
+        self.sim.remove_all_devices()
+
+    def _fill_max_config(self):
+        """满配置: 13 台 0x48 高频25Hz轨道接收模块 (每台 133 个输入寄存器)。
+
+        全部 13 台分配到地址 1-13, 总共 13×133 = 1729 个输入寄存器。
+        用于测试串口最大数据承受量。静默操作, 不在日志中逐条打印。
+        """
+        if self.sim is None:
+            return
+
+        devices = self.sim.get_devices()
+        if devices:
+            if not messagebox.askyesno(
+                    "确认满配置",
+                    f"当前已有 {len(devices)} 台设备。\n\n"
+                    "满配置将清空现有设备并创建 13 台 0x48 设备\n"
+                    "(高频25Hz轨道接收, 每台 133 个输入寄存器)。\n\n"
+                    "是否继续？"):
+                return
+
+        MAX_ADDR = 0x48  # 高频25Hz轨道接收 (133 regs)
+
+        # 静默清空+静默添加, 不触发逐条事件
+        self.sim.remove_all_devices(silent=True)
+
+        total_regs = 0
+        for addr in range(1, 14):
+            total_regs += 133
+            self.sim.add_device(
+                addr, MAX_ADDR,
+                curve_mode="realtime",
+                allow_extended_read=True,
+                silent=True,
+            )
+
+        # 直接刷新设备列表 + 一条汇总日志
+        self._populate_device_list()
+        self._log("success",
+                  f"满配置已就绪: 13 台 0x48 设备, "
+                  f"共 {total_regs} 个输入寄存器 (每台 133)")
+
     # ================================================================
     #  生命周期
     # ================================================================
@@ -1124,6 +1338,202 @@ class SlaveSimulatorGUI:
         if self.sim:
             self.sim.stop()
         self.root.destroy()
+
+
+# ============================================================================
+# 添加设备弹窗
+# ============================================================================
+
+class AddDeviceDialog:
+    """添加新设备弹窗 — 选择地址和模块类型。"""
+
+    def __init__(self, parent, sim: SimulatorThread):
+        self.sim = sim
+        self.result: Optional[dict] = None
+
+        self.window = tk.Toplevel(parent)
+        self.window.title("添加从机设备")
+        self.window.geometry("640x640")
+        self.window.resizable(True, True)
+        self.window.minsize(580, 580)
+        self.window.transient(parent)
+        self.window.grab_set()
+
+        self._build()
+        # 居中
+        self.window.update_idletasks()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        ww, wh = 640, 640
+        x = parent.winfo_rootx() + (pw - ww) // 2
+        y = parent.winfo_rooty() + (ph - wh) // 2
+        self.window.geometry(f"+{x}+{y}")
+
+    def _build(self):
+        """构建界面。"""
+        main = ttk.Frame(self.window, padding=20)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        # ---- 地址 ----
+        ttk.Label(main, text="从机地址 (1-247):",
+                  font=("Microsoft YaHei", 11, "bold")).pack(anchor=tk.W, pady=(0, 5))
+
+        addr_frame = ttk.Frame(main)
+        addr_frame.pack(fill=tk.X, pady=(0, 15))
+
+        # 自动推荐下一个可用地址
+        existing = self.sim.get_devices()
+        suggested = 1
+        while suggested in existing:
+            suggested += 1
+        if suggested > 247:
+            suggested = 1  # 回退
+
+        self.addr_var = tk.IntVar(value=suggested)
+        ttk.Spinbox(addr_frame, textvariable=self.addr_var, from_=1, to=247,
+                    width=8, font=("Microsoft YaHei", 11)).pack(side=tk.LEFT)
+        ttk.Label(addr_frame, text=f"  (建议: {suggested}, 已占用: "
+                  f"{sorted(existing.keys()) if existing else '无'})",
+                  font=("Microsoft YaHei", 8), foreground="gray").pack(
+            side=tk.LEFT, padx=5)
+
+        # ---- 模块类型 ----
+        ttk.Label(main, text="模块类型:",
+                  font=("Microsoft YaHei", 11, "bold")).pack(anchor=tk.W, pady=(0, 8))
+
+        type_frame = ttk.Frame(main)
+        type_frame.pack(fill=tk.X, pady=(0, 10))
+
+        type_names = [f"0x{k:02X} — {v}" for k, v in MODULE_TYPE_NAMES.items() if k != 0]
+        self.type_var = tk.StringVar(value=type_names[0])
+
+        self.type_combo = ttk.Combobox(type_frame, textvariable=self.type_var,
+                                       values=type_names, state="readonly", width=42,
+                                       font=("Microsoft YaHei", 10))
+        self.type_combo.pack(fill=tk.X, ipady=2)
+        self.type_combo.bind("<<ComboboxSelected>>", self._on_type_changed)
+
+        # ---- 设备信息 ----
+        self.info_var = tk.StringVar()
+        self._update_info_text(type_names[0])
+        ttk.Label(main, textvariable=self.info_var,
+                  font=("Microsoft YaHei", 9), foreground="gray").pack(
+            anchor=tk.W, pady=(0, 12))
+
+        # ---- 曲线模式 ----
+        self.curve_frame = ttk.LabelFrame(main, text="自定义曲线设置", padding=12)
+        self.curve_frame.pack(fill=tk.X, pady=(0, 12))
+
+        self.curve_var = tk.StringVar(value="realtime")
+        ttk.Radiobutton(self.curve_frame, text="仅实时数据 (realtime)",
+                        variable=self.curve_var, value="realtime").pack(anchor=tk.W, pady=3)
+        ttk.Radiobutton(self.curve_frame, text="包含曲线数据 (curve)",
+                        variable=self.curve_var, value="curve").pack(anchor=tk.W, pady=3)
+
+        # 曲线帧参数
+        param_row = ttk.Frame(self.curve_frame)
+        param_row.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(param_row, text="每周期帧数:").pack(side=tk.LEFT)
+        self.fpc_var = tk.IntVar(value=8)
+        ttk.Spinbox(param_row, textvariable=self.fpc_var, from_=2, to=50,
+                    width=5).pack(side=tk.LEFT, padx=(5, 20))
+        ttk.Label(param_row, text="每帧点数:").pack(side=tk.LEFT)
+        self.ppf_var = tk.IntVar(value=25)
+        ttk.Spinbox(param_row, textvariable=self.ppf_var, from_=5, to=25,
+                    width=5).pack(side=tk.LEFT, padx=5)
+
+        # ---- 扩展读 ----
+        self.ext_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(main, text="允许扩展读 (>125 寄存器)",
+                        variable=self.ext_var).pack(anchor=tk.W, pady=(0, 12))
+
+        # 初始化控件状态
+        self._on_type_changed()
+
+        # ---- 按钮 ----
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(btn_frame, text="添加 (Add)", command=self._save).pack(
+            side=tk.RIGHT, padx=(5, 0), ipadx=8, ipady=2)
+        ttk.Button(btn_frame, text="取消 (Cancel)",
+                   command=self.window.destroy).pack(side=tk.RIGHT, ipadx=8, ipady=2)
+
+    def _on_type_changed(self, event=None):
+        """模块类型切换时, 更新信息显示和控件状态。"""
+        type_str = self.type_var.get()
+        self._update_info_text(type_str)
+
+        try:
+            mtype = int(type_str.split(" ")[0].replace("0x", ""), 16)
+        except (ValueError, IndexError):
+            return
+
+        profile = get_profile(mtype)
+
+        if profile.is_custom_curve:
+            for child in self.curve_frame.winfo_children():
+                child.configure(state=tk.NORMAL)
+        else:
+            for child in self.curve_frame.winfo_children():
+                try:
+                    child.configure(state=tk.DISABLED)
+                except tk.TclError:
+                    pass
+
+        self.ext_var.set(profile.exceeds_125_regs)
+
+    def _update_info_text(self, type_str: str):
+        """更新设备信息文本。"""
+        try:
+            mtype = int(type_str.split(" ")[0].replace("0x", ""), 16)
+        except (ValueError, IndexError):
+            return
+
+        profile = get_profile(mtype)
+        is_curve = "是" if profile.is_custom_curve else "否"
+        is_hf = "是" if profile.is_high_frequency else "否"
+        self.info_var.set(
+            f"输入寄存器: {profile.input_regs}  |  "
+            f"保持寄存器: {profile.holding_regs}  |  "
+            f"自定义曲线: {is_curve}  |  "
+            f"高频模块: {is_hf}"
+            + (f"  |  曲线分支数: {profile.curve_branch_count}"
+               if profile.is_custom_curve else "")
+        )
+
+    def _save(self):
+        """保存并关闭。"""
+        addr = self.addr_var.get()
+        if not (1 <= addr <= 247):
+            messagebox.showwarning("输入错误",
+                                   "地址必须在 1-247 之间", parent=self.window)
+            return
+
+        # 检查地址冲突
+        existing = self.sim.get_devices()
+        if addr in existing:
+            if not messagebox.askyesno(
+                    "地址冲突",
+                    f"地址 {addr} 已被设备 0x{existing[addr].module_type:02X} 占用。\n\n"
+                    "确定将覆盖该设备吗？",
+                    parent=self.window):
+                return
+
+        type_str = self.type_var.get()
+        try:
+            mtype = int(type_str.split(" ")[0].replace("0x", ""), 16)
+        except (ValueError, IndexError):
+            messagebox.showwarning("输入错误", "无法解析模块类型", parent=self.window)
+            return
+
+        self.result = {
+            "address": addr,
+            "module_type": mtype,
+            "curve_mode": self.curve_var.get(),
+            "allow_extended_read": self.ext_var.get(),
+            "curve_frames_per_cycle": self.fpc_var.get(),
+            "curve_points_per_frame": self.ppf_var.get(),
+        }
+        self.window.destroy()
 
 
 # ============================================================================

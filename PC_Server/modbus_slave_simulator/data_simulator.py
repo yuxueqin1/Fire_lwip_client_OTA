@@ -159,22 +159,12 @@ class DataSimulator:
     # ------------------------------------------------------------------
 
     def _build_generators(self) -> list[_RegisterGen]:
-        """Create a generator per register based on the module profile."""
-        p = self._profile
-        n = p.input_regs
-        gens: list[_RegisterGen] = []
+        """Create a generator per register — all initialised to 0.
 
-        # Register 0: status (always online = 1 for simulation)
-        gens.append(_ConstReg(1))
-
-        # Register 1: alarm bits (occasionally set based on probability)
-        gens.append(self._make_alarm_gen())
-
-        # Remaining registers: simulated data based on register index
-        for i in range(2, n):
-            gens.append(self._make_data_gen(i, n))
-
-        return gens
+        用户可根据测试需要, 通过寄存器监视器手动修改任意寄存器值。
+        """
+        n = self._profile.input_regs
+        return [_ConstReg(0) for _ in range(n)]
 
     def _make_alarm_gen(self) -> _RegisterGen:
         """Generator for the alarm register (index 1)."""
