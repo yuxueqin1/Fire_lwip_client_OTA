@@ -181,7 +181,7 @@ static const UART_ModuleProfile_t uart_module_profiles[] = {
     {FLFXG_NEW_XHJ,       50, 48,   1,     0,      0,       0,       0,       0,        0,       0,       0},
     /* GD_25_J_HIGH: 高频25Hz轨道接收, 133 个输入寄存器                    */
     {FLFXG_GD_25_J_HIGH,  133,131,  1,     0,      0,       0,       0,       0,        0,       0,       0},
-    /* GD_25_F_HIGH: 高频25Hz发送, 117 个输入寄存器                       */
+    /* GD_25_F_HIGH: 高频25Hz轨道发送, 117 个输入寄存器                       */
     {FLFXG_GD_25_F_HIGH,  117,115,  1,     0,      0,       0,       0,       0,        0,       0,       0},
     /* CL_HIGH:      高频采集, 62 个输入寄存器                            */
     {FLFXG_CL_HIGH,       62, 60,   1,     0,      0,       0,       0,       0,        0,       0,       0},
@@ -348,7 +348,7 @@ eMBErrorCode uart_init_port(uint8_t port_idx, uint32_t baud_rate, xMBMHandle *px
 /*  6 路串口引脚映射:                                                     */
 /*    端口     UART外设    TX      RX      EN(DE)                          */
 /*    USART1  USART1     PA9     PA10    PA11                             */
-/*    USART2  USART2     PD5     PD6     PD4                              */
+/*    USART2  USART2     PD5     PD6     PD11   //debug:PD4改成PD11,因为现在在用调试板测试                           */
 /*    USART3  USART3     PB10    PB11    PH6                              */
 /*    UART4   UART4      PC10    PC11    PA15                             */
 /*    UART5   UART5      PC12    PD2     PA15                             */
@@ -384,11 +384,11 @@ eMBErrorCode uart_init_custom_raw(uint8_t port_idx, uint32_t baud_rate)
         __HAL_RCC_GPIOA_CLK_ENABLE();
         __HAL_RCC_USART1_CLK_ENABLE();
         break;
-    case 1:  /* USART2: TX=PD5(AF7), RX=PD6(AF7), DE=PD4 */
+    case 1:  /* USART2: TX=PD5(AF7), RX=PD6(AF7), DE=PD11 */
         uart_instance   = USART2;
         gpio_port_tx    = GPIOD;  gpio_pin_tx = GPIO_PIN_5;   af_tx = GPIO_AF7_USART2;
         gpio_port_rx    = GPIOD;  gpio_pin_rx = GPIO_PIN_6;   af_rx = GPIO_AF7_USART2;
-        gpio_port_de    = GPIOD;  gpio_pin_de = GPIO_PIN_4;
+        gpio_port_de    = GPIOD;  gpio_pin_de = GPIO_PIN_11;// debug:PD4改成PD11,因为现在在用调试板测试
         __HAL_RCC_GPIOD_CLK_ENABLE();
         __HAL_RCC_USART2_CLK_ENABLE();
         break;

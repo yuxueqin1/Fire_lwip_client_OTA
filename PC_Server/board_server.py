@@ -51,6 +51,24 @@ from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
 
+# ---- 抑制 Windows tkinter 主题的 "Can't find filter element" 噪音 ----
+# 该警告来自 Windows visual styles API, 不影响功能, 但会污染命令行输出.
+# 在创建任何 tk widget 之前重定向 stderr 以过滤该警告.
+import io as _io
+
+class _FilteredStderr:
+    """过滤掉 tkinter 主题相关的无害警告。"""
+    def __init__(self, real_stderr):
+        self._real = real_stderr
+    def write(self, s):
+        if "Can't find filter element" not in s:
+            self._real.write(s)
+    def flush(self):
+        self._real.flush()
+
+_sys_stderr = sys.stderr
+sys.stderr = _FilteredStderr(_sys_stderr)  # type: ignore[assignment]
+
 # ============================================================================
 # 常量定义 (与嵌入式代码保持一致)
 # ============================================================================
@@ -148,9 +166,9 @@ PORT_TYPE_MAP = {0: "禁用", 1: "自定义曲线", 3: "Modbus 从机", 4: "Modb
 MODULE_TYPE_MAP = {
     0x00: "未配置",
     0x31: "信号机开关量",   0x32: "信号机",       0x33: "25Hz 轨道接收器",
-    0x34: "DC/AC 转换器",  0x35: "25Hz 发送器",   0x36: "采集模块",
-    0x37: "交流转辙机",    0x38: "直流四线制",    0x39: "直流六线制",
-    0x47: "高频信号机",    0x48: "高频轨道接收器", 0x49: "高频发送器",
+    0x34: "DC/AC 转换器",  0x35: "25Hz 轨道发送器",   0x36: "采集模块",
+    0x37: "交流转辙机",    0x38: "直流四线制道岔",    0x39: "直流六线制道岔",
+    0x47: "高频信号机",    0x48: "高频25Hz轨道接收器", 0x49: "高频25Hz轨道发送器",
     0x4A: "高频采集模块",  0x4B: "高频交流转辙机", 0x4C: "高频直流四线制",
     0x4D: "高频直流六线制",
 }
@@ -183,7 +201,7 @@ class BoardConfig:
                     "Parity":        0,   # 无校验
                     "MainProType":   1,
                     "SubProType":    2,
-                    "FenjiNum":      10,
+                    "FenjiNum":      2,
                     "QueryPeriod":   100,
                     "SlaveModuelNum": 1,
                     "SlaveModuelAddress": [0] * UART_MODULE_MAX_COUNT,
@@ -867,15 +885,22 @@ class BoardServerGUI:
         try:
             while True:
                 event = self.server.event_queue.get_nowait()
-                self._process_event(event)
+                try:
+                    self._process_event(event)
+                except Exception as e:
+                    # 单个事件处理异常不应中断整个轮询循环
+                    self._log("error", f"事件处理异常: {e}")
                 msg_count += 1
         except queue.Empty:
             pass
 
         if msg_count > 0:
             # 更新消息计数
-            current = int(self.msg_count_label.cget("text").split(": ")[-1])
-            self.msg_count_label.config(text=f"消息: {current + msg_count}")
+            try:
+                current = int(self.msg_count_label.cget("text").split(": ")[-1])
+                self.msg_count_label.config(text=f"消息: {current + msg_count}")
+            except Exception:
+                pass
 
         self.root.after(100, self._poll_events)
 
@@ -959,7 +984,12 @@ class BoardServerGUI:
                     self._log("data", summary)
                 # 转发给串口监视器 (不限速, 全量)
                 if self.serial_monitor is not None:
-                    self.serial_monitor.handle_frame(msg)
+                    try:
+                        # 确认窗口存活后再转发
+                        if self.serial_monitor.window.winfo_exists():
+                            self.serial_monitor.handle_frame(msg)
+                    except tk.TclError:
+                        self.serial_monitor = None
             else:
                 # 旧格式兼容: 纯字符串
                 if self.show_data_frames.get():
@@ -1050,7 +1080,7 @@ class BoardServerGUI:
             self.serial_monitor = None
             self._log("info", "串口监视器已关闭")
         else:
-            self.serial_monitor = SerialDataMonitor(self.root, self.config)
+            self.serial_monitor = SerialDataMonitor(self.root, self.config, self)
             self._log("info", "串口监视器已打开")
 
     # ================================================================
@@ -1443,8 +1473,9 @@ class SerialDataMonitor:
     可在 6 个串口之间随时切换, 不限速显示所有帧。
     """
 
-    def __init__(self, parent, config: BoardConfig):
-        self.parent = parent
+    def __init__(self, parent, config: BoardConfig, main_window=None):
+        self.parent = parent          # Tk 父窗口 (用于 Toplevel)
+        self.main_window = main_window  # BoardServerGUI 实例 (用于清理引用)
         self.config = config
         self.paused = False
         self.current_port = 1
@@ -1947,8 +1978,8 @@ class SerialDataMonitor:
 
     def _on_close(self):
         """关闭窗口时清理 MainWindow 中的引用。"""
-        if hasattr(self.parent, 'serial_monitor'):
-            self.parent.serial_monitor = None
+        if self.main_window is not None:
+            self.main_window.serial_monitor = None
         self.window.destroy()
 
 
