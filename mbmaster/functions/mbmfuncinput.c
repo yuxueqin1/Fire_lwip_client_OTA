@@ -27,7 +27,7 @@
 
 /* ----------------------- Defines ------------------------------------------*/
 #define MBM_FUNC_RD_INPUT_REG                   ( 0x04 )
-#define MBM_PDU_FUNC_RD_REGCNT_MAX              ( 0x007D )
+#define MBM_PDU_FUNC_RD_REGCNT_MAX              ( 0x00FA )  /* 250: 放宽以支持 0x48 等大寄存器模块 (>125 regs) */
 #define MBM_PDU_FUNC_RD_RESP_SIZE_BYTECNT_OFF   ( MB_PDU_DATA_OFF )
 #define MBM_PDU_FUNC_RD_RESP_REGS_OFF           ( MBM_PDU_FUNC_RD_RESP_SIZE_BYTECNT_OFF + 1 )
 
@@ -105,7 +105,7 @@ vMBMReadInputRegistersPolled( xMBHandle xHdl, UCHAR ucSlaveAddress, USHORT usReg
             *peState = MBM_STATE_DONE;
             if( ( MBM_PDU_FUNC_RD_RESP_SIZE( ubNRegs ) == pxIntHdl->usFrameMBPDULength ) &&
                 ( MBM_FUNC_RD_INPUT_REG == pxIntHdl->pubFrameMBPDUBuffer[MB_PDU_FUNC_OFF] ) &&
-                ( ( 2 * ubNRegs ) == pxIntHdl->pubFrameMBPDUBuffer[MBM_PDU_FUNC_RD_RESP_SIZE_BYTECNT_OFF] ) )
+                ( ( ( 2 * ubNRegs ) & 0xFF ) == pxIntHdl->pubFrameMBPDUBuffer[MBM_PDU_FUNC_RD_RESP_SIZE_BYTECNT_OFF] ) )
             {
 
                 /* A pointer pointing to the first register value in the stream. */

@@ -55,7 +55,7 @@
 /*  队列数 = UART_PORT_COUNT (6路串口) + 1 (控制通道/日志)                */
 /*======================================================================*/
 #define TCP_SEND_QUEUE_COUNT           (UART_PORT_COUNT + 1U)
-#define TCP_SEND_BUF_SIZE              1536U
+#define TCP_SEND_BUF_SIZE              4096U   /* 4KB: 匹配 UART_SERIAL_BUF_SIZE */
 #define TCP_RECV_BUF_SIZE              512U
 #define TCP_SEND_RETRY_COUNT           10U     /* 单帧发送重试次数 */
 #define TCP_RECV_ERR_MAX               200U      /* 连续接收错误阈值 → 重连 */

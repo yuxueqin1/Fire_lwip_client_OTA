@@ -36,7 +36,7 @@
 /* ----------------------- Defines ------------------------------------------*/
 #define MBM_SER_PDU_SIZE_MIN            ( 4 )   /*!< Minimum size of a MODBUS RTU frame. */
 #if !defined( MBM_SER_PDU_SIZE_MAX )
-#define MBM_SER_PDU_SIZE_MAX            ( 256 ) /*!< Maximum size of a MODBUS RTU frame. */
+#define MBM_SER_PDU_SIZE_MAX            ( 512 ) /*!< Maximum size of a MODBUS RTU frame (扩大以支持 >125 寄存器). */
 #endif
 #define MBM_SER_PDU_SIZE_CRC            ( 2 )   /*!< Size of CRC field in PDU. */
 #define MBM_SER_PDU_ADDR_OFF            ( 0 )   /*!< Offset of slave address in RTU frame. */

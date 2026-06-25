@@ -24,7 +24,7 @@ typedef struct {
 } BoardConfig_t;
 
 #define UART_PORT_COUNT             6
-#define UART_SERIAL_BUF_SIZE        (2 * 1024)
+#define UART_SERIAL_BUF_SIZE        (4 * 1024)  /* 4KB: 支持 13×0x48≈3.5KB, 余量~15台 */
 #define UART_PORT_DISABLED          0
 #define UART_PORT_CUSTOM            1
 #define UART_PORT_SLAVE             3
