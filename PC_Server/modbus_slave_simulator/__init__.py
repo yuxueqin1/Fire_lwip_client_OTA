@@ -1,0 +1,10 @@
+"""
+Modbus Slave Simulator — PC-side simulator for STM32 RS485 slave modules.
+
+Simulates all 14 module types:
+  - Standard Modbus (0x31-0x36, 0x47-0x4A) via function code 0x04
+  - Custom curve protocol (0x37-0x39, 0x4B-0x4D) via custom serial protocol
+
+Usage:
+    python -m modbus_slave_simulator -c config.json
+"""

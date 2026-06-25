@@ -10,3 +10,8 @@ Project/*.uvguix.*
 
 # Editor
 .vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo

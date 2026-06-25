@@ -1002,6 +1002,24 @@ static void uart_check_port_error_and_arm(UART_PortRuntime_t *runtime)
         if (runtime->port_error < 4U) {
             if ((BoardCfgTab[runtime->port_idx].PortType == UART_PORT_MODBUS_MASTER) ||
                 (BoardCfgTab[runtime->port_idx].PortType == UART_PORT_CUSTOM)) {
+
+                /*
+                 * Before re-initializing a Modbus port, close the old handle
+                 * to release the serial port slot in the FreeModbus port layer.
+                 * Otherwise eMBPSerialInit() finds the old port still registered
+                 * (via prvGetSerialPort), returns MB_EAGAIN, causing the new
+                 * eMBMSerialInit() to fail and set xMBMaster to NULL.
+                 * With xMBMaster == NULL, uart_process_modbus_master() returns
+                 * immediately and never sends any Modbus requests again —
+                 * a permanent failure that only a board restart can recover from.
+                 */
+                if (BoardCfgTab[runtime->port_idx].PortType == UART_PORT_MODBUS_MASTER) {
+                    if (runtime->xMBMaster != NULL) {
+                        eMBMClose(runtime->xMBMaster);
+                        runtime->xMBMaster = NULL;
+                    }
+                }
+
                 baud_rate = uart_get_baud_rate(
                     BoardCfgTab[runtime->port_idx].BautRate);
                 (void)uart_init_port(runtime->port_idx, baud_rate,

@@ -644,7 +644,17 @@ uint16_t uart_custom_exchange(uint8_t port_idx, const uint8_t *tx_buf, uint16_t 
     }
 
     /* ---- 步骤 4: 等待发送完成 (TC = Transmission Complete) ---- */
-    while (__HAL_UART_GET_FLAG(huart, UART_FLAG_TC) == RESET) { }
+    /* 添加超时保护: 防止因硬件异常导致 TC 永远不置位而死循环.
+     * HAL_UART_Transmit 内部已等待过 TC, 正常情况下此循环立即通过. */
+    {
+        uint32_t tc_tick = HAL_GetTick();
+        while (__HAL_UART_GET_FLAG(huart, UART_FLAG_TC) == RESET) {
+            if ((HAL_GetTick() - tc_tick) > first_byte_timeout_ms) {
+                HAL_GPIO_WritePin(cfg->de_port, cfg->de_pin, GPIO_PIN_RESET);
+                return 0U;
+            }
+        }
+    }
 
     /* ---- 步骤 5: 拉低 DE, 切换到接收模式 ---- */
     HAL_GPIO_WritePin(cfg->de_port, cfg->de_pin, GPIO_PIN_RESET);

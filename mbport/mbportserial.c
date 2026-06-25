@@ -300,6 +300,7 @@ static void prvUARTIRQHandler( xSerialPortInternal *pxSerial )
     ULONG sr;
     ULONG cr1;
     volatile ULONG tmp;
+    BOOL   bRxDisabled = FALSE;
 
     if( pxSerial == NULL )
     {
@@ -309,7 +310,14 @@ static void prvUARTIRQHandler( xSerialPortInternal *pxSerial )
     sr  = pxSerial->huart.Instance->SR;
     cr1 = pxSerial->huart.Instance->CR1;
 
-    /* ERROR */
+    /* ERROR — clear error flags by reading SR then DR.
+     * If the receiver is enabled, also disable RXNE interrupt to prevent
+     * an ISR storm when the 485 bus is disconnected or noisy.
+     * Without this, continuous framing errors starve the TIM6 timer ISR,
+     * which prevents Modbus response timeouts from firing, permanently
+     * hanging eMBMReadInputRegisters().
+     * RXNE will be re-enabled by the Modbus state machine on the next
+     * transaction (via eMBPSerialRxEnable). */
     if( sr & (USART_SR_ORE |
               USART_SR_NE  |
               USART_SR_FE  |
@@ -320,10 +328,26 @@ static void prvUARTIRQHandler( xSerialPortInternal *pxSerial )
 
         (void)tmp;
 
-        return;
+        /* Disable RXNE to break the interrupt storm.
+         * Don't return — fall through to handle TXE/TC if they are pending,
+         * which is critical during transmission phases. */
+        if( pxSerial->bRxEnabled )
+        {
+            __HAL_UART_DISABLE_IT( &pxSerial->huart, UART_IT_RXNE );
+            pxSerial->bRxEnabled = FALSE;
+            bRxDisabled = TRUE;
+        }
+
+        /* Re-read SR after error clearing, as the flags may have changed. */
+        if( bRxDisabled )
+        {
+            sr  = pxSerial->huart.Instance->SR;
+            cr1 = pxSerial->huart.Instance->CR1;
+        }
     }
 
-    /* RXNE */
+    /* RXNE — processed only if no error occurred (otherwise the byte was
+     * already consumed by the error-clearing DR read above). */
     if( (sr & USART_SR_RXNE) &&
         (cr1 & USART_CR1_RXNEIE) )
     {
@@ -487,6 +511,11 @@ eMBPSerialInit( xMBPSerialHandle * pxSerialHdl, UCHAR ucPort, ULONG ulBaudRate,
     __HAL_UART_DISABLE_IT( &pxSerialPort->huart, UART_IT_TXE );
     __HAL_UART_DISABLE_IT( &pxSerialPort->huart, UART_IT_TC );
 
+    /* UART IRQ priority = 2, higher than TIM6 (priority 3).
+     * This ensures UART can preempt TIM6, which is critical for
+     * accurate T3.5 character-timeout detection in Modbus RTU.
+     * If TIM6 could preempt UART, the timer ISR might fire while
+     * a character is being received, causing premature frame timeout. */
     HAL_NVIC_SetPriority( pxSerialPort->eIRQn, 2, 0 );
     HAL_NVIC_EnableIRQ( pxSerialPort->eIRQn );
 
