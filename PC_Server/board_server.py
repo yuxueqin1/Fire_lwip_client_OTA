@@ -528,8 +528,8 @@ class TcpBoardServer(threading.Thread):
             self._post_event("log", msg)
 
         elif frame_type == "serial_data":
-            flag_str = "实时" if parsed["frame_flag"] == 0x00 else (
-                "曲线数据" if parsed["frame_flag"] == 0x01 else f"0x{parsed['frame_flag']:02X}")
+            flag_str = "实时(Modbus)" if parsed["frame_flag"] == 0x00 else (
+                "实时(自定义端口)" if parsed["frame_flag"] == 0x01 else f"0x{parsed['frame_flag']:02X}")
 
             # 发送完整帧数据 (限速移到 GUI 侧, 监视器需要全量数据)
             self._post_event("serial_data", {
@@ -1815,8 +1815,8 @@ class SerialDataMonitor:
             "main_type":   f"0x{frame_dict['main_type']:02X}",
             "sub_type":    f"0x{frame_dict['sub_type']:02X}",
             "frame_flag":  f"0x{frame_dict['frame_flag']:02X}"
-                           + (" (实时)" if frame_dict["frame_flag"] == 0x00
-                              else " (曲线)" if frame_dict["frame_flag"] == 0x01
+                           + (" (Modbus实时帧)" if frame_dict["frame_flag"] == 0x00
+                              else " (自定义端口数据)" if frame_dict["frame_flag"] == 0x01
                               else ""),
             "fenji_num":   str(frame_dict["fenji_num"]),
             "data_len":    f"{frame_dict['data_len']} (0x{frame_dict['data_len']:04X})",
@@ -2042,12 +2042,14 @@ class SerialDataMonitor:
         self.slave_placeholder.pack(expand=True, pady=50)
 
     def _update_status_bar(self):
-        """更新底部状态栏。"""
+        """更新底部状态栏和工具栏帧计数。"""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         port_stats = "  |  ".join(
             f"P{p}: {self.port_frame_counts.get(p, 0)}" for p in range(1, UART_PORT_COUNT + 1))
         self.status_label.config(
             text=f"总帧: {self.total_frames}  |  最后更新: {now}  |  {port_stats}")
+        cur = self.port_frame_counts.get(self.current_port, 0)
+        self.frame_count_label.config(text=f"帧计数: {cur}")
 
     # ================================================================
     #  按钮动作

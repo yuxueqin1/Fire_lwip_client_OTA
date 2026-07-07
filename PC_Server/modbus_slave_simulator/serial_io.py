@@ -190,16 +190,20 @@ class SerialPort:
             with self._lock:
                 # Read all available bytes
                 available = self._ser.in_waiting
-                if available == 0:
-                    return self._check_frame_timeout()
+                if available > 0:
+                    chunk = self._ser.read(available)
+                    if chunk:
+                        self._rx_buf.extend(chunk)
+                        self._last_byte_time = time.monotonic()
+                        self.rx_byte_count += len(chunk)
 
-                chunk = self._ser.read(available)
-                if chunk:
-                    self._rx_buf.extend(chunk)
-                    self._last_byte_time = time.monotonic()
-                    self.rx_byte_count += len(chunk)
+                frame = self._detect_frame()
 
-                return self._check_frame_timeout()
+            # ── 在锁外打印: print 很慢, 不能阻塞响应路径 ──
+            if frame is not None and self._verbose:
+                print(f"  [SERIAL] [{self._timestamp()}] "
+                      f"← 接收 ({len(frame)}B): {self._hex_dump(frame)}")
+            return frame
         except (serial.SerialException, OSError) as e:
             print(f"  [SERIAL] Read error: {e}")
             return None
@@ -220,8 +224,11 @@ class SerialPort:
             time.sleep(0.001)
         return None
 
-    def _check_frame_timeout(self) -> Optional[bytes]:
-        """If the inter-frame gap has elapsed, return the accumulated bytes."""
+    def _detect_frame(self) -> Optional[bytes]:
+        """If the inter-frame gap has elapsed, return the accumulated bytes.
+
+        Caller is responsible for verbose logging (must be done outside the lock).
+        """
         if not self._rx_buf:
             return None
 
@@ -231,14 +238,8 @@ class SerialPort:
             self._rx_buf.clear()
             if len(frame) >= 4:  # Minimum valid Modbus frame
                 self.rx_frame_count += 1
-                if self._verbose:
-                    print(f"  [SERIAL] [{self._timestamp()}] "
-                          f"← 接收 ({len(frame)}B): {self._hex_dump(frame)}")
                 return frame
-            # Discard too-short fragments (noise)
-            if len(frame) > 0 and self._verbose:
-                print(f"  [SERIAL] [{self._timestamp()}] "
-                      f"← 丢弃短帧 ({len(frame)}B): {self._hex_dump(frame)}")
+            # Discard too-short fragments (noise) — silently
             return None
         return None
 
@@ -268,12 +269,13 @@ class SerialPort:
                 self._ser.write(data)
                 self._ser.flush()
                 self.tx_frame_count += 1
-                if self._verbose:
-                    print(f"  [SERIAL] [{self._timestamp()}] "
-                          f"→ 发送 ({len(data)}B): {self._hex_dump(data)}")
-                # RS485 turnaround delay (bus release)
-                if self._rs485_delay > 0:
-                    time.sleep(self._rs485_delay)
+            # ── 在锁外打印和延迟: print 很慢(10-30ms), 不能阻塞后续读操作 ──
+            if self._verbose:
+                print(f"  [SERIAL] [{self._timestamp()}] "
+                      f"→ 发送 ({len(data)}B): {self._hex_dump(data)}")
+            # RS485 turnaround delay (bus release)
+            if self._rs485_delay > 0:
+                time.sleep(self._rs485_delay)
         except (serial.SerialException, OSError) as e:
             print(f"  [SERIAL] Write error: {e}")
 

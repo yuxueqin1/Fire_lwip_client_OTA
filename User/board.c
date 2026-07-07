@@ -31,6 +31,162 @@
 static void SystemClock_Config(void);
 static void GPIO_CLK_Init(void);
 
+/*
+ * ===========================================================================
+ *  SDRAM 曲线数据区诊断测试 (临时 — 测试通过后即可删除)
+ * ===========================================================================
+ * 测试 SDRAM 中 QX 曲线数据区的读写完整性。
+ * 测试 3 个不同地址区域, 每个区域用 3 种 bit 模式遍历:
+ *   [1] 0xAAAA (偶数位=1, 奇数位=0) → 检测相邻 bit 短路
+ *   [2] 0x5555 (偶数位=0, 奇数位=1) → 检测相邻 bit 短路 (互补)
+ *   [3] 地址低 16 位作为数据           → 检测地址线粘连/断路
+ *
+ * 测试范围:
+ *   区域 A: SSZ 实时数据区 (0xD0000000)
+ *   区域 B: QX  曲线数据区基址 (0xD0005000)
+ *   区域 C: Port2 曲线数据区 (0xD0023000) ← 正在测试的端口
+ *
+ * 每个区域测试 256 字节 (128 个 uint16_t)。
+ * 测试前先备份原始内容, 测试后恢复。
+ * ===========================================================================
+ */
+#define SDRAM_TEST_REGION_SIZE   256U
+#define SDRAM_TEST_ADDR_COUNT    3U
+
+static uint8_t SDRAM_CurveArea_Test(void)
+{
+    const uint32_t test_addrs[SDRAM_TEST_ADDR_COUNT] = {
+        0xD0000000U,
+        0xD0005000U,
+        0xD0023000U,
+    };
+    const char *region_names[SDRAM_TEST_ADDR_COUNT] = {
+        "SSZ",
+        "QX base",
+        "Port2 QX",
+    };
+
+    uint16_t backup[SDRAM_TEST_REGION_SIZE / 2U];
+    uint16_t test_buf[SDRAM_TEST_REGION_SIZE / 2U];
+    uint8_t  region;
+    uint8_t  all_pass = 1U;
+    uint32_t addr;
+    uint32_t i;
+
+    printf("\n");
+    printf("========================================\n");
+    printf("  SDRAM Curve Area Diagnostic Test\n");
+    printf("========================================\n");
+
+    for (region = 0U; region < SDRAM_TEST_ADDR_COUNT; region++) {
+        addr = test_addrs[region];
+        printf("\n[Zone %c] %s (0x%08lX)\n",
+               'A' + region, region_names[region], (unsigned long)addr);
+
+        /* backup */
+        for (i = 0U; i < (SDRAM_TEST_REGION_SIZE / 2U); i++) {
+            backup[i] = *(__IO uint16_t *)(addr + i * 2U);
+        }
+
+        /* test 1: 0xAAAA */
+        for (i = 0U; i < (SDRAM_TEST_REGION_SIZE / 2U); i++) {
+            *(__IO uint16_t *)(addr + i * 2U) = 0xAAAAU;
+        }
+        for (i = 0U; i < (SDRAM_TEST_REGION_SIZE / 2U); i++) {
+            test_buf[i] = *(__IO uint16_t *)(addr + i * 2U);
+        }
+        for (i = 0U; i < (SDRAM_TEST_REGION_SIZE / 2U); i++) {
+            if (test_buf[i] != 0xAAAAU) {
+                printf("  [FAIL] 0xAAAA @ +0x%04lX: exp 0xAAAA, got 0x%04X\n",
+                       (unsigned long)(i * 2U), test_buf[i]);
+                all_pass = 0U;
+                break;
+            }
+        }
+        if (i == (SDRAM_TEST_REGION_SIZE / 2U)) {
+            printf("  [PASS] pattern 0xAAAA — %u bytes OK\n",
+                   (unsigned int)SDRAM_TEST_REGION_SIZE);
+        }
+
+        /* test 2: 0x5555 */
+        for (i = 0U; i < (SDRAM_TEST_REGION_SIZE / 2U); i++) {
+            *(__IO uint16_t *)(addr + i * 2U) = 0x5555U;
+        }
+        for (i = 0U; i < (SDRAM_TEST_REGION_SIZE / 2U); i++) {
+            test_buf[i] = *(__IO uint16_t *)(addr + i * 2U);
+        }
+        for (i = 0U; i < (SDRAM_TEST_REGION_SIZE / 2U); i++) {
+            if (test_buf[i] != 0x5555U) {
+                printf("  [FAIL] 0x5555 @ +0x%04lX: exp 0x5555, got 0x%04X\n",
+                       (unsigned long)(i * 2U), test_buf[i]);
+                all_pass = 0U;
+                break;
+            }
+        }
+        if (i == (SDRAM_TEST_REGION_SIZE / 2U)) {
+            printf("  [PASS] pattern 0x5555 — %u bytes OK\n",
+                   (unsigned int)SDRAM_TEST_REGION_SIZE);
+        }
+
+        /* test 3: address-as-data */
+        for (i = 0U; i < (SDRAM_TEST_REGION_SIZE / 2U); i++) {
+            *(__IO uint16_t *)(addr + i * 2U) = (uint16_t)(i & 0xFFFFU);
+        }
+        for (i = 0U; i < (SDRAM_TEST_REGION_SIZE / 2U); i++) {
+            test_buf[i] = *(__IO uint16_t *)(addr + i * 2U);
+        }
+        for (i = 0U; i < (SDRAM_TEST_REGION_SIZE / 2U); i++) {
+            if (test_buf[i] != (uint16_t)(i & 0xFFFFU)) {
+                printf("  [FAIL] addr @ +0x%04lX: exp 0x%04lX, got 0x%04X\n",
+                       (unsigned long)(i * 2U), (unsigned long)(i & 0xFFFFU), test_buf[i]);
+                all_pass = 0U;
+                break;
+            }
+        }
+        if (i == (SDRAM_TEST_REGION_SIZE / 2U)) {
+            printf("  [PASS] address pattern — %u bytes OK\n",
+                   (unsigned int)SDRAM_TEST_REGION_SIZE);
+        }
+
+        /* restore */
+        for (i = 0U; i < (SDRAM_TEST_REGION_SIZE / 2U); i++) {
+            *(__IO uint16_t *)(addr + i * 2U) = backup[i];
+        }
+    }
+
+    printf("\n========================================\n");
+    if (all_pass) {
+        printf("  SDRAM Curve Area Test: ALL PASSED\n");
+    } else {
+        printf("  SDRAM Curve Area Test: FAILURES DETECTED!\n");
+    }
+    printf("========================================\n\n");
+
+    /*
+     * LED 信号 (不依赖串口即可观察结果):
+     *   通过 → LED 绿灯快闪 3 次, 然后全部熄灭继续启动
+     *   失败 → LED 红灯持续慢闪 (0.3s 周期), 板子不继续启动
+     */
+    if (all_pass) {
+        uint8_t blink;
+        for (blink = 0U; blink < 3U; blink++) {
+            LED_GREEN;
+            HAL_Delay(200U);
+            LED_RGBOFF;
+            HAL_Delay(200U);
+        }
+    } else {
+        while (1U) {
+            LED_RED;
+            HAL_Delay(150U);
+            LED_RGBOFF;
+            HAL_Delay(150U);
+        }
+    }
+
+    return all_pass;
+}
+
 void BSP_Init(void)
 {
   HAL_Init();    
@@ -39,7 +195,9 @@ void BSP_Init(void)
   SystemClock_Config();
 	/* ��ʼ��RGB�ʵ� */ 
   LED_GPIO_Config(); 
-  // SDRAM_Init();
+  SDRAM_Init();
+  /* ---- 临时: SDRAM 曲线数据区诊断测试 (通过后可删除) ---- */
+  SDRAM_CurveArea_Test();
   EEPROM_Init();    /* AT24C64D I2C EEPROM init (PB5=WP, PB6=SCL, PB7=SDA) */
   /*��ʼ��USART ����ģʽΪ 115200 8-N-1���жϽ���*/
   // DEBUG_USART_Config();

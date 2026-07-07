@@ -266,7 +266,10 @@ class SimulatorThread(threading.Thread):
         if device is not None and device.can_handle(frame):
             response = device.handle_request(frame)
             if response is not None:
-                # ── 控制台数据交互流 ──
+                # ── 先发送应答 (必须在100ms超时内完成, 打印日志/事件不得阻塞此路径) ──
+                self._serial.write_frame(response)
+
+                # ── 控制台数据交互流 (在发送之后打印, 不占用通信超时窗口) ──
                 module_name = get_module_name(device.module_type)
                 flag_info = ""
                 is_curve = device.is_curve_capable
@@ -281,8 +284,6 @@ class SimulatorThread(threading.Thread):
                       f"{module_name}{flag_info}")
                 print(f"  [FLOW] 主机→从机: {frame.hex(' ')}")
                 print(f"  [FLOW] 从机→主机: {response.hex(' ')}")
-
-                self._serial.write_frame(response)
 
                 # 发送事件给 GUI
                 flags = {}
@@ -668,27 +669,32 @@ class SlaveSimulatorGUI:
                                       font=("Microsoft YaHei", 8), foreground="gray")
         self.sel_dev_info.pack(anchor=tk.W, pady=(0, 5))
 
-        btn_row2 = ttk.Frame(act_frame)
-        btn_row2.pack(fill=tk.X)
-        ttk.Button(btn_row2, text="添加设备",
-                   command=self._add_device).pack(side=tk.LEFT, padx=(0, 5))
+        # 按钮分行放置 (每行2个, 避免全部挤在一行导致窗口过宽)
+        btn_row1 = ttk.Frame(act_frame)
+        btn_row1.pack(fill=tk.X, pady=(0, 3))
+        ttk.Button(btn_row1, text="添加设备",
+                   command=self._add_device).pack(side=tk.LEFT, padx=(0, 5), fill=tk.X, expand=True)
 
-        self.edit_btn = ttk.Button(btn_row2, text="编辑设备",
+        self.edit_btn = ttk.Button(btn_row1, text="编辑设备",
                                    command=self._edit_device, state=tk.DISABLED)
-        self.edit_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.edit_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+        btn_row2 = ttk.Frame(act_frame)
+        btn_row2.pack(fill=tk.X, pady=(0, 3))
         self.del_btn = ttk.Button(btn_row2, text="删除设备",
                                   command=self._delete_device, state=tk.DISABLED)
-        self.del_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.del_btn.pack(side=tk.LEFT, padx=(0, 5), fill=tk.X, expand=True)
 
         self.curve_btn = ttk.Button(btn_row2, text="切换曲线模式",
                                     command=self._toggle_curve, state=tk.DISABLED)
-        self.curve_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.curve_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        self.watch_btn = ttk.Button(btn_row2, text="打开寄存器监视",
+        btn_row3 = ttk.Frame(act_frame)
+        btn_row3.pack(fill=tk.X)
+        self.watch_btn = ttk.Button(btn_row3, text="打开寄存器监视",
                                     command=self._open_register_watch,
                                     state=tk.DISABLED)
-        self.watch_btn.pack(side=tk.LEFT)
+        self.watch_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self._selected_addr: Optional[int] = None
 
@@ -1727,8 +1733,8 @@ class RegisterWatchWindow:
         self.window.title(
             f"设备 {address} (0x{device.module_type:02X} "
             f"{get_module_name(device.module_type)}) — 寄存器监视")
-        self.window.geometry("750x580")
-        self.window.minsize(600, 400)
+        self.window.geometry("600x420")
+        self.window.minsize(320, 280)
         self.window.transient(parent)
         self.window.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -1821,97 +1827,95 @@ class RegisterWatchWindow:
                                         font=("Consolas", 9), foreground="gray")
         self.resp_hex_label.pack(side=tk.LEFT, padx=(5, 0))
 
-    def _build_reg_grid(self):
-        """创建可编辑的寄存器网格。每行 4 组 (每组: 序号 + hex输入框 + dec输入框)。
+    def _build_reg_grid(self, groups_per_row: int | None = None):
+        """创建可编辑的寄存器网格 (只显示十进制)。
 
-        直接点击 hex 或 dec 输入框即可编辑，按 Enter 或移开焦点即生效。
+        布局随窗口宽度自适应: 窄窗口 → 每行 2-3 组, 宽窗口 → 6-8 组。
+        每组: 序号标签 + 十进制输入框。
+
+        直接点击输入框即可编辑，按 Enter 或移开焦点即生效。
         手动修改过的寄存器用浅蓝色背景标记。
         """
-        max_show = min(self.device.profile.input_regs, 64)
-        cols_per_group = 3  # R##, hex entry, dec entry
-        groups_per_row = 4
-
+        # 清除旧 widgets
+        for w in self.reg_inner.winfo_children():
+            w.destroy()
         self._reg_entries.clear()
+
+        max_show = min(self.device.profile.input_regs, 64)
+
+        # 自适应列数: 每组约 95px (标签 35 + 输入框 55 + 间距 5)
+        if groups_per_row is None:
+            self.reg_inner.update_idletasks()
+            width = self.reg_canvas.winfo_width()
+            groups_per_row = max(2, min(8, (width - 5) // 100)) if width > 10 else 4
+
+        cols_per_group = 2  # R## label + dec entry
 
         for r in range(max_show):
             row = r // groups_per_row
-            col_base = (r % groups_per_row) * (cols_per_group + 1)
+            col_base = (r % groups_per_row) * cols_per_group
 
             # 寄存器序号
             idx_label = ttk.Label(self.reg_inner,
                                   text=f"R{r:02d}", width=5, anchor=tk.E,
-                                  font=("Consolas", 8), foreground="gray")
+                                  font=("Consolas", 9), foreground="gray")
             idx_label.grid(row=row, column=col_base, sticky=tk.E, padx=1, pady=1)
-
-            # 十六进制输入框 (使用 StringVar 便于追踪)
-            hex_var = tk.StringVar(value="0x0000")
-            hex_entry = tk.Entry(self.reg_inner, textvariable=hex_var,
-                                 width=7, font=("Consolas", 8, "bold"),
-                                 justify=tk.CENTER,
-                                 relief=tk.FLAT, borderwidth=1,
-                                 bg="SystemWindow",
-                                 insertbackground="black")
-            hex_entry.grid(row=row, column=col_base + 1, sticky=tk.W, padx=1, pady=1)
-            hex_entry.bind("<Return>", lambda e, ri=r: self._commit_edit(ri, "hex"))
-            hex_entry.bind("<FocusOut>", lambda e, ri=r: self._commit_edit(ri, "hex"))
-            # 右键清除覆写
-            hex_entry.bind("<Button-3>",
-                           lambda e, ri=r: self._clear_override_popup(ri, e))
 
             # 十进制输入框
             dec_var = tk.StringVar(value="0")
             dec_entry = tk.Entry(self.reg_inner, textvariable=dec_var,
-                                 width=7, font=("Consolas", 8),
+                                 width=6, font=("Consolas", 9),
                                  justify=tk.RIGHT,
                                  relief=tk.FLAT, borderwidth=1,
                                  bg="SystemWindow",
                                  insertbackground="black")
-            dec_entry.grid(row=row, column=col_base + 2, sticky=tk.E, padx=1, pady=1)
-            dec_entry.bind("<Return>", lambda e, ri=r: self._commit_edit(ri, "dec"))
-            dec_entry.bind("<FocusOut>", lambda e, ri=r: self._commit_edit(ri, "dec"))
+            dec_entry.grid(row=row, column=col_base + 1, sticky=tk.E, padx=(1, 6), pady=1)
+            dec_entry.bind("<Return>", lambda e, ri=r: self._commit_edit(ri))
+            dec_entry.bind("<FocusOut>", lambda e, ri=r: self._commit_edit(ri))
+            # 右键清除覆写
             dec_entry.bind("<Button-3>",
                            lambda e, ri=r: self._clear_override_popup(ri, e))
-
-            # 列间分隔
-            if col_base + 3 < groups_per_row * (cols_per_group + 1):
-                spacer = ttk.Label(self.reg_inner, text=" ")
-                spacer.grid(row=row, column=col_base + 3, padx=4)
 
             self._reg_entries.append({
                 "reg": r,
                 "idx_label": idx_label,
-                "hex_var": hex_var,
-                "hex_entry": hex_entry,
                 "dec_var": dec_var,
                 "dec_entry": dec_entry,
             })
 
-    def _commit_edit(self, reg_index: int, source: str):
-        """将用户编辑的寄存器值提交到模拟器。
+        # 绑定窗口大小变化 → 重排布局
+        self.reg_canvas.bind("<Configure>", self._on_reg_canvas_resize, add="+")
 
-        Args:
-            reg_index: 寄存器索引 (0-based)。
-            source: "hex" 或 "dec" — 确定从哪个输入框读取值。
-        """
+    def _on_reg_canvas_resize(self, event=None):
+        """窗口宽度变化时重新计算列数并重排寄存器网格。"""
+        width = self.reg_canvas.winfo_width()
+        if width < 50:
+            return
+        # 每组约 95px: 标签 35 + 输入框 55 + 间距 5
+        groups_per_row = max(2, min(8, (width - 5) // 100))
+        # 只有当列数实际变化时才重建 (避免频繁重建造成闪烁)
+        current_rows = (len(self._reg_entries) + groups_per_row - 1) // groups_per_row if self._reg_entries else 0
+        # 用 grid_slaves 推测当前列数: 如果变化超过阈值则重建
+        if not hasattr(self, '_last_groups_per_row'):
+            self._last_groups_per_row = 0
+        if groups_per_row != self._last_groups_per_row:
+            self._last_groups_per_row = groups_per_row
+            self._build_reg_grid(groups_per_row)
+
+    def _commit_edit(self, reg_index: int):
+        """将用户编辑的十进制寄存器值提交到模拟器。"""
         entry_info = self._reg_entries[reg_index]
         try:
-            if source == "hex":
-                raw = entry_info["hex_var"].get().strip()
-                raw = raw.removeprefix("0x").removeprefix("0X")
-                value = int(raw, 16)
-            else:
-                raw = entry_info["dec_var"].get().strip()
-                value = int(raw)
+            raw = entry_info["dec_var"].get().strip()
+            value = int(raw)
         except (ValueError, AttributeError):
-            # 无效输入 → 恢复到当前实际值
             self._sync_one_entry(reg_index)
             return
 
         value = max(0, min(65535, value))
         self.sim.set_device_register(self.address, reg_index, value)
 
-        # 同步两个输入框
-        entry_info["hex_var"].set(f"0x{value:04X}")
+        # 同步显示
         entry_info["dec_var"].set(str(value))
 
         # 标记为已覆写
@@ -1951,14 +1955,12 @@ class RegisterWatchWindow:
         """用浅蓝色背景标记手动覆写的寄存器。"""
         info = self._reg_entries[reg_index]
         color = "#C8E6FF"
-        info["hex_entry"].configure(bg=color, readonlybackground=color)
         info["dec_entry"].configure(bg=color, readonlybackground=color)
 
     def _unmark_overridden(self, reg_index: int):
         """恢复默认背景色。"""
         info = self._reg_entries[reg_index]
         default = "SystemWindow"
-        info["hex_entry"].configure(bg=default, readonlybackground=default)
         info["dec_entry"].configure(bg=default, readonlybackground=default)
 
     def _sync_one_entry(self, reg_index: int):
@@ -1967,7 +1969,6 @@ class RegisterWatchWindow:
         if reg_index < len(values):
             v = values[reg_index]
             info = self._reg_entries[reg_index]
-            info["hex_var"].set(f"0x{v:04X}")
             info["dec_var"].set(str(v))
 
     # ================================================================
@@ -1989,8 +1990,6 @@ class RegisterWatchWindow:
                 v = values[i]
                 # 只更新当前焦点不在的输入框, 避免打断用户编辑
                 focused = self.window.focus_get()
-                if info["hex_entry"] != focused:
-                    info["hex_var"].set(f"0x{v:04X}")
                 if info["dec_entry"] != focused:
                     info["dec_var"].set(str(v))
                 # 更新覆写标记

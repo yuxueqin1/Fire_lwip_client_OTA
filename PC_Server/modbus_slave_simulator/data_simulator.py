@@ -159,9 +159,9 @@ class DataSimulator:
     # ------------------------------------------------------------------
 
     def _build_generators(self) -> list[_RegisterGen]:
-        """Create a generator per register — all initialised to 0.
+        """Create a generator per register, all initialised to 0.
 
-        用户可根据测试需要, 通过寄存器监视器手动修改任意寄存器值。
+        The user sets desired values manually via the register watch window.
         """
         n = self._profile.input_regs
         return [_ConstReg(0) for _ in range(n)]

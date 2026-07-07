@@ -786,10 +786,13 @@ void uart_handle_curve_continue_frame(uint8_t port_idx, uint8_t module_idx,
     uint16_t weibo_temp;
     uint16_t *qx = uart_qx_ptr(port_idx, module_idx);
     uint8_t  n;
+    const uint8_t *resp;  /* 响应数据起始 = ser_buf + 11 (跳过 TCP 帧头) */
+
+    resp = ser_buf + 11U;
 
     /* 更新帧序号和帧标记 */
     AC_module_infor[port_idx].Frame_sequence[module_idx] =
-        ser_buf[profile->curve_seq_offset];
+        resp[profile->curve_seq_offset];
     AC_module_infor[port_idx].Frame_mark[module_idx] = 0x55U;
 
     /* 首帧: 清零微步计数, 写入时间戳头部 */
@@ -823,13 +826,13 @@ void uart_handle_curve_continue_frame(uint8_t port_idx, uint8_t module_idx,
     }
 
     /* 计算本帧曲线数据字节数: 长度字节 * 2 (每点 2 字节) */
-    weibo_temp = (uint16_t)(ser_buf[profile->curve_len_offset] * 2U);
+    weibo_temp = (uint16_t)(resp[profile->curve_len_offset] * 2U);
 
     /* 将各分支曲线数据写入 SDRAM (追加到已有数据之后) */
     for (n = 0; n < profile->curve_branch_count; n++) {
         memcpy((uint8_t *)(qx + n * (SDRAM_QX_BRANCH_SIZE / 2U)
                            + 3U + Weibo_number[port_idx][module_idx] / 2U),
-               &ser_buf[profile->curve_data_offset + n * 50U],
+               &resp[profile->curve_data_offset + n * 50U],
                weibo_temp);
     }
     Weibo_number[port_idx][module_idx] += weibo_temp;
@@ -856,25 +859,28 @@ void uart_handle_curve_end_frame(uint8_t port_idx, uint8_t module_idx,
     uint16_t weibo_temp;
     uint16_t *qx = uart_qx_ptr(port_idx, module_idx);
     uint8_t  n;
+    const uint8_t *resp;  /* 响应数据起始 = ser_buf + 11 (跳过 TCP 帧头) */
+
+    resp = ser_buf + 11U;
 
     /* 更新帧序号和帧标记 */
     AC_module_infor[port_idx].Frame_sequence[module_idx] =
-        ser_buf[profile->curve_seq_offset];
+        resp[profile->curve_seq_offset];
     AC_module_infor[port_idx].Frame_mark[module_idx] = 0xFFU;
 
     /* 首帧检测: flag+1 字节为 0 且序列号为 1 */
-    if ((ser_buf[profile->curve_flag_offset + 1U] == 0U) &&
-        (ser_buf[profile->curve_seq_offset] == 1U)) {
+    if ((resp[profile->curve_flag_offset + 1U] == 0U) &&
+        (resp[profile->curve_seq_offset] == 1U)) {
         uint8_t ft[6];
         Weibo_number[port_idx][module_idx] = 0;
         AC_module_infor[port_idx].Curve_number[module_idx] = 1;
 
         /* 构建时间戳头部 (从响应帧中的时间字段读取) */
         ft[0] = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx];
-        ft[2] = ser_buf[profile->curve_flag_offset + 3U];  /* 年/月 */
-        ft[3] = ser_buf[profile->curve_flag_offset + 4U];  /* 日/时 */
-        ft[4] = ser_buf[profile->curve_flag_offset + 5U];  /* 分/秒 */
-        ft[5] = ser_buf[profile->curve_flag_offset + 6U];
+        ft[2] = resp[profile->curve_flag_offset + 3U];  /* 年/月 */
+        ft[3] = resp[profile->curve_flag_offset + 4U];  /* 日/时 */
+        ft[4] = resp[profile->curve_flag_offset + 5U];  /* 分/秒 */
+        ft[5] = resp[profile->curve_flag_offset + 6U];
 
         /* 为每个分支写入时间戳头部 */
         for (n = 0; n < profile->curve_branch_count; n++) {
@@ -895,11 +901,11 @@ void uart_handle_curve_end_frame(uint8_t port_idx, uint8_t module_idx,
     }
 
     /* ---- 缓存最后一段曲线数据 ---- */
-    weibo_temp = (uint16_t)(ser_buf[profile->curve_len_offset] * 2U);
+    weibo_temp = (uint16_t)(resp[profile->curve_len_offset] * 2U);
     for (n = 0; n < profile->curve_branch_count; n++) {
         memcpy((uint8_t *)(qx + n * (SDRAM_QX_BRANCH_SIZE / 2U)
                            + 3U + Weibo_number[port_idx][module_idx] / 2U),
-               &ser_buf[profile->curve_data_offset + n * 50U],
+               &resp[profile->curve_data_offset + n * 50U],
                weibo_temp);
     }
     Weibo_number[port_idx][module_idx] += weibo_temp;
@@ -911,7 +917,7 @@ void uart_handle_curve_end_frame(uint8_t port_idx, uint8_t module_idx,
      */
     memcpy((uint8_t *)(qx + (profile->curve_branch_count - 1U) * (SDRAM_QX_BRANCH_SIZE / 2U)
                        + 3U + Weibo_number[port_idx][module_idx] / 2U),
-           &ser_buf[profile->curve_direction_offset], 2);
+           &resp[profile->curve_direction_offset], 2);
 
     AC_module_infor[port_idx].Points_number[module_idx] =
         Weibo_number[port_idx][module_idx];

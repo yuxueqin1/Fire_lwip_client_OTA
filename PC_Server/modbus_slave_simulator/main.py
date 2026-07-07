@@ -254,7 +254,10 @@ class Simulator:
             if device is not None and device.can_handle(frame):
                 response = device.handle_request(frame)
                 if response is not None:
-                    # ── 控制台数据交互流 ──
+                    # ── 先发送应答 (必须在100ms超时内完成, 打印日志不得阻塞此路径) ──
+                    self._serial.write_frame(response)  # type: ignore[union-attr]
+
+                    # ── 控制台数据交互流 (在发送之后打印, 不占用通信超时窗口) ──
                     module_name = get_module_name(device.module_type)
                     flag_info = ""
                     if device.is_curve_capable and len(response) > device.profile.curve_flag_offset:
@@ -268,8 +271,6 @@ class Simulator:
                           f"{module_name}{flag_info}")
                     print(f"  [FLOW] 主机→从机: {frame.hex(' ')}")
                     print(f"  [FLOW] 从机→主机: {response.hex(' ')}")
-
-                    self._serial.write_frame(response)  # type: ignore[union-attr]
                 # else: CRC error or invalid request — real slave is silent
             # else: request for an unknown address — ignore (we're not that slave)
 

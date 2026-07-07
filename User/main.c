@@ -847,6 +847,14 @@ static void uart_custom_module_online(UART_PortRuntime_t *runtime,
     *dc_offset += reg_count;
     runtime->data_len += profile->realtime_bytes;
 
+    /*
+     * 在曲线帧分发之前更新 SerialDataBuf 中的链路掩码.
+     * uart_handle_curve_frame_dispatch 在收到 0xFF 结束帧时会立即通过
+     * client_add_to_tcp_send_buf 上传完整曲线数据, 此时 ser_buf[7-10]
+     * 必须反映当前在线状态, 否则上位机会看到 link_mask=0x00000000.
+     */
+    *((uint32_t *)&ser_buf[7]) = runtime->link_mask;
+
     /* 曲线帧分发 (使用完整 SerialDataBuf 中的绝对偏移) */
     uart_handle_curve_frame_dispatch(runtime->port_idx, module_idx,
                                      profile, ser_buf);
@@ -910,15 +918,18 @@ static void uart_handle_curve_frame_dispatch(uint8_t port_idx, uint8_t module_id
     uint8_t  flag_byte;
     uint8_t  flash_time[6];
     uint8_t  is_first;
+    const uint8_t *resp;  /* 响应数据起始 = ser_buf + 11 (跳过 TCP 帧头) */
 
-    flag_byte = ser_buf[profile->curve_flag_offset];
+    resp = ser_buf + 11U;  /* ser_buf[0..10] = TCP 帧头; resp[0..] = 从机响应 */
+
+    flag_byte = resp[profile->curve_flag_offset];
 
     /*
      * 首帧检测: flag+1 处必须为 0, 序列号必须为 1.
      * 此条件对所有三种曲线模块 (AC_ZZJ, DC_ZZJ4, DC_ZZJ6) 一致.
      */
-    is_first = ((ser_buf[profile->curve_flag_offset + 1U] == 0U) &&
-                (ser_buf[profile->curve_seq_offset] == 1U));
+    is_first = ((resp[profile->curve_flag_offset + 1U] == 0U) &&
+                (resp[profile->curve_seq_offset] == 1U));
 
     /*
      * 构建 flash_time 头部 (用于曲线存储).
@@ -927,10 +938,10 @@ static void uart_handle_curve_frame_dispatch(uint8_t port_idx, uint8_t module_id
      * flash_time[2-5]: 年月日时分秒
      */
     flash_time[0] = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx];
-    flash_time[2] = ser_buf[profile->curve_flag_offset + 3U];  /* 年/月 */
-    flash_time[3] = ser_buf[profile->curve_flag_offset + 4U];  /* 日/时 */
-    flash_time[4] = ser_buf[profile->curve_flag_offset + 5U];  /* 分/秒 */
-    flash_time[5] = ser_buf[profile->curve_flag_offset + 6U];
+    flash_time[2] = resp[profile->curve_flag_offset + 3U];  /* 年/月 */
+    flash_time[3] = resp[profile->curve_flag_offset + 4U];  /* 日/时 */
+    flash_time[4] = resp[profile->curve_flag_offset + 5U];  /* 分/秒 */
+    flash_time[5] = resp[profile->curve_flag_offset + 6U];
 
     switch (flag_byte) {
 
@@ -1146,13 +1157,13 @@ void checkSendLog(void)
         }
     }
 
-    // /* ---- 端口曲线上传完成日志 (6 路端口) ---- */
-    // for (i = 0; i < UART_PORT_COUNT; i++) {
-    //     if (portDLQX[i] != 0U) {
-    //         SendLogToServer((uint8_t)(i + 1U), 5U);
-    //         portDLQX[i] = 0U;
-    //     }
-    // }
+    /* ---- 端口曲线上传完成日志 (6 路端口) ---- */
+    for (i = 0; i < UART_PORT_COUNT; i++) {
+        if (portDLQX[i] != 0U) {
+            SendLogToServer((uint8_t)(i + 1U), 5U);
+            portDLQX[i] = 0U;
+        }
+    }
 
     /* ---- 校时日志 ---- */
     if (jiaoshi != 0U) {

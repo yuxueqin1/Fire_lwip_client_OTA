@@ -58,7 +58,8 @@ class CustomHandler:
                  data_gen: DataSimulator,
                  curve_mode: CurveMode = CurveMode.REALTIME_ONLY,
                  curve_frames_per_cycle: int = 10,
-                 curve_points_per_frame: int = 25) -> None:
+                 curve_points_per_frame: int = 25,
+                 curve_interval: float = 5.0) -> None:
         """
         Args:
             address: Slave device address (1-247).
@@ -67,6 +68,8 @@ class CustomHandler:
             curve_mode: Whether to include curve data in responses.
             curve_frames_per_cycle: Number of 0x55 frames per curve cycle.
             curve_points_per_frame: Data points per branch per frame (≤ 25).
+            curve_interval: Seconds between curve cycles (normal frames sent
+                            during cooldown).  Default 5.0 s.
         """
         if not profile.uses_custom_curve:
             raise ValueError(
@@ -82,6 +85,7 @@ class CustomHandler:
         self.curve_mode = curve_mode
         self.curve_frames_per_cycle = curve_frames_per_cycle
         self.points_per_frame = curve_points_per_frame
+        self.curve_interval = curve_interval
 
         # Total curve points = frames_per_cycle * points_per_frame
         self._total_curve_points = curve_frames_per_cycle * curve_points_per_frame
@@ -96,6 +100,7 @@ class CustomHandler:
         # State
         self._state: CurveState = CurveState.IDLE
         self._cycle_seq: int = 0        # sequence counter within current cycle
+        self._last_cycle_end_time: float = 0.0  # monotonic timestamp of last 0xFF
 
         # Statistics
         self.request_count: int = 0
@@ -268,6 +273,12 @@ class CustomHandler:
 
         # --- State machine ---
         if self._state == CurveState.IDLE:
+            # Honour cooldown interval between cycles.
+            # During cooldown, send normal (0x00) frames so the bus isn't
+            # flooded with back-to-back curve data.
+            elapsed = _time.monotonic() - self._last_cycle_end_time
+            if elapsed < self.curve_interval:
+                return self._build_normal_frame(seq)
             # Start a new curve cycle
             self._state = CurveState.TRANSMITTING
             self._cycle_seq = 0
@@ -320,7 +331,7 @@ class CustomHandler:
 
         # Frame flag
         buf[p.curve_flag_offset] = flag
-        buf[p.curve_flag_offset + 1] = 0x00 if is_first else 0xFF
+        buf[p.curve_flag_offset + 1] = 0x00 if is_first else 0x80
 
         # Timestamp (6 bytes at flag_offset+2; first byte = seq, set later)
         ts_bytes = CurveGenerator.make_timestamp_bytes(
@@ -332,8 +343,14 @@ class CustomHandler:
             if pos < p.curve_data_offset:  # don't overflow into curve data
                 buf[pos] = b
 
-        # Set seq byte AFTER timestamp to echo master's seq (overwrites timestamp[0])
-        buf[p.curve_seq_offset] = seq & 0xFF
+        # Set seq byte AFTER timestamp.
+        # Use the sensor's own frame counter (1-based), NOT an echo of the
+        # master's request seq.  The device manual specifies that FramNum
+        # starts at 0001 for the first curve frame and increments for each
+        # subsequent frame.  Echoing the master's seq (which is 0 on the
+        # first request) would cause the firmware's is_first detection to
+        # fail permanently (it expects seq == 1).
+        buf[p.curve_seq_offset] = (self._cycle_seq + 1) & 0xFF
 
         # Curve length byte
         buf[p.curve_len_offset] = self.points_per_frame & 0xFF
@@ -348,9 +365,9 @@ class CustomHandler:
             direction = self._curve_gen.rotation_direction
             buf[p.curve_direction_offset] = (direction >> 8) & 0xFF
             buf[p.curve_direction_offset + 1] = direction & 0xFF
-            # End of cycle → back to IDLE after this frame
-            # (transition on NEXT request)
+            # End of cycle → back to IDLE, start cooldown timer
             self._state = CurveState.IDLE
+            self._last_cycle_end_time = _time.monotonic()
 
         # --- Post-frame state update ---
         if flag == 0x55 and self._curve_gen.frames_remaining <= 1:
@@ -373,9 +390,10 @@ class CustomHandler:
         """Switch between realtime-only and curve modes at runtime."""
         self.curve_mode = mode
         if mode == CurveMode.CURVE:
-            # Reset state machine for a fresh cycle
+            # Reset state machine for a fresh cycle (start immediately)
             self._state = CurveState.IDLE
             self._cycle_seq = 0
+            self._last_cycle_end_time = 0.0
 
     def toggle_curve_mode(self) -> CurveMode:
         """Toggle curve mode and return the new mode."""

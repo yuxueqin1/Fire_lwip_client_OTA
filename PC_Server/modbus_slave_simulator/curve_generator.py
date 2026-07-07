@@ -176,63 +176,8 @@ class CurveGenerator:
 
     @staticmethod
     def _curve_value(t: int, phase_offset: float = 0.0) -> int:
-        """
-        Single curve data-point value at time ``t``.
-
-        Models a switch-machine action current curve:
-
-        t=0..40:   Inrush phase — rapid rise then exponential decay
-                   (peak ~8000 units → settling to ~3000)
-        t=40..80:  Steady-state with 25Hz / high-freq oscillation
-        t=80..130: Gradual current rise (resistance increases)
-        t=130..170: Second transition spike
-        t=170..200: Settling to zero (operation complete)
-
-        Units are in mA × correction-factor (similar to the real sensors).
-        """
-        # Phase-shifted time for variety across branches
-        tp = t + phase_offset * 20.0
-
-        if tp < 40:
-            # --- Inrush ---
-            # Sharp rise in first 5 points, then exponential decay
-            if tp < 5:
-                val = 2000.0 + tp * 1200.0  # ramp up
-            else:
-                val = 8000.0 * math.exp(-(tp - 5) / 12.0) + 2000.0
-            val += 400.0 * math.sin(tp * 0.5 + phase_offset)
-        elif tp < 80:
-            # --- Steady-state ---
-            val = 2800.0 + 600.0 * math.sin(tp * 0.25 + phase_offset)
-            # Add 25Hz ripple for normal modules, 50Hz for HF
-            ripple_freq = 0.8
-            val += 200.0 * math.sin(tp * ripple_freq)
-        elif tp < 130:
-            # --- Ramp up ---
-            ramp = (tp - 80) / 50.0  # 0 → 1
-            val = 2800.0 + ramp * 1200.0
-            val += 500.0 * math.sin(tp * 0.3 + phase_offset)
-        elif tp < 170:
-            # --- Second transition ---
-            # Spike and settle
-            relative = (tp - 130) / 40.0
-            if relative < 0.3:
-                spike = relative / 0.3  # 0 → 1
-                val = 4000.0 + spike * 2500.0
-            else:
-                decay = (relative - 0.3) / 0.7  # 0 → 1
-                val = 6500.0 * math.exp(-decay * 2.0) + 1500.0
-            val += 300.0 * math.sin(tp * 0.5 + phase_offset)
-        else:
-            # --- Settling to zero ---
-            settle = min(1.0, (tp - 170) / 30.0)
-            val = 2000.0 * (1.0 - settle) + 100.0 * math.sin(tp * 0.6)
-
-        # Noise
-        val += random.gauss(0.0, 30.0)
-
-        # Clamp
-        return max(0, min(65535, int(val)))
+        """Fixed curve data value — always 10 (user-configured)."""
+        return 10
 
     # ------------------------------------------------------------------
     # Helpers for the CustomHandler

@@ -450,6 +450,7 @@ class TestCustomHandler(unittest.TestCase):
             curve_mode=CurveMode.CURVE,
             curve_frames_per_cycle=5,
             curve_points_per_frame=20,
+            curve_interval=0,  # no cooldown in tests
         )
         p = self.profile
 
@@ -486,6 +487,7 @@ class TestCustomHandler(unittest.TestCase):
             1, self.profile, self.data_gen,
             curve_mode=CurveMode.CURVE,
             curve_frames_per_cycle=5,
+            curve_interval=0,  # no cooldown in tests
         )
         p = self.profile
 
@@ -505,6 +507,7 @@ class TestCustomHandler(unittest.TestCase):
             curve_mode=CurveMode.CURVE,
             curve_frames_per_cycle=3,
             curve_points_per_frame=25,
+            curve_interval=0,  # no cooldown in tests
         )
         p = self.profile
 
