@@ -920,7 +920,7 @@ static void uart_handle_curve_frame_dispatch(uint8_t port_idx, uint8_t module_id
     uint8_t  is_first;
     const uint8_t *resp;  /* 响应数据起始 = ser_buf + 11 (跳过 TCP 帧头) */
 
-    resp = ser_buf + 11U;  /* ser_buf[0..10] = TCP 帧头; resp[0..] = 从机响应 */
+    resp = ser_buf + 11U;
 
     flag_byte = resp[profile->curve_flag_offset];
 
@@ -1025,6 +1025,20 @@ static void uart_check_port_error_and_arm(UART_PortRuntime_t *runtime)
                  * a permanent failure that only a board restart can recover from.
                  */
                 if (BoardCfgTab[runtime->port_idx].PortType == UART_PORT_MODBUS_MASTER) {
+                    if (runtime->xMBMaster != NULL) {
+                        eMBMClose(runtime->xMBMaster);
+                        runtime->xMBMaster = NULL;
+                    }
+                }
+
+                /*
+                 * Modbus → Custom 切换: 若用户通过上位机将端口从 Modbus
+                 * 切换为自定义曲线模式, Modbus 初始化时开启的 UART 中断
+                 * (TXEIE/RXNEIE/TCIE) 仍在触发 prvUARTIRQHandler, 会与
+                 * uart_custom_exchange 的 HAL_UART_Transmit 阻塞轮询
+                 * 发生数据竞争. 必须显式关闭残留的 Modbus 句柄.
+                 */
+                if (BoardCfgTab[runtime->port_idx].PortType == UART_PORT_CUSTOM) {
                     if (runtime->xMBMaster != NULL) {
                         eMBMClose(runtime->xMBMaster);
                         runtime->xMBMaster = NULL;

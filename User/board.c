@@ -195,9 +195,9 @@ void BSP_Init(void)
   SystemClock_Config();
 	/* ��ʼ��RGB�ʵ� */ 
   LED_GPIO_Config(); 
-  SDRAM_Init();
+//   SDRAM_Init();
   /* ---- 临时: SDRAM 曲线数据区诊断测试 (通过后可删除) ---- */
-  SDRAM_CurveArea_Test();
+//   SDRAM_CurveArea_Test();
   EEPROM_Init();    /* AT24C64D I2C EEPROM init (PB5=WP, PB6=SCL, PB7=SDA) */
   /*��ʼ��USART ����ģʽΪ 115200 8-N-1���жϽ���*/
   // DEBUG_USART_Config();
