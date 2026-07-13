@@ -3,123 +3,132 @@
 
 #include "stm32f4xx.h"
 
-//“˝Ω≈∂®“Â
-/*******************************************************/
-//R ∫Ï…´µ∆
-#define LED1_PIN                  GPIO_PIN_10                 
-#define LED1_GPIO_PORT            GPIOH                      
-#define LED1_GPIO_CLK_ENABLE()    __GPIOH_CLK_ENABLE()
+/*==========================================================================
+ * 7 Ë∑ØÂçïËâ≤ LED ÂºïËÑöÂÆö‰πâ
+ * 485-1-LED : PD7    485-2-LED : PG9
+ * 485-3-LED : PG10   485-4-LED : PG12
+ * 485-5-LED : PB3    485-6-LED : PB4
+ * 485-run-LED : PB8
+ *==========================================================================*/
 
-//G ¬Ã…´µ∆
-#define LED2_PIN                  GPIO_PIN_11                 
-#define LED2_GPIO_PORT            GPIOH                      
-#define LED2_GPIO_CLK_ENABLE()    __GPIOH_CLK_ENABLE()
+/* 485-1-LED : PD7 */
+#define LED_485_1_PIN               GPIO_PIN_7
+#define LED_485_1_PORT              GPIOD
+#define LED_485_1_CLK_ENABLE()      __HAL_RCC_GPIOD_CLK_ENABLE()
 
-//B ¿∂…´µ∆
-#define LED3_PIN                  GPIO_PIN_12                 
-#define LED3_GPIO_PORT            GPIOH                       
-#define LED3_GPIO_CLK_ENABLE()    __GPIOH_CLK_ENABLE()
+/* 485-2-LED : PG9 */
+#define LED_485_2_PIN               GPIO_PIN_9
+#define LED_485_2_PORT              GPIOG
+#define LED_485_2_CLK_ENABLE()      __HAL_RCC_GPIOG_CLK_ENABLE()
 
-/************************************************************/
+/* 485-3-LED : PG10 */
+#define LED_485_3_PIN               GPIO_PIN_10
+#define LED_485_3_PORT              GPIOG
+#define LED_485_3_CLK_ENABLE()      __HAL_RCC_GPIOG_CLK_ENABLE()
 
+/* 485-4-LED : PG12 */
+#define LED_485_4_PIN               GPIO_PIN_12
+#define LED_485_4_PORT              GPIOG
+#define LED_485_4_CLK_ENABLE()      __HAL_RCC_GPIOG_CLK_ENABLE()
 
-/** øÿ÷∆LEDµ∆¡¡√µƒ∫Í£¨
-	* LEDµÕµÁ∆Ω¡¡£¨…Ë÷√ON=0£¨OFF=1
-	* »ÙLED∏ﬂµÁ∆Ω¡¡£¨∞—∫Í…Ë÷√≥…ON=1 £¨OFF=0 º¥ø…
-	*/
-#define ON  GPIO_PIN_RESET
-#define OFF GPIO_PIN_SET
+/* 485-5-LED : PB3 (SWD Ë∞ÉËØï‰∏ã JTAG-SWO ÈáäÊîæ‰∏∫ GPIO) */
+#define LED_485_5_PIN               GPIO_PIN_3
+#define LED_485_5_PORT              GPIOB
+#define LED_485_5_CLK_ENABLE()      __HAL_RCC_GPIOB_CLK_ENABLE()
 
-/* ¥¯≤Œ∫Í£¨ø…“‘œÒƒ⁄¡™∫Ø ˝“ª—˘ π”√ */
-#define LED1(a)	HAL_GPIO_WritePin(LED1_GPIO_PORT,LED1_PIN,a)
+/* 485-6-LED : PB4 (SWD Ë∞ÉËØï‰∏ã JTAG-JNTRST ÈáäÊîæ‰∏∫ GPIO) */
+#define LED_485_6_PIN               GPIO_PIN_4
+#define LED_485_6_PORT              GPIOB
+#define LED_485_6_CLK_ENABLE()      __HAL_RCC_GPIOB_CLK_ENABLE()
 
-
-#define LED2(a)	HAL_GPIO_WritePin(LED2_GPIO_PORT,LED2_PIN,a)
-
-
-#define LED3(a)	HAL_GPIO_WritePin(LED2_GPIO_PORT,LED3_PIN,a)
-
-
-
-
-/* ÷±Ω”≤Ÿ◊˜ºƒ¥Ê∆˜µƒ∑Ω∑®øÿ÷∆IO */
-#define	digitalHi(p,i)			{p->BSRR=i;}			  //…Ë÷√Œ™∏ﬂµÁ∆Ω		
-#define digitalLo(p,i)			{p->BSRR=(uint32_t)i << 16;}				// ‰≥ˆµÕµÁ∆Ω
-#define digitalToggle(p,i)		{p->ODR ^=i;}			// ‰≥ˆ∑¥◊™◊¥Ã¨
-
-
-/* ∂®“Âøÿ÷∆IOµƒ∫Í */
-#define LED1_TOGGLE		digitalToggle(LED1_GPIO_PORT,LED1_PIN)
-#define LED1_OFF		digitalHi(LED1_GPIO_PORT,LED1_PIN)
-#define LED1_ON			digitalLo(LED1_GPIO_PORT,LED1_PIN)
-
-#define LED2_TOGGLE		digitalToggle(LED2_GPIO_PORT,LED2_PIN)
-#define LED2_OFF		digitalHi(LED2_GPIO_PORT,LED2_PIN)
-#define LED2_ON			digitalLo(LED2_GPIO_PORT,LED2_PIN)
-
-#define LED3_TOGGLE		digitalToggle(LED3_GPIO_PORT,LED3_PIN)
-#define LED3_OFF		digitalHi(LED3_GPIO_PORT,LED3_PIN)
-#define LED3_ON			digitalLo(LED3_GPIO_PORT,LED3_PIN)
-
-#define LED4_TOGGLE		digitalToggle(LED4_GPIO_PORT,LED4_PIN)
-#define LED4_OFF		digitalHi(LED4_GPIO_PORT,LED4_PIN)
-#define LED4_ON			digitalLo(LED4_GPIO_PORT,LED4_PIN)
+/* ÈÄö‰ø°ÊùøËøêË°åÊåáÁ§∫ÁÅØ : PB8 */
+#define LED_RUN_PIN                 GPIO_PIN_8
+#define LED_RUN_PORT                GPIOB
+#define LED_RUN_CLK_ENABLE()        __HAL_RCC_GPIOB_CLK_ENABLE()
 
 
-/* ª˘±æªÏ…´£¨∫Û√Ê∏ﬂº∂”√∑® π”√PWMø…ªÏ≥ˆ»´≤ —’…´,«“–ßπ˚∏¸∫√ */
+/*==========================================================================
+ * LED ÁîµÂπ≥ÈÄªËæë (‰ΩéÁîµÂπ≥ÁÇπ‰∫Æ, ÁÅåÁîµÊµÅÈ©±Âä®)
+ *   ON  = GPIO_PIN_RESET  (ËæìÂá∫‰ΩéÁîµÂπ≥ ‚Üí LED ‰∫Æ)
+ *   OFF = GPIO_PIN_SET    (ËæìÂá∫È´òÁîµÂπ≥ ‚Üí LED ÁÅ≠)
+ *==========================================================================*/
+#define ON     GPIO_PIN_RESET
+#define OFF    GPIO_PIN_SET
+#define TOGGLE 2U             /* LED_485_Set() ÁøªËΩ¨ */
 
-//∫Ï
-#define LED_RED  \
-					LED1_ON;\
-					LED2_OFF\
-					LED3_OFF
+/*==========================================================================
+ * Áõ¥Êé•Êìç‰ΩúÂØÑÂ≠òÂô®ÁöÑ GPIO ÂéüÂ≠êÊìç‰Ωú
+ *==========================================================================*/
+#define	digitalHi(p,i)       {p->BSRR=i;}              /* ËæìÂá∫È´òÁîµÂπ≥ */
+#define digitalLo(p,i)       {p->BSRR=(uint32_t)i << 16;} /* ËæìÂá∫‰ΩéÁîµÂπ≥ */
+#define digitalToggle(p,i)   {p->ODR ^=i;}             /* ÁøªËΩ¨ËæìÂá∫ */
 
-//¬Ã
-#define LED_GREEN		\
-					LED1_OFF;\
-					LED2_ON\
-					LED3_OFF
+/*==========================================================================
+ * ÂêÑ LED ÁöÑÊéßÂà∂ÂÆè
+ *==========================================================================*/
+/* 485-1-LED */
+#define LED_485_1_TOGGLE    digitalToggle(LED_485_1_PORT, LED_485_1_PIN)
+#define LED_485_1_OFF       digitalHi(LED_485_1_PORT, LED_485_1_PIN)
+#define LED_485_1_ON        digitalLo(LED_485_1_PORT, LED_485_1_PIN)
 
-//¿∂
-#define LED_BLUE	\
-					LED1_OFF;\
-					LED2_OFF\
-					LED3_ON
+/* 485-2-LED */
+#define LED_485_2_TOGGLE    digitalToggle(LED_485_2_PORT, LED_485_2_PIN)
+#define LED_485_2_OFF       digitalHi(LED_485_2_PORT, LED_485_2_PIN)
+#define LED_485_2_ON        digitalLo(LED_485_2_PORT, LED_485_2_PIN)
 
-					
-//ª∆(∫Ï+¬Ã)					
-#define LED_YELLOW	\
-					LED1_ON;\
-					LED2_ON\
-					LED3_OFF
-//◊œ(∫Ï+¿∂)
-#define LED_PURPLE	\
-					LED1_ON;\
-					LED2_OFF\
-					LED3_ON
+/* 485-3-LED */
+#define LED_485_3_TOGGLE    digitalToggle(LED_485_3_PORT, LED_485_3_PIN)
+#define LED_485_3_OFF       digitalHi(LED_485_3_PORT, LED_485_3_PIN)
+#define LED_485_3_ON        digitalLo(LED_485_3_PORT, LED_485_3_PIN)
 
-//«‡(¬Ã+¿∂)
-#define LED_CYAN \
-					LED1_OFF;\
-					LED2_ON\
-					LED3_ON
-					
-//∞◊(∫Ï+¬Ã+¿∂)
-#define LED_WHITE	\
-					LED1_ON;\
-					LED2_ON\
-					LED3_ON
-					
-//∫⁄(»´≤øπÿ±’)
-#define LED_RGBOFF	\
-					LED1_OFF;\
-					LED2_OFF\
-					LED3_OFF
-					
+/* 485-4-LED */
+#define LED_485_4_TOGGLE    digitalToggle(LED_485_4_PORT, LED_485_4_PIN)
+#define LED_485_4_OFF       digitalHi(LED_485_4_PORT, LED_485_4_PIN)
+#define LED_485_4_ON        digitalLo(LED_485_4_PORT, LED_485_4_PIN)
 
+/* 485-5-LED */
+#define LED_485_5_TOGGLE    digitalToggle(LED_485_5_PORT, LED_485_5_PIN)
+#define LED_485_5_OFF       digitalHi(LED_485_5_PORT, LED_485_5_PIN)
+#define LED_485_5_ON        digitalLo(LED_485_5_PORT, LED_485_5_PIN)
 
+/* 485-6-LED */
+#define LED_485_6_TOGGLE    digitalToggle(LED_485_6_PORT, LED_485_6_PIN)
+#define LED_485_6_OFF       digitalHi(LED_485_6_PORT, LED_485_6_PIN)
+#define LED_485_6_ON        digitalLo(LED_485_6_PORT, LED_485_6_PIN)
 
+/* ËøêË°åÁÅØ */
+#define LED_RUN_TOGGLE      digitalToggle(LED_RUN_PORT, LED_RUN_PIN)
+#define LED_RUN_OFF         digitalHi(LED_RUN_PORT, LED_RUN_PIN)
+#define LED_RUN_ON          digitalLo(LED_RUN_PORT, LED_RUN_PIN)
 
+/*==========================================================================
+ * ÊâπÈáèÊéßÂà∂ÂÆè
+ *==========================================================================*/
+/* ÂÖ®ÈÉ® 485 ÈÄöÈÅìÁÅØÂêåÊó∂‰∫Æ/ÁÅ≠ */
+#define LED_485_ALL_ON      \
+    do {                    \
+        LED_485_1_ON;       \
+        LED_485_2_ON;       \
+        LED_485_3_ON;       \
+        LED_485_4_ON;       \
+        LED_485_5_ON;       \
+        LED_485_6_ON;       \
+    } while(0)
+
+#define LED_485_ALL_OFF     \
+    do {                    \
+        LED_485_1_OFF;      \
+        LED_485_2_OFF;      \
+        LED_485_3_OFF;      \
+        LED_485_4_OFF;      \
+        LED_485_5_OFF;      \
+        LED_485_6_OFF;      \
+    } while(0)
+
+/*==========================================================================
+ * ÂáΩÊï∞Â£∞Êòé
+ *==========================================================================*/
 void LED_GPIO_Config(void);
+void LED_485_Set(uint8_t ch, uint8_t state);
 
 #endif /* __LED_H */

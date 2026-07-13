@@ -2,64 +2,118 @@
   ******************************************************************************
   * @file    bsp_led.c
   * @author  fire
-  * @version V1.0
-  * @date    2017-xx-xx
-  * @brief   ledÓ¦ÓÃº¯Êı½Ó¿Ú
-  ******************************************************************************
-  * @attention
-  *
-  * ÊµÑéÆ½Ì¨:Ò°»ğ STM32 F429 ¿ª·¢°å  
-  * ÂÛÌ³    :http://www.firebbs.cn
-  * ÌÔ±¦    :http://firestm32.taobao.com
-  *
+  * @version V2.0
+  * @date    2026-07-10
+  * @brief   7 è·¯å•è‰² LED é©±åŠ¨ (6 è·¯ 485 é€šé“ç¯ + 1 è·¯è¿è¡Œç¯)
   ******************************************************************************
   */
-  
-#include "./led/bsp_led.h"   
 
- /**
-  * @brief  ³õÊ¼»¯¿ØÖÆLEDµÄIO
-  * @param  ÎŞ
-  * @retval ÎŞ
+#include "./led/bsp_led.h"
+
+/**
+  * @brief  åˆå§‹åŒ–å…¨éƒ¨ 7 è·¯ LED çš„ GPIO
+  * @param  æ— 
+  * @retval æ— 
   */
 void LED_GPIO_Config(void)
-{		
-		
-    /*¶¨ÒåÒ»¸öGPIO_InitTypeDefÀàĞÍµÄ½á¹¹Ìå*/
+{
     GPIO_InitTypeDef  GPIO_InitStruct;
 
-    /*¿ªÆôLEDÏà¹ØµÄGPIOÍâÉèÊ±ÖÓ*/
-    LED1_GPIO_CLK_ENABLE();
-    LED2_GPIO_CLK_ENABLE();
-    LED3_GPIO_CLK_ENABLE();
+    /* ä½¿èƒ½å„ LED æ‰€åœ¨ GPIO ç«¯å£çš„æ—¶é’Ÿ */
+    LED_485_1_CLK_ENABLE();
+    LED_485_2_CLK_ENABLE();
+    LED_485_3_CLK_ENABLE();
+    LED_485_4_CLK_ENABLE();
+    LED_485_5_CLK_ENABLE();
+    LED_485_6_CLK_ENABLE();
+    LED_RUN_CLK_ENABLE();
 
-    /*Ñ¡ÔñÒª¿ØÖÆµÄGPIOÒı½Å*/															   
-    GPIO_InitStruct.Pin = LED1_PIN;	
-
-    /*ÉèÖÃÒı½ÅµÄÊä³öÀàĞÍÎªÍÆÍìÊä³ö*/
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;  
-
-    /*ÉèÖÃÒı½ÅÎªÉÏÀ­Ä£Ê½*/
+    /* é€šç”¨é…ç½®: æ¨æŒ½è¾“å‡º + ä¸Šæ‹‰ + é«˜é€Ÿ */
+    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull  = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_HIGH;
 
-    /*ÉèÖÃÒı½ÅËÙÂÊÎª¸ßËÙ */   
-    GPIO_InitStruct.Speed = GPIO_SPEED_HIGH; 
+    /* 485-1-LED : PD7 */
+    GPIO_InitStruct.Pin = LED_485_1_PIN;
+    HAL_GPIO_Init(LED_485_1_PORT, &GPIO_InitStruct);
 
-    /*µ÷ÓÃ¿âº¯Êı£¬Ê¹ÓÃÉÏÃæÅäÖÃµÄGPIO_InitStructure³õÊ¼»¯GPIO*/
-    HAL_GPIO_Init(LED1_GPIO_PORT, &GPIO_InitStruct);	
+    /* 485-2-LED : PG9 */
+    GPIO_InitStruct.Pin = LED_485_2_PIN;
+    HAL_GPIO_Init(LED_485_2_PORT, &GPIO_InitStruct);
 
-    /*Ñ¡ÔñÒª¿ØÖÆµÄGPIOÒı½Å*/															   
-    GPIO_InitStruct.Pin = LED2_PIN;	
-    HAL_GPIO_Init(LED2_GPIO_PORT, &GPIO_InitStruct);	
+    /* 485-3-LED : PG10 */
+    GPIO_InitStruct.Pin = LED_485_3_PIN;
+    HAL_GPIO_Init(LED_485_3_PORT, &GPIO_InitStruct);
 
-    /*Ñ¡ÔñÒª¿ØÖÆµÄGPIOÒı½Å*/															   
-    GPIO_InitStruct.Pin = LED3_PIN;	
-    HAL_GPIO_Init(LED3_GPIO_PORT, &GPIO_InitStruct);	
+    /* 485-4-LED : PG12 */
+    GPIO_InitStruct.Pin = LED_485_4_PIN;
+    HAL_GPIO_Init(LED_485_4_PORT, &GPIO_InitStruct);
 
+    /* 485-5-LED : PB3 */
+    GPIO_InitStruct.Pin = LED_485_5_PIN;
+    HAL_GPIO_Init(LED_485_5_PORT, &GPIO_InitStruct);
 
-    /*¹Ø±ÕRGBµÆ*/
-    LED_RGBOFF;
+    /* 485-6-LED : PB4 */
+    GPIO_InitStruct.Pin = LED_485_6_PIN;
+    HAL_GPIO_Init(LED_485_6_PORT, &GPIO_InitStruct);
 
-		
+    /* è¿è¡Œç¯ : PB8 */
+    GPIO_InitStruct.Pin = LED_RUN_PIN;
+    HAL_GPIO_Init(LED_RUN_PORT, &GPIO_InitStruct);
+
+    /* åˆå§‹åŒ–åå…¨éƒ¨ç†„ç­ */
+    LED_485_ALL_OFF;
+    LED_RUN_OFF;
 }
+
+/**
+  * @brief  æŒ‰é€šé“å·æ§åˆ¶ 485 LED
+  * @param  ch    : é€šé“å· (0~5, å¯¹åº” 485-1 ~ 485-6)
+  * @param  state : ON (äº®), OFF (ç­), æˆ–å…¶å®ƒå€¼ (ç¿»è½¬)
+  * @retval æ— 
+  */
+void LED_485_Set(uint8_t ch, uint8_t state)
+{
+    switch (ch) {
+    case 0: {
+        if (state == ON)        LED_485_1_ON
+        else if (state == OFF)  LED_485_1_OFF
+        else                    LED_485_1_TOGGLE;
+        break;
+    }
+    case 1: {
+        if (state == ON)        LED_485_2_ON
+        else if (state == OFF)  LED_485_2_OFF
+        else                    LED_485_2_TOGGLE;
+        break;
+    }
+    case 2: {
+        if (state == ON)        LED_485_3_ON
+        else if (state == OFF)  LED_485_3_OFF
+        else                    LED_485_3_TOGGLE;
+        break;
+    }
+    case 3: {
+        if (state == ON)        LED_485_4_ON
+        else if (state == OFF)  LED_485_4_OFF
+        else                    LED_485_4_TOGGLE;
+        break;
+    }
+    case 4: {
+        if (state == ON)        LED_485_5_ON
+        else if (state == OFF)  LED_485_5_OFF
+        else                    LED_485_5_TOGGLE;
+        break;
+    }
+    case 5: {
+        if (state == ON)        LED_485_6_ON
+        else if (state == OFF)  LED_485_6_OFF
+        else                    LED_485_6_TOGGLE;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 /*********************************************END OF FILE**********************/

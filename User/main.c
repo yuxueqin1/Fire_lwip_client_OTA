@@ -245,7 +245,8 @@ static void Test1_Task(void *parameter)
 {
     (void)parameter;
     while (1) {
-        // LED1_TOGGLE;   //红色
+        
+        LED_RUN_TOGGLE;
         vTaskDelay(1000);
     }
 }
@@ -330,10 +331,10 @@ static void App_TaskStart(void *pvParameters)
     pStart = 1U;  /* 标记系统启动, 触发启动日志上报 */
 
     while (1) {
-        // cnts++;
+        cnts++;
         heartbeat++;
 
-        // /* ---- 根据配置状态调整 LED 闪烁频率 ---- */
+        /* ---- 运行灯心跳 (根据配置状态调整闪烁频率) ---- */
         // if (download_flag == 1U) {
         //     /*
         //      * 配置已下载: 心跳周期 1000 (10s), LED 每 50 次翻转 = 500ms.
@@ -341,8 +342,7 @@ static void App_TaskStart(void *pvParameters)
         //     number = 1000U;
         //     if (cnts > 50U) {
         //         cnts = 0U;
-        //         // BSP_LED_Toggle(2, 13);  /* LED 翻转 (运行指示) */
-        //         // BSP_LED_Toggle(2, 4);
+        //         LED_RUN_TOGGLE;
         //     }
         // } else {
         //     /*
@@ -350,17 +350,13 @@ static void App_TaskStart(void *pvParameters)
         //      */
         //     if (cnts > 10U) {
         //         cnts = 0U;
-        //         // BSP_LED_Toggle(2, 13);
-        //         // BSP_LED_Toggle(2, 4);
+        //         LED_RUN_TOGGLE;
         //     }
         // }
 
-        // /* ---- 报警灯控制 ---- */
-        // if (ALARM != 0U) {
-        //     // GPIO_PinWrite(2, 11, 1);   /* 点亮报警灯 */
-        // } else {
-        //     // GPIO_PinWrite(2, 11, 0);   /* 熄灭报警灯 */
-        // }
+        /* ---- 报警灯控制 (使用 485-1-LED 作为报警指示) ---- */
+        // if (ALARM != 0U) { LED_485_1_ON;  }
+        // else            { LED_485_1_OFF; }
 
         /* ---- 累加各端口 WDT 计数器 ---- */
         for (i = 0; i < UART_PORT_COUNT; i++) {
@@ -456,7 +452,7 @@ static void uart_task_handler(void *pvParameters)
 
     while (1) {
 
-        LED1_TOGGLE;  //debug:红色
+        LED_485_Set(port_idx, TOGGLE);  /* 485 通道通信闪烁指示 */
         /* ---- 清零本端口 WDT 计数器 (告知 App_TaskStart 本任务存活) ---- */
         WDTUARTFLAG[port_idx] = 0;
         runtime.data_len = 0;

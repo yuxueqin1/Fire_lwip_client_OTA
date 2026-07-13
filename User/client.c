@@ -240,8 +240,6 @@ void client_send_pending(void)
         } while (retry-- > 0U);
 
         if (err == ERR_OK) {
-
-            LED2_TOGGLE;  //debug:绿色 
             /* 发送成功: 清空槽位 */
             if (tcp_queue_lock != NULL) {
                 xSemaphoreTake(tcp_queue_lock, portMAX_DELAY);
@@ -380,7 +378,6 @@ static void client_handle_rx(const uint8_t *buf, uint16_t len)
              * 当前实现跳过此恢复逻辑 (与原程序最终行为一致).
              */
             download_flag = 1U;
-            LED2_TOGGLE;  //debug:绿色
         } else {
             /*
              * 配置变更 — 先保存所有端口的曲线信息 (防丢失),
@@ -396,7 +393,6 @@ static void client_handle_rx(const uint8_t *buf, uint16_t len)
                  */
             }
             WTD_RESET = 1U;   /* 看门狗复位码: 1 = 配置变更复位 */
-            LED3_TOGGLE;  //debug：蓝色
         }
 #endif /* 调试阶段: 绕过 EEPROM */
 
@@ -405,7 +401,6 @@ static void client_handle_rx(const uint8_t *buf, uint16_t len)
          * 通信板就绪后, 删除下面两行, 并将上方 #if 0 改为 #if 1.
          */
         download_flag = 1U;
-        // LED2_TOGGLE;  //debug:绿色 — 配置已接收
     }
     /*==================================================================*/
     /*  校时命令: [0x00, 0xA3, 0x04, 0x00, timestamp(4 bytes)]         */

@@ -125,14 +125,21 @@ static void low_level_init(struct netif *netif)
 { 
   HAL_StatusTypeDef hal_eth_init_status;
   
-  //ЁУй╪╩╞bsp║╙eth
+  //О©╫О©╫й╪О©╫О©╫bspО©╫О©╫eth
   hal_eth_init_status = Bsp_Eth_Init();
 
-  if (hal_eth_init_status == HAL_OK)
-  {
-    /* Set netif link flag */  
-    netif->flags |= NETIF_FLAG_LINK_UP;
+  if (hal_eth_init_status != HAL_OK) {
+    PRINT_ERR("Bsp_Eth_Init returned %d Б─■ PHY MDIO access failed, "
+              "but MAC+DMA are configured. Relying on PHY hardware "
+              "auto-negotiation.\r\n", hal_eth_init_status);
   }
+
+  /* Always set link up Б─■ DP83848K auto-negotiates independently
+   * of software MDIO access. Even if HAL_ETH_Init fails due to
+   * PHY address mismatch on MDIO, the MAC + DMA are already
+   * configured and the PHY establishes the physical link on its own
+   * after hardware power-up/reset. */
+  netif->flags |= NETIF_FLAG_LINK_UP;
 
 #if LWIP_ARP || LWIP_ETHERNET 
 
@@ -170,16 +177,16 @@ static void low_level_init(struct netif *netif)
 
   /* create the task that handles the ETH_MAC */
 	sys_thread_new("ETHIN",
-                  ethernetif_input,  /* хннЯхК©з╨╞йЩ */
-                  netif,        	  /* хннЯхК©з╨╞йЩ╡нйЩ */
-                  NETIF_IN_TASK_STACK_SIZE,/* хннЯу╩╢Сп║ */
-                  NETIF_IN_TASK_PRIORITY); /* хннЯ╣дсеох╪╤ */
+                  ethernetif_input,  /* О©╫О©╫О©╫О©╫О©╫О©╫з╨О©╫О©╫О©╫ */
+                  netif,        	  /* О©╫О©╫О©╫О©╫О©╫О©╫з╨О©╫О©╫О©╫О©╫О©╫О©╫О©╫ */
+                  NETIF_IN_TASK_STACK_SIZE,/* О©╫О©╫О©╫О©╫у╩О©╫О©╫п║ */
+                  NETIF_IN_TASK_PRIORITY); /* О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫х╪О©╫ */
                   
 //	sys_thread_new("ETHTX",
-//                  ethernetif_output,  /* хннЯхК©з╨╞йЩ */
-//                  netif,        	  /* хннЯхК©з╨╞йЩ╡нйЩ */
-//                  NETIF_OUT_TASK_STACK_SIZE,/* хннЯу╩╢Сп║ */
-//                  NETIF_OUT_TASK_PRIORITY); /* хннЯ╣дсеох╪╤ */
+//                  ethernetif_output,  /* О©╫О©╫О©╫О©╫О©╫О©╫з╨О©╫О©╫О©╫ */
+//                  netif,        	  /* О©╫О©╫О©╫О©╫О©╫О©╫з╨О©╫О©╫О©╫О©╫О©╫О©╫О©╫ */
+//                  NETIF_OUT_TASK_STACK_SIZE,/* О©╫О©╫О©╫О©╫у╩О©╫О©╫п║ */
+//                  NETIF_OUT_TASK_PRIORITY); /* О©╫О©╫О©╫О©╫О©╫О©╫О©╫О©╫х╪О©╫ */
                                  
 /* USER CODE END PHY_PRE_CONFIG */
   

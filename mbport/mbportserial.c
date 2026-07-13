@@ -54,13 +54,13 @@ static const struct
     IRQn_Type               IRQn;
 } arxSerialPortConfig[MBP_SERIAL_PORTS] =
 {
-    { USART1, GPIOA, GPIO_PIN_10, GPIO_AF7_USART1, GPIOA, GPIO_PIN_9, GPIO_AF7_USART1, GPIOA, GPIO_PIN_11, USART1_IRQn },
-    { USART2, GPIOD, GPIO_PIN_6,  GPIO_AF7_USART2, GPIOD, GPIO_PIN_5, GPIO_AF7_USART2, GPIOD, GPIO_PIN_11,   USART2_IRQn },//现在在其他板子上测试，所以这个引脚有区别，DIR:PD4->PD11
-    { USART3, GPIOB, GPIO_PIN_11, GPIO_AF7_USART3, GPIOB, GPIO_PIN_10, GPIO_AF7_USART3, GPIOH, GPIO_PIN_6,  USART3_IRQn },
-    { UART4, GPIOC, GPIO_PIN_11, GPIO_AF8_UART4, GPIOC, GPIO_PIN_10, GPIO_AF8_UART4, GPIOA, GPIO_PIN_15, UART4_IRQn  },
-    { UART5, GPIOD, GPIO_PIN_2,  GPIO_AF8_UART5, GPIOC, GPIO_PIN_12, GPIO_AF8_UART5, GPIOA, GPIO_PIN_15, UART5_IRQn  },
-    { USART6,GPIOC, GPIO_PIN_7,  GPIO_AF8_USART6,GPIOC, GPIO_PIN_6,  GPIO_AF8_USART6,GPIOC, GPIO_PIN_8,  USART6_IRQn },
-    { UART7, GPIOF, GPIO_PIN_6,  GPIO_AF8_UART7, GPIOF, GPIO_PIN_7, GPIO_AF8_UART7, GPIOF, GPIO_PIN_8,  UART7_IRQn  }
+    { UART7, GPIOF, GPIO_PIN_6,  GPIO_AF8_UART7, GPIOF, GPIO_PIN_7, GPIO_AF8_UART7, GPIOF, GPIO_PIN_8,  UART7_IRQn  },//485-1
+    { USART2, GPIOD, GPIO_PIN_6,  GPIO_AF7_USART2, GPIOD, GPIO_PIN_5, GPIO_AF7_USART2, GPIOD, GPIO_PIN_4,  USART2_IRQn },//485-2
+    { UART5, GPIOD, GPIO_PIN_2,  GPIO_AF8_UART5, GPIOC, GPIO_PIN_12, GPIO_AF8_UART5, GPIOD, GPIO_PIN_3, UART5_IRQn  },//485-3
+    { UART4, GPIOC, GPIO_PIN_11, GPIO_AF8_UART4, GPIOC, GPIO_PIN_10, GPIO_AF8_UART4, GPIOA, GPIO_PIN_15, UART4_IRQn  },//485-4
+    { USART1, GPIOA, GPIO_PIN_10, GPIO_AF7_USART1, GPIOA, GPIO_PIN_9, GPIO_AF7_USART1, GPIOA, GPIO_PIN_11, USART1_IRQn },//485-5
+    { USART6,GPIOC, GPIO_PIN_7,  GPIO_AF8_USART6,GPIOC, GPIO_PIN_6,  GPIO_AF8_USART6,GPIOC, GPIO_PIN_8,  USART6_IRQn },//485-6
+    { USART3, GPIOB, GPIO_PIN_11, GPIO_AF7_USART3, GPIOB, GPIO_PIN_10, GPIO_AF7_USART3, GPIOH, GPIO_PIN_6,  USART3_IRQn }//485-7 
 };
 
 static xSerialPortInternal arxSerialPorts[MBP_SERIAL_PORTS];
@@ -371,7 +371,7 @@ static void prvUARTIRQHandler( xSerialPortInternal *pxSerial )
 
 void USART1_IRQHandler( void )
 {
-    prvUARTIRQHandler( &arxSerialPorts[0] );
+    prvUARTIRQHandler( &arxSerialPorts[4] );
 }
 
 void USART2_IRQHandler( void )
@@ -381,7 +381,7 @@ void USART2_IRQHandler( void )
 
 void USART3_IRQHandler( void )
 {
-    prvUARTIRQHandler( &arxSerialPorts[2] );
+    prvUARTIRQHandler( &arxSerialPorts[6] );
 }
 
 void UART4_IRQHandler( void )
@@ -391,7 +391,7 @@ void UART4_IRQHandler( void )
 
 void UART5_IRQHandler( void )
 {
-    prvUARTIRQHandler( &arxSerialPorts[4] );
+    prvUARTIRQHandler( &arxSerialPorts[2] );
 }
 
 void USART6_IRQHandler( void )
@@ -401,7 +401,7 @@ void USART6_IRQHandler( void )
 
 void UART7_IRQHandler( void )
 {
-    prvUARTIRQHandler( &arxSerialPorts[6] );
+    prvUARTIRQHandler( &arxSerialPorts[0] );
 }
 
 /* ----------------------- Start implementation -----------------------------*/

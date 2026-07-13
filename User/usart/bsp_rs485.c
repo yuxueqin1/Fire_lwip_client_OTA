@@ -348,7 +348,7 @@ eMBErrorCode uart_init_port(uint8_t port_idx, uint32_t baud_rate, xMBMHandle *px
 /*  6 路串口引脚映射:                                                     */
 /*    端口     UART外设    TX      RX      EN(DE)                          */
 /*    USART1  USART1     PA9     PA10    PA11                             */
-/*    USART2  USART2     PD5     PD6     PD11   //debug:PD4改成PD11,因为现在在用调试板测试                           */
+/*    USART2  USART2     PD5     PD6     PD4                              */
 /*    USART3  USART3     PB10    PB11    PH6                              */
 /*    UART4   UART4      PC10    PC11    PA15                             */
 /*    UART5   UART5      PC12    PD2     PA15                             */
@@ -376,30 +376,30 @@ eMBErrorCode uart_init_custom_raw(uint8_t port_idx, uint32_t baud_rate)
      * 注意: USART1/USART6 在 APB2 上, USART2/3 和 UART4/5 在 APB1 上.
      */
     switch (port_idx) {
-    case 0:  /* USART1: TX=PA9(AF7), RX=PA10(AF7), DE=PA11 */
-        uart_instance   = USART1;
-        gpio_port_tx    = GPIOA;  gpio_pin_tx = GPIO_PIN_9;   af_tx = GPIO_AF7_USART1;
-        gpio_port_rx    = GPIOA;  gpio_pin_rx = GPIO_PIN_10;  af_rx = GPIO_AF7_USART1;
-        gpio_port_de    = GPIOA;  gpio_pin_de = GPIO_PIN_11;
-        __HAL_RCC_GPIOA_CLK_ENABLE();
-        __HAL_RCC_USART1_CLK_ENABLE();
+    case 0:  /* UART7: TX=PF7(AF8), RX=PF6(AF8), DE=PF8 */
+        uart_instance   = UART7;
+        gpio_port_tx    = GPIOF;  gpio_pin_tx = GPIO_PIN_7;   af_tx = GPIO_AF8_UART7;
+        gpio_port_rx    = GPIOF;  gpio_pin_rx = GPIO_PIN_6;  af_rx = GPIO_AF8_UART7;
+        gpio_port_de    = GPIOF;  gpio_pin_de = GPIO_PIN_8;
+        __HAL_RCC_GPIOF_CLK_ENABLE();
+        __HAL_RCC_UART7_CLK_ENABLE();
         break;
-    case 1:  /* USART2: TX=PD5(AF7), RX=PD6(AF7), DE=PD11 */
+    case 1:  /* USART2: TX=PD5(AF7), RX=PD6(AF7), DE=PD4 */
         uart_instance   = USART2;
         gpio_port_tx    = GPIOD;  gpio_pin_tx = GPIO_PIN_5;   af_tx = GPIO_AF7_USART2;
         gpio_port_rx    = GPIOD;  gpio_pin_rx = GPIO_PIN_6;   af_rx = GPIO_AF7_USART2;
-        gpio_port_de    = GPIOD;  gpio_pin_de = GPIO_PIN_11;// debug:PD4改成PD11,因为现在在用调试板测试
+        gpio_port_de    = GPIOD;  gpio_pin_de = GPIO_PIN_4;
         __HAL_RCC_GPIOD_CLK_ENABLE();
         __HAL_RCC_USART2_CLK_ENABLE();
         break;
-    case 2:  /* USART3: TX=PB10(AF7), RX=PB11(AF7), DE=PH6 */
-        uart_instance   = USART3;
-        gpio_port_tx    = GPIOB;  gpio_pin_tx = GPIO_PIN_10;  af_tx = GPIO_AF7_USART3;
-        gpio_port_rx    = GPIOB;  gpio_pin_rx = GPIO_PIN_11;  af_rx = GPIO_AF7_USART3;
-        gpio_port_de    = GPIOH;  gpio_pin_de = GPIO_PIN_6;
-        __HAL_RCC_GPIOB_CLK_ENABLE();
-        __HAL_RCC_GPIOH_CLK_ENABLE();
-        __HAL_RCC_USART3_CLK_ENABLE();
+    case 2:  /* UART5: TX=PC12(AF8), RX=PD2(AF8), DE=PD3 */
+        uart_instance   = UART5;
+        gpio_port_tx    = GPIOC;  gpio_pin_tx = GPIO_PIN_12;  af_tx = GPIO_AF8_UART5;
+        gpio_port_rx    = GPIOD;  gpio_pin_rx = GPIO_PIN_2;   af_rx = GPIO_AF8_UART5;
+        gpio_port_de    = GPIOD;  gpio_pin_de = GPIO_PIN_3;
+        __HAL_RCC_GPIOC_CLK_ENABLE();
+        __HAL_RCC_GPIOD_CLK_ENABLE();
+        __HAL_RCC_UART5_CLK_ENABLE();
         break;
     case 3:  /* UART4: TX=PC10(AF8), RX=PC11(AF8), DE=PA15 */
         uart_instance   = UART4;
@@ -410,15 +410,13 @@ eMBErrorCode uart_init_custom_raw(uint8_t port_idx, uint32_t baud_rate)
         __HAL_RCC_GPIOA_CLK_ENABLE();
         __HAL_RCC_UART4_CLK_ENABLE();
         break;
-    case 4:  /* UART5: TX=PC12(AF8), RX=PD2(AF8), DE=PA15 */
-        uart_instance   = UART5;
-        gpio_port_tx    = GPIOC;  gpio_pin_tx = GPIO_PIN_12;  af_tx = GPIO_AF8_UART5;
-        gpio_port_rx    = GPIOD;  gpio_pin_rx = GPIO_PIN_2;   af_rx = GPIO_AF8_UART5;
-        gpio_port_de    = GPIOA;  gpio_pin_de = GPIO_PIN_15;
-        __HAL_RCC_GPIOC_CLK_ENABLE();
-        __HAL_RCC_GPIOD_CLK_ENABLE();
+    case 4:  /* USART1: TX=PA9(AF7), RX=PA10(AF7), DE=PA11 */
+        uart_instance   = USART1;
+        gpio_port_tx    = GPIOA;  gpio_pin_tx = GPIO_PIN_9;   af_tx = GPIO_AF7_USART1;
+        gpio_port_rx    = GPIOA;  gpio_pin_rx = GPIO_PIN_10;  af_rx = GPIO_AF7_USART1;
+        gpio_port_de    = GPIOA;  gpio_pin_de = GPIO_PIN_11;
         __HAL_RCC_GPIOA_CLK_ENABLE();
-        __HAL_RCC_UART5_CLK_ENABLE();
+        __HAL_RCC_USART1_CLK_ENABLE();
         break;
     case 5:  /* USART6: TX=PC6(AF8), RX=PC7(AF8), DE=PC8 */
         uart_instance   = USART6;
