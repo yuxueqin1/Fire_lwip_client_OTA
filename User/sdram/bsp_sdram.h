@@ -6,20 +6,20 @@
 
 
 
-#define IS42S16400J_SIZE 0x800000  //400000*16bits = 0x800000  £¬8M×Ö½Ú
+#define IS42S16160J_SIZE 0x2000000  // 4M*16bits*4banks = 0x2000000 (32MB)
 
 
-/*SDRAM µÄbankÑ¡Ôñ*/  
-#define FMC_BANK_SDRAM            FMC_Bank2_SDRAM  
-#define FMC_COMMAND_TARGET_BANK   FMC_SDRAM_CMD_TARGET_BANK2
+/*SDRAM ï¿½ï¿½bankÑ¡ï¿½ï¿½*/  
+#define FMC_BANK_SDRAM            FMC_Bank1_SDRAM
+#define FMC_COMMAND_TARGET_BANK   FMC_SDRAM_CMD_TARGET_BANK1
 
 /**
-  * @brief  FMC SDRAM Êý¾Ý»ùµØÖ·
+  * @brief  FMC SDRAM ï¿½ï¿½ï¿½Ý»ï¿½ï¿½ï¿½Ö·
   */   
-#define SDRAM_BANK_ADDR     ((uint32_t)0xD0000000)
+#define SDRAM_BANK_ADDR     ((uint32_t)0xC0000000)
   
 /**
-  * @brief  FMC SDRAM Êý¾Ý¿í¶È
+  * @brief  FMC SDRAM ï¿½ï¿½ï¿½Ý¿ï¿½ï¿½ï¿½
   */  
 /* #define SDRAM_MEMORY_WIDTH   FMC_SDMemory_Width_8b  */
 #define SDRAM_MEMORY_WIDTH    FMC_SDRAM_MEM_BUS_WIDTH_16 
@@ -31,13 +31,13 @@
 #define SDRAM_CAS_LATENCY    FMC_SDRAM_CAS_LATENCY_3
 
 /**
-  * @brief  FMC SDRAM SDCLKÊ±ÖÓ·ÖÆµÒò×Ó
+  * @brief  FMC SDRAM SDCLKÊ±ï¿½Ó·ï¿½Æµï¿½ï¿½ï¿½ï¿½
   */  
 #define SDCLOCK_PERIOD    FMC_SDRAM_CLOCK_PERIOD_2        /* Default configuration used with LCD */
 /* #define SDCLOCK_PERIOD    FMC_SDClock_Period_3 */
 
 /**
-  * @brief  FMC SDRAM Í»·¢¶ÁÈ¡ÌØÐÔ
+  * @brief  FMC SDRAM Í»ï¿½ï¿½ï¿½ï¿½È¡ï¿½ï¿½ï¿½ï¿½
   */  
 #define SDRAM_READBURST    FMC_SDRAM_RBURST_DISABLE    /* Default configuration used with LCD */
 /* #define SDRAM_READBURST    FMC_Read_Burst_Enable  */
@@ -52,7 +52,7 @@
 
 
 /**
-  * @brief  FMC SDRAM Ä£Ê½ÅäÖÃµÄ¼Ä´æÆ÷Ïà¹Ø¶¨Òå
+  * @brief  FMC SDRAM Ä£Ê½ï¿½ï¿½ï¿½ÃµÄ¼Ä´ï¿½ï¿½ï¿½ï¿½ï¿½Ø¶ï¿½ï¿½ï¿½
   */
 #define SDRAM_MODEREG_BURST_LENGTH_1             ((uint16_t)0x0000)
 #define SDRAM_MODEREG_BURST_LENGTH_2             ((uint16_t)0x0001)
@@ -67,7 +67,7 @@
 #define SDRAM_MODEREG_WRITEBURST_MODE_SINGLE     ((uint16_t)0x0200)      
 
 
-/*ÐÅÏ¢Êä³ö*/
+/*ï¿½ï¿½Ï¢ï¿½ï¿½ï¿½*/
 #define SDRAM_DEBUG_ON         1
 
 #define SDRAM_INFO(fmt,arg...)           printf("<<-SDRAM-INFO->> "fmt"\n",##arg)
@@ -80,7 +80,7 @@
   * @}
   */  
  
-/*µØÖ·ÐÅºÅÏß*/  
+/*ï¿½ï¿½Ö·ï¿½Åºï¿½ï¿½ï¿½*/  
 #define FMC_A0_GPIO_PORT        GPIOF
 #define FMC_A0_GPIO_CLK         __HAL_RCC_GPIOF_CLK_ENABLE()
 #define FMC_A0_GPIO_PIN         GPIO_PIN_0
@@ -155,7 +155,14 @@
 #define FMC_A11_PINSOURCE        GPIO_PinSource1
 #define FMC_A11_AF               GPIO_AF_FMC
 
-/*Êý¾ÝÐÅºÅÏß*/
+
+#define FMC_A12_GPIO_PORT        GPIOG
+#define FMC_A12_GPIO_CLK         __HAL_RCC_GPIOG_CLK_ENABLE()
+#define FMC_A12_GPIO_PIN         GPIO_PIN_2
+#define FMC_A12_PINSOURCE        GPIO_PinSource2
+#define FMC_A12_AF               GPIO_AF_FMC
+
+/*ï¿½ï¿½ï¿½ï¿½ï¿½Åºï¿½ï¿½ï¿½*/
 #define FMC_D0_GPIO_PORT        GPIOD
 #define FMC_D0_GPIO_CLK         __HAL_RCC_GPIOD_CLK_ENABLE()
 #define FMC_D0_GPIO_PIN         GPIO_PIN_14
@@ -253,11 +260,11 @@
 #define FMC_D15_AF               GPIO_AF_FMC
 
 
-/*¿ØÖÆÐÅºÅÏß*/  
-#define FMC_CS_GPIO_PORT        GPIOH
-#define FMC_CS_GPIO_CLK         __HAL_RCC_GPIOH_CLK_ENABLE()
-#define FMC_CS_GPIO_PIN         GPIO_PIN_6
-#define FMC_CS_PINSOURCE        GPIO_PinSource6
+/*ï¿½ï¿½ï¿½ï¿½ï¿½Åºï¿½ï¿½ï¿½*/  
+#define FMC_CS_GPIO_PORT        GPIOC
+#define FMC_CS_GPIO_CLK         __HAL_RCC_GPIOC_CLK_ENABLE()
+#define FMC_CS_GPIO_PIN         GPIO_PIN_2
+#define FMC_CS_PINSOURCE        GPIO_PinSource2
 #define FMC_CS_AF               GPIO_AF_FMC
 
 #define FMC_BA0_GPIO_PORT        GPIOG
@@ -296,10 +303,10 @@
 #define FMC_CLK_PINSOURCE        GPIO_PinSource8
 #define FMC_CLK_AF               GPIO_AF_FMC
 
-#define FMC_CKE_GPIO_PORT        GPIOH
-#define FMC_CKE_GPIO_CLK         __HAL_RCC_GPIOH_CLK_ENABLE()
-#define FMC_CKE_GPIO_PIN         GPIO_PIN_7
-#define FMC_CKE_PINSOURCE        GPIO_PinSource7
+#define FMC_CKE_GPIO_PORT        GPIOC
+#define FMC_CKE_GPIO_CLK         __HAL_RCC_GPIOC_CLK_ENABLE()
+#define FMC_CKE_GPIO_PIN         GPIO_PIN_3
+#define FMC_CKE_PINSOURCE        GPIO_PinSource3
 #define FMC_CKE_AF               GPIO_AF_FMC
 
 /*UDQM LDQM*/
@@ -316,7 +323,7 @@
 #define FMC_LDQM_AF               GPIO_AF_FMC
 
 
-/** @defgroup STM32429 SDRAMº¯Êý
+/** @defgroup STM32429 SDRAMï¿½ï¿½ï¿½ï¿½
   * @{
   */ 
 void  SDRAM_Init(void);

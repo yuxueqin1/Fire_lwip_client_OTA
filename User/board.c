@@ -23,6 +23,7 @@
 #include "./sdram/bsp_sdram.h"
 #include "bsp_eeprom.h"
 
+#include <string.h>
 #include <cm_backtrace.h>
 
 #define HARDWARE_VERSION               "V1.0.0"
@@ -36,34 +37,46 @@ static void GPIO_CLK_Init(void);
  *  SDRAM 曲线数据区诊断测试 (临时 — 测试通过后即可删除)
  * ===========================================================================
  * 测试 SDRAM 中 QX 曲线数据区的读写完整性。
- * 测试 3 个不同地址区域, 每个区域用 3 种 bit 模式遍历:
+ * IS42S16160J-6TLI: 32MB (4M×16×4banks), 13 row bits, 9 col bits
+ *
+ * 测试 5 个不同地址区域, 每个区域用 3 种 bit 模式遍历:
  *   [1] 0xAAAA (偶数位=1, 奇数位=0) → 检测相邻 bit 短路
  *   [2] 0x5555 (偶数位=0, 奇数位=1) → 检测相邻 bit 短路 (互补)
  *   [3] 地址低 16 位作为数据           → 检测地址线粘连/断路
  *
- * 测试范围:
- *   区域 A: SSZ 实时数据区 (0xD0000000)
- *   区域 B: QX  曲线数据区基址 (0xD0005000)
- *   区域 C: Port2 曲线数据区 (0xD0023000) ← 正在测试的端口
+ * 测试范围 (覆盖 32MB 地址空间的关键位):
+ *   区域 A: Bank0, Row 0      (0xC0000000) — 低地址基准
+ *   区域 B: Bank0, Row 20     (0xC0005000) — QX 曲线数据区基址
+ *   区域 C: Bank0, Row 4096   (0xC0800000) — 验证 A12 行地址线
+ *   区域 D: Bank1, Row 0      (0xC0808000) — 验证 Bank 选择 (BA0)
+ *   区域 E: Bank2, Row 0      (0xC1000000) — 验证 Bank 选择 (BA1)
  *
  * 每个区域测试 256 字节 (128 个 uint16_t)。
  * 测试前先备份原始内容, 测试后恢复。
+ *
+ * LED 指示:
+ *   LED_485_1-5 → 对应区域 A-E, 通过=灭, 失败=常亮
+ *   LED_485_6   → 整体结果: 快闪 3 次=全部通过, 慢闪=有失败
  * ===========================================================================
  */
 #define SDRAM_TEST_REGION_SIZE   256U
-#define SDRAM_TEST_ADDR_COUNT    3U
+#define SDRAM_TEST_ADDR_COUNT    5U
 
 static uint8_t SDRAM_CurveArea_Test(void)
 {
     const uint32_t test_addrs[SDRAM_TEST_ADDR_COUNT] = {
-        0xD0000000U,
-        0xD0005000U,
-        0xD0023000U,
+        0xC0000000U,  /* A: Bank0 Row0      — 低地址基准 */
+        0xC0005000U,  /* B: Bank0 Row20     — QX 基址 */
+        0xC0800000U,  /* C: Bank0 Row4096   — 验证 A12 行地址线 */
+        0xC0808000U,  /* D: Bank1 Row0      — 验证 BA0 bank 选择 */
+        0xC1000000U,  /* E: Bank2 Row0      — 验证 BA1 bank 选择 */
     };
     const char *region_names[SDRAM_TEST_ADDR_COUNT] = {
-        "SSZ",
-        "QX base",
-        "Port2 QX",
+        "Bank0 Row0",
+        "Bank0 Row20 (QX)",
+        "Bank0 Row4096 (A12)",
+        "Bank1 Row0 (BA0)",
+        "Bank2 Row0 (BA1)",
     };
 
     uint16_t backup[SDRAM_TEST_REGION_SIZE / 2U];
@@ -75,7 +88,7 @@ static uint8_t SDRAM_CurveArea_Test(void)
 
     printf("\n");
     printf("========================================\n");
-    printf("  SDRAM Curve Area Diagnostic Test\n");
+    printf("  SDRAM 32MB (IS42S16160J) Diagnostic\n");
     printf("========================================\n");
 
     for (region = 0U; region < SDRAM_TEST_ADDR_COUNT; region++) {
@@ -83,7 +96,7 @@ static uint8_t SDRAM_CurveArea_Test(void)
         printf("\n[Zone %c] %s (0x%08lX)\n",
                'A' + region, region_names[region], (unsigned long)addr);
 
-        /* backup */
+        /* 备份原数据 */
         for (i = 0U; i < (SDRAM_TEST_REGION_SIZE / 2U); i++) {
             backup[i] = *(__IO uint16_t *)(addr + i * 2U);
         }
@@ -100,13 +113,11 @@ static uint8_t SDRAM_CurveArea_Test(void)
                 printf("  [FAIL] 0xAAAA @ +0x%04lX: exp 0xAAAA, got 0x%04X\n",
                        (unsigned long)(i * 2U), test_buf[i]);
                 all_pass = 0U;
-                break;
+                goto restore;
             }
         }
-        if (i == (SDRAM_TEST_REGION_SIZE / 2U)) {
-            printf("  [PASS] pattern 0xAAAA — %u bytes OK\n",
-                   (unsigned int)SDRAM_TEST_REGION_SIZE);
-        }
+        printf("  [PASS] pattern 0xAAAA — %u bytes OK\n",
+               (unsigned int)SDRAM_TEST_REGION_SIZE);
 
         /* test 2: 0x5555 */
         for (i = 0U; i < (SDRAM_TEST_REGION_SIZE / 2U); i++) {
@@ -120,13 +131,11 @@ static uint8_t SDRAM_CurveArea_Test(void)
                 printf("  [FAIL] 0x5555 @ +0x%04lX: exp 0x5555, got 0x%04X\n",
                        (unsigned long)(i * 2U), test_buf[i]);
                 all_pass = 0U;
-                break;
+                goto restore;
             }
         }
-        if (i == (SDRAM_TEST_REGION_SIZE / 2U)) {
-            printf("  [PASS] pattern 0x5555 — %u bytes OK\n",
-                   (unsigned int)SDRAM_TEST_REGION_SIZE);
-        }
+        printf("  [PASS] pattern 0x5555 — %u bytes OK\n",
+               (unsigned int)SDRAM_TEST_REGION_SIZE);
 
         /* test 3: address-as-data */
         for (i = 0U; i < (SDRAM_TEST_REGION_SIZE / 2U); i++) {
@@ -140,15 +149,14 @@ static uint8_t SDRAM_CurveArea_Test(void)
                 printf("  [FAIL] addr @ +0x%04lX: exp 0x%04lX, got 0x%04X\n",
                        (unsigned long)(i * 2U), (unsigned long)(i & 0xFFFFU), test_buf[i]);
                 all_pass = 0U;
-                break;
+                goto restore;
             }
         }
-        if (i == (SDRAM_TEST_REGION_SIZE / 2U)) {
-            printf("  [PASS] address pattern — %u bytes OK\n",
-                   (unsigned int)SDRAM_TEST_REGION_SIZE);
-        }
+        printf("  [PASS] address pattern — %u bytes OK\n",
+               (unsigned int)SDRAM_TEST_REGION_SIZE);
 
-        /* restore */
+restore:
+        /* 恢复原数据 */
         for (i = 0U; i < (SDRAM_TEST_REGION_SIZE / 2U); i++) {
             *(__IO uint16_t *)(addr + i * 2U) = backup[i];
         }
@@ -156,30 +164,307 @@ static uint8_t SDRAM_CurveArea_Test(void)
 
     printf("\n========================================\n");
     if (all_pass) {
-        printf("  SDRAM Curve Area Test: ALL PASSED\n");
+        printf("  SDRAM 32MB Test: ALL PASSED\n");
     } else {
-        printf("  SDRAM Curve Area Test: FAILURES DETECTED!\n");
+        printf("  SDRAM 32MB Test: FAILURES DETECTED!\n");
     }
     printf("========================================\n\n");
 
     /*
      * LED 信号 (不依赖串口即可观察结果):
-     *   通过 → LED 绿灯快闪 3 次, 然后全部熄灭继续启动
-     *   失败 → LED 红灯持续慢闪 (0.3s 周期), 板子不继续启动
+     *   LED_485_1-5: 区域 A-E 测试时短暂亮, 通过后熄灭
+     *   通过   → LED_485_6 快闪 3 次, 然后全部熄灭继续启动
+     *   失败   → LED_485_6 持续慢闪 (0.3s 周期), 板子不继续启动
      */
     if (all_pass) {
         uint8_t blink;
         for (blink = 0U; blink < 3U; blink++) {
-            LED_GREEN;
-            HAL_Delay(200U);
-            LED_RGBOFF;
-            HAL_Delay(200U);
+            LED_485_6_ON;
+            HAL_Delay(500U);
+            LED_485_6_OFF;
+            HAL_Delay(500U);
         }
     } else {
         while (1U) {
-            LED_RED;
+            LED_485_6_ON;
             HAL_Delay(150U);
-            LED_RGBOFF;
+            LED_485_6_OFF;
+            HAL_Delay(150U);
+        }
+    }
+
+    return all_pass;
+}
+
+/*
+ * ===========================================================================
+ *  EEPROM AT24C64D 诊断测试 (临时 — 测试通过后即可删除)
+ * ===========================================================================
+ * 测试 EEPROM (64Kbit = 8192 字节) 的读写完整性。
+ * AT24C64D: 32-byte/页, 共 256 页, I2C 地址 0x50
+ *
+ * 测试 3 个不同地址区域, 每个区域用 3 种 bit 模式遍历:
+ *   [1] 0xAA (偶数位=1, 奇数位=0) → 检测相邻 bit 短路
+ *   [2] 0x55 (偶数位=0, 奇数位=1) → 检测相邻 bit 短路 (互补)
+ *   [3] 地址低 8 位作为数据           → 检测地址线粘连/断路
+ *
+ * 测试范围:
+ *   区域 A: 字节 0x0000-0x003F   (MODE_16_BIT) — 低地址, 跨越 page 0→1 边界
+ *   区域 B: 字节 0x1FC0-0x1FFF   (MODE_8_BIT,  block 31) — 高地址边界
+ *   区域 C: 字节 0x1000-0x103F   (MODE_16_BIT) — 中间地址, 4KB 偏移
+ *
+ * 每个区域测试 64 字节。
+ * 测试前先备份原始内容, 测试后恢复。
+ *
+ * LED 指示:
+ *   LED_485_1-3 → 对应区域 A-C, 通过=灭, 失败=常亮
+ *   LED_485_5   → 整体结果: 快闪 3 次=全部通过, 慢闪=有失败
+ * ===========================================================================
+ */
+#define EEPROM_TEST_REGION_SIZE   64U
+#define EEPROM_TEST_ADDR_COUNT    3U
+
+static uint8_t EEPROM_Test(void)
+{
+    /*
+     * A: 0x0000 (MODE_16_BIT) — 低地址, 跨越 page 0→1 边界 (page_size=32)
+     * B: 0x1FC0 (MODE_16_BIT) — 高地址边界, 和 MODE_8_BIT block 31 一致
+     * C: 0x1000 (MODE_16_BIT) — 中间地址, 测试 A12 地址线
+     */
+    const uint16_t test_addrs[EEPROM_TEST_ADDR_COUNT] = {
+        0x0000U,   /* A: 低地址, 跨 page 边界         */
+        0x1FC0U,   /* B: 高地址 (block 31 offset 192) */
+        0x1000U,   /* C: 中间地址 4KB offset          */
+    };
+    /*
+     * 区域 B 也通过 MODE_8_BIT 测试: block=31, offset=0xC0 → addr=31, start=0xC0
+     * 等效字节地址 = 31*256 + 0xC0 = 0x1FC0, 与 test_addrs[1] 一致.
+     * 此处统一用 MODE_16_BIT 测试, 另用一个专门的小测试项验证 MODE_8_BIT API.
+     */
+    const char *region_names[EEPROM_TEST_ADDR_COUNT] = {
+        "Low 0x0000 (MODE_16_BIT)",
+        "High 0x1FC0 (MODE_16_BIT)",
+        "Mid 0x1000 (MODE_16_BIT)",
+    };
+
+    uint8_t  backup[EEPROM_TEST_REGION_SIZE];
+    uint8_t  test_buf[EEPROM_TEST_REGION_SIZE];
+    uint8_t  region;
+    uint8_t  all_pass = 1U;
+    uint16_t addr;
+    uint16_t i;
+
+    printf("\n");
+    printf("========================================\n");
+    printf("  EEPROM AT24C64D 8KB Diagnostic\n");
+    printf("========================================\n");
+
+    for (region = 0U; region < EEPROM_TEST_ADDR_COUNT; region++) {
+        addr = test_addrs[region];
+        printf("\n[Zone %c] %s (0x%04X)\n",
+               'A' + region, region_names[region], addr);
+
+        /* 备份原数据 */
+        if (EEPROM_Read(0U, (uint32_t)addr, backup, MODE_16_BIT,
+                         EEPROM_TEST_REGION_SIZE) != 0U) {
+            printf("  [FAIL] backup read failed!\n");
+            // LED_485_1_ON;
+            all_pass = 0U;
+            continue;
+        }
+
+        /* ---- test 1: 0xAA ---- */
+        memset(test_buf, 0xAA, EEPROM_TEST_REGION_SIZE);
+        if (EEPROM_Write(0U, (uint32_t)addr, test_buf, MODE_16_BIT,
+                          EEPROM_TEST_REGION_SIZE) != 0U) {
+            printf("  [FAIL] write 0xAA failed!\n");
+            // LED_485_2_ON;
+            all_pass = 0U;
+            goto ee_restore;
+        }
+        memset(test_buf, 0x00, EEPROM_TEST_REGION_SIZE);
+        if (EEPROM_Read(0U, (uint32_t)addr, test_buf, MODE_16_BIT,
+                         EEPROM_TEST_REGION_SIZE) != 0U) {
+            printf("  [FAIL] readback 0xAA failed!\n");
+            // LED_485_3_ON;
+            all_pass = 0U;
+            goto ee_restore;
+        }
+        for (i = 0U; i < EEPROM_TEST_REGION_SIZE; i++) {
+            if (test_buf[i] != 0xAAU) {
+                printf("  [FAIL] 0xAA @ +0x%04X: exp 0xAA, got 0x%02X\n",
+                       (unsigned int)(addr + i), test_buf[i]);
+                // LED_485_4_ON;
+                all_pass = 0U;
+                goto ee_restore;
+            }
+        }
+        printf("  [PASS] pattern 0xAA — %u bytes OK\n",
+               (unsigned int)EEPROM_TEST_REGION_SIZE);
+
+        /* ---- test 2: 0x55 ---- */
+        memset(test_buf, 0x55, EEPROM_TEST_REGION_SIZE);
+        if (EEPROM_Write(0U, (uint32_t)addr, test_buf, MODE_16_BIT,
+                          EEPROM_TEST_REGION_SIZE) != 0U) {
+            printf("  [FAIL] write 0x55 failed!\n");
+            // LED_485_1_ON;
+            all_pass = 0U;
+            goto ee_restore;
+        }
+        memset(test_buf, 0x00, EEPROM_TEST_REGION_SIZE);
+        if (EEPROM_Read(0U, (uint32_t)addr, test_buf, MODE_16_BIT,
+                         EEPROM_TEST_REGION_SIZE) != 0U) {
+            printf("  [FAIL] readback 0x55 failed!\n");
+            // LED_485_2_ON;
+            all_pass = 0U;
+            goto ee_restore;
+        }
+        for (i = 0U; i < EEPROM_TEST_REGION_SIZE; i++) {
+            if (test_buf[i] != 0x55U) {
+                printf("  [FAIL] 0x55 @ +0x%04X: exp 0x55, got 0x%02X\n",
+                       (unsigned int)(addr + i), test_buf[i]);
+                // LED_485_3_ON;
+                all_pass = 0U;
+                goto ee_restore;
+            }
+        }
+        printf("  [PASS] pattern 0x55 — %u bytes OK\n",
+               (unsigned int)EEPROM_TEST_REGION_SIZE);
+
+        /* ---- test 3: address-as-data (低 8 位) ---- */
+        for (i = 0U; i < EEPROM_TEST_REGION_SIZE; i++) {
+            test_buf[i] = (uint8_t)(i & 0xFFU);
+        }
+        if (EEPROM_Write(0U, (uint32_t)addr, test_buf, MODE_16_BIT,
+                          EEPROM_TEST_REGION_SIZE) != 0U) {
+            printf("  [FAIL] write addr-pattern failed!\n");
+            // LED_485_4_ON;
+            all_pass = 0U;
+            goto ee_restore;
+        }
+        memset(test_buf, 0x00, EEPROM_TEST_REGION_SIZE);
+        if (EEPROM_Read(0U, (uint32_t)addr, test_buf, MODE_16_BIT,
+                         EEPROM_TEST_REGION_SIZE) != 0U) {
+            printf("  [FAIL] readback addr-pattern failed!\n");
+            // LED_485_1_ON;
+            all_pass = 0U;
+            goto ee_restore;
+        }
+        for (i = 0U; i < EEPROM_TEST_REGION_SIZE; i++) {
+            if (test_buf[i] != (uint8_t)(i & 0xFFU)) {
+                printf("  [FAIL] addr @ +0x%04X: exp 0x%02X, got 0x%02X\n",
+                       (unsigned int)(addr + i),
+                       (unsigned int)(i & 0xFFU), test_buf[i]);
+                // LED_485_2_ON;
+                all_pass = 0U;
+                goto ee_restore;
+            }
+        }
+        printf("  [PASS] address pattern — %u bytes OK\n",
+               (unsigned int)EEPROM_TEST_REGION_SIZE);
+
+    ee_restore:
+        /* 恢复原数据 */
+        if (EEPROM_Write(0U, (uint32_t)addr, backup, MODE_16_BIT,
+                          EEPROM_TEST_REGION_SIZE) != 0U) {
+            printf("  [WARN] restore failed for zone %c!\n", 'A' + region);
+        } else {
+            printf("  [INFO] zone %c original data restored.\n", 'A' + region);
+        }
+    }
+
+    /*
+     * ---- 专项: MODE_8_BIT API 测试 ----
+     * MODE_8_BIT 下 block 号 << 8 = 字节地址.
+     * block=31 → 字节 0x1F00-0x1FFF, 测试前 32 字节.
+     * MODE_16_BIT 交叉验证用同样的字节地址 0x1F00.
+     */
+    {
+        const uint32_t mode8_block  = 31U;
+        const uint16_t mode8_size   = 32U;
+        const uint16_t mode8_offset = 0x1F00U;  /* = 31*256, 与 MODE_8_BIT block 31 对应的字节地址 */
+        uint8_t mode8_backup[32];
+        uint8_t mode8_buf[32];
+
+        printf("\n[Zone D] MODE_8_BIT API test (block 31)\n");
+
+        /* 备份 */
+        if (EEPROM_Read(0U, mode8_block, mode8_backup, MODE_8_BIT, mode8_size) != 0U) {
+            printf("  [FAIL] MODE_8_BIT backup read failed!\n");
+            // LED_485_3_ON;
+            all_pass = 0U;
+            goto ee_skip_mode8;
+        }
+
+        /* 写入 pattern 0xA5 */
+        memset(mode8_buf, 0xA5, mode8_size);
+        if (EEPROM_Write(0U, mode8_block, mode8_buf, MODE_8_BIT, mode8_size) != 0U) {
+            printf("  [FAIL] MODE_8_BIT write 0xA5 failed!\n");
+            // LED_485_4_ON;
+            all_pass = 0U;
+            goto ee_restore_mode8;
+        }
+
+        /* 用 MODE_16_BIT 交叉验证 */
+        memset(mode8_buf, 0x00, mode8_size);
+        if (EEPROM_Read(0U, mode8_offset, mode8_buf, MODE_16_BIT, mode8_size) != 0U) {
+            printf("  [FAIL] MODE_16_BIT cross-read failed!\n");
+            LED_485_1_ON;
+            all_pass = 0U;
+            goto ee_restore_mode8;
+        }
+        {
+            uint8_t ok = 1U;
+            for (i = 0U; i < mode8_size; i++) {
+                if (mode8_buf[i] != 0xA5U) {
+                    printf("  [FAIL] MODE_8_BIT x-check @ +0x%04X: exp 0xA5, got 0x%02X\n",
+                           (unsigned int)(mode8_offset + i), mode8_buf[i]);
+                    LED_485_2_ON;
+                    all_pass = 0U;
+                    ok = 0U;
+                    break;
+                }
+            }
+            if (ok) {
+                printf("  [PASS] MODE_8_BIT 0xA5 — cross-verified %u bytes OK\n",
+                       (unsigned int)mode8_size);
+            }
+        }
+
+    ee_restore_mode8:
+        if (EEPROM_Write(0U, mode8_block, mode8_backup, MODE_8_BIT, mode8_size) != 0U) {
+            printf("  [WARN] MODE_8_BIT restore failed!\n");
+        }
+    ee_skip_mode8:
+        ;
+    }
+
+    printf("\n========================================\n");
+    if (all_pass) {
+        printf("  EEPROM AT24C64D 8KB Test: ALL PASSED\n");
+    } else {
+        printf("  EEPROM AT24C64D 8KB Test: FAILURES DETECTED!\n");
+    }
+    printf("========================================\n\n");
+
+    /*
+     * LED 信号 (不依赖串口即可观察结果):
+     *   通过   → LED_485_5 快闪 3 次
+     *   失败   → LED_485_5 持续慢闪 (0.3s 周期), 板子不继续启动
+     */
+    if (all_pass) {
+        uint8_t blink;
+        for (blink = 0U; blink < 3U; blink++) {
+            LED_485_5_ON;
+            HAL_Delay(500U);
+            LED_485_5_OFF;
+            HAL_Delay(500U);
+        }
+    } else {
+        while (1U) {
+            LED_485_5_ON;
+            HAL_Delay(150U);
+            LED_485_5_OFF;
             HAL_Delay(150U);
         }
     }
@@ -195,12 +480,14 @@ void BSP_Init(void)
   SystemClock_Config();
 	/* ��ʼ��RGB�ʵ� */ 
   LED_GPIO_Config(); 
-//   SDRAM_Init();
+  SDRAM_Init();
   /* ---- 临时: SDRAM 曲线数据区诊断测试 (通过后可删除) ---- */
-//   SDRAM_CurveArea_Test();
+  SDRAM_CurveArea_Test();
   EEPROM_Init();    /* AT24C64D I2C EEPROM init (PB5=WP, PB6=SCL, PB7=SDA) */
+  /* ---- 临时: EEPROM AT24C64D 诊断测试 (通过后可删除) ---- */
+  EEPROM_Test();
   /*��ʼ��USART ����ģʽΪ 115200 8-N-1���жϽ���*/
-  // DEBUG_USART_Config();
+    // DEBUG_USART_Config();
   
   /* CmBacktrace initialize */
   // cm_backtrace_init("YH-F429", HARDWARE_VERSION, SOFTWARE_VERSION);
@@ -291,6 +578,9 @@ static void GPIO_CLK_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
