@@ -125,16 +125,16 @@ static void low_level_init(struct netif *netif)
 { 
   HAL_StatusTypeDef hal_eth_init_status;
   
-  //��ʼ��bsp��eth
+  /* Initialize BSP ETH */
   hal_eth_init_status = Bsp_Eth_Init();
 
   if (hal_eth_init_status != HAL_OK) {
-    PRINT_ERR("Bsp_Eth_Init returned %d — PHY MDIO access failed, "
+    PRINT_ERR("Bsp_Eth_Init returned %d -- PHY MDIO access failed, "
               "but MAC+DMA are configured. Relying on PHY hardware "
               "auto-negotiation.\r\n", hal_eth_init_status);
   }
 
-  /* Always set link up — DP83848K auto-negotiates independently
+  /* Always set link up -- DP83848K auto-negotiates independently
    * of software MDIO access. Even if HAL_ETH_Init fails due to
    * PHY address mismatch on MDIO, the MAC + DMA are already
    * configured and the PHY establishes the physical link on its own
@@ -177,16 +177,16 @@ static void low_level_init(struct netif *netif)
 
   /* create the task that handles the ETH_MAC */
 	sys_thread_new("ETHIN",
-                  ethernetif_input,  /* ������ں��� */
-                  netif,        	  /* ������ں������� */
-                  NETIF_IN_TASK_STACK_SIZE,/* ����ջ��С */
-                  NETIF_IN_TASK_PRIORITY); /* ��������ȼ� */
+                  ethernetif_input,  /* eth input callback */
+                  netif,              /* input callback arg */
+                  NETIF_IN_TASK_STACK_SIZE,/* task stack size */
+                  NETIF_IN_TASK_PRIORITY); /* task priority */
                   
 //	sys_thread_new("ETHTX",
-//                  ethernetif_output,  /* ������ں��� */
-//                  netif,        	  /* ������ں������� */
-//                  NETIF_OUT_TASK_STACK_SIZE,/* ����ջ��С */
-//                  NETIF_OUT_TASK_PRIORITY); /* ��������ȼ� */
+//                  ethernetif_output,  /* eth output callback */
+//                  netif,              /* output callback arg */
+//                  NETIF_OUT_TASK_STACK_SIZE,/* task stack size */
+//                  NETIF_OUT_TASK_PRIORITY); /* task priority */
                                  
 /* USER CODE END PHY_PRE_CONFIG */
   
@@ -664,15 +664,20 @@ void ethernetif_update_config(struct netif *netif)
         heth.Init.DuplexMode = ETH_MODE_HALFDUPLEX;           
       }
       /* Configure the MAC with the speed fixed by the auto-negotiation process */
+      /*
+       * DP83848K PHYSTS bit1: 1 = 100M, 0 = 10M.
+       * (Other PHYs may use the opposite polarity — this logic is
+       * DP83848K-specific.)
+       */
       if(regvalue & PHY_SPEED_STATUS)
-      {  
-        /* Set Ethernet speed to 10M following the auto-negotiation */
-        heth.Init.Speed = ETH_SPEED_10M; 
+      {
+        /* Set Ethernet speed to 100M following the auto-negotiation */
+        heth.Init.Speed = ETH_SPEED_100M;
       }
       else
-      {   
-        /* Set Ethernet speed to 100M following the auto-negotiation */ 
-        heth.Init.Speed = ETH_SPEED_100M;
+      {
+        /* Set Ethernet speed to 10M following the auto-negotiation */
+        heth.Init.Speed = ETH_SPEED_10M;
       }
     }
     else /* AutoNegotiation Disable */

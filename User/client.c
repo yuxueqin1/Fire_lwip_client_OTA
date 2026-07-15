@@ -215,7 +215,7 @@ void client_send_pending(void)
     uint8_t  retry;
     err_t    err;
 
-    if (tcp_conn == NULL) {
+    if (tcp_conn == NULL || tcp_connected == 0U) {
         return;
     }
 

@@ -3,7 +3,7 @@
 
 #include "stm32f4xx_hal.h"
 
-/* FreeRTOS 头文件 */
+/* FreeRTOS header */
 #include "FreeRTOS.h"
 #include "task.h"
 
@@ -41,6 +41,5 @@
 
 
 HAL_StatusTypeDef Bsp_Eth_Init(void);
-
 
 #endif

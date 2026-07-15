@@ -4,33 +4,32 @@
 #include "stm32f4xx.h"
 #include <stdio.h>
 
-//¥Æø⁄≤®Ãÿ¬ 
+//ÔøΩÔøΩÔøΩ⁄≤ÔøΩÔøΩÔøΩÔøΩÔøΩ
 #define DEBUG_USART_BAUDRATE                    115200
 
-//“˝Ω≈∂®“Â
+//ÔøΩÔøΩÔøΩ≈∂ÔøΩÔøΩÔøΩ
 /*******************************************************/
-#define DEBUG_USART                             USART2 //UART8
-#define DEBUG_USART_CLK_ENABLE()                __USART2_CLK_ENABLE();
+#define DEBUG_USART                             UART7
+#define DEBUG_USART_CLK_ENABLE()                __HAL_RCC_UART7_CLK_ENABLE();
 
-#define RCC_PERIPHCLK_UARTx                     RCC_PERIPHCLK_USART2
-#define RCC_UARTxCLKSOURCE_SYSCLK               RCC_USART2CLKSOURCE_SYSCLK
+//Ê≥®ÊÑè: STM32F429 ‰∏ä UART7 Êó∂ÈíüÂõ∫ÂÆö‰∏∫ PCLK1, ‰∏çÊîØÊåÅÊó∂ÈíüÊ∫êÈÄâÊã© (Êó† RCC_PERIPHCLK_UART7 ÂÆè)
 
-#define DEBUG_USART_RX_GPIO_PORT                GPIOD
-#define DEBUG_USART_RX_GPIO_CLK_ENABLE()        __GPIOD_CLK_ENABLE()
+#define DEBUG_USART_RX_GPIO_PORT                GPIOF
+#define DEBUG_USART_RX_GPIO_CLK_ENABLE()        __HAL_RCC_GPIOF_CLK_ENABLE()
 #define DEBUG_USART_RX_PIN                      GPIO_PIN_6
-#define DEBUG_USART_RX_AF                       GPIO_AF7_USART2
+#define DEBUG_USART_RX_AF                       GPIO_AF8_UART7
 
-#define DEBUG_USART_TX_GPIO_PORT                GPIOD
-#define DEBUG_USART_TX_GPIO_CLK_ENABLE()        __GPIOD_CLK_ENABLE()
-#define DEBUG_USART_TX_PIN                      GPIO_PIN_5
-#define DEBUG_USART_TX_AF                       GPIO_AF7_USART2
+#define DEBUG_USART_TX_GPIO_PORT                GPIOF
+#define DEBUG_USART_TX_GPIO_CLK_ENABLE()        __HAL_RCC_GPIOF_CLK_ENABLE()
+#define DEBUG_USART_TX_PIN                      GPIO_PIN_7
+#define DEBUG_USART_TX_AF                       GPIO_AF8_UART7
 
-#define DEBUG_USART_DE_GPIO_PORT                GPIOD
-#define DEBUG_USART_DE_GPIO_CLK_ENABLE()        __GPIOD_CLK_ENABLE()
-#define DEBUG_USART_DE_PIN                      GPIO_PIN_11
+#define DEBUG_USART_DE_GPIO_PORT                GPIOF
+#define DEBUG_USART_DE_GPIO_CLK_ENABLE()        __HAL_RCC_GPIOF_CLK_ENABLE()
+#define DEBUG_USART_DE_PIN                      GPIO_PIN_8
 
-#define DEBUG_USART_IRQHandler                  USART2_IRQHandler
-#define DEBUG_USART_IRQ                 		USART2_IRQn
+#define DEBUG_USART_IRQHandler                  UART7_IRQHandler
+#define DEBUG_USART_IRQ                 		UART7_IRQn
 /************************************************************/
 
 void Usart_SendString(uint8_t *str);

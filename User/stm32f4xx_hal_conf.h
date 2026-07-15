@@ -211,11 +211,10 @@
 #define PHY_LINKED_STATUS               ((uint16_t)0x0004U)  /*!< Valid link established               */
 #define PHY_JABBER_DETECTION            ((uint16_t)0x0002U)  /*!< Jabber condition detected            */
   
-/* Section 4: Extended PHY Registers */
-#define PHY_SR                          ((uint16_t)0x1FU)    /*!< PHY status register Offset                      */
-
-#define PHY_SPEED_STATUS                ((uint16_t)0x0004U)  /*!< PHY Speed mask                                  */
-#define PHY_DUPLEX_STATUS               ((uint16_t)0x0010U)  /*!< PHY Duplex mask                                 */
+/* Section 4: Extended PHY Registers — DP83848K specific */
+#define PHY_SR                          ((uint16_t)0x10U)    /*!< PHYSTS register Offset (DP83848K)              */
+#define PHY_SPEED_STATUS                ((uint16_t)0x0002U)  /*!< PHY Speed mask: bit1=1→100M, bit1=0→10M        */
+#define PHY_DUPLEX_STATUS               ((uint16_t)0x0004U)  /*!< PHY Duplex mask: bit2=1→Full, bit2=0→Half      */
 
 
 /* ################## SPI peripheral configuration ########################## */

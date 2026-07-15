@@ -4,13 +4,13 @@
   * @author  fire
   * @version V1.0
   * @date    2016-xx-xx
-  * @brief   Ê¹ÓÃ´®¿Ú1£¬ÖØ¶¨Ïòc¿âprintfº¯Êıµ½usart¶Ë¿Ú£¬ÖĞ¶Ï½ÓÊÕÄ£Ê½
+  * @brief   Ê¹ï¿½Ã´ï¿½ï¿½ï¿½1ï¿½ï¿½ï¿½Ø¶ï¿½ï¿½ï¿½cï¿½ï¿½printfï¿½ï¿½ï¿½ï¿½ï¿½ï¿½usartï¿½Ë¿Ú£ï¿½ï¿½Ğ¶Ï½ï¿½ï¿½ï¿½Ä£Ê½
   ******************************************************************************
   * @attention
   *
-  * ÊµÑéÆ½Ì¨:Ò°»ğ STM32 F429 ¿ª·¢°å  
-  * ÂÛÌ³    :http://www.firebbs.cn
-  * ÌÔ±¦    :http://firestm32.taobao.com
+  * Êµï¿½ï¿½Æ½Ì¨:Ò°ï¿½ï¿½ STM32 F429 ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½  
+  * ï¿½ï¿½Ì³    :http://www.firebbs.cn
+  * ï¿½Ô±ï¿½    :http://firestm32.taobao.com
   *
   ******************************************************************************
   */ 
@@ -21,9 +21,9 @@ UART_HandleTypeDef UartHandle;
 extern uint8_t ucTemp;  
 
  /**
-  * @brief  DEBUG_USART GPIO ÅäÖÃ,¹¤×÷Ä£Ê½ÅäÖÃ¡£115200 8-N-1
-  * @param  ÎŞ
-  * @retval ÎŞ
+  * @brief  DEBUG_USART GPIO ï¿½ï¿½ï¿½ï¿½,ï¿½ï¿½ï¿½ï¿½Ä£Ê½ï¿½ï¿½ï¿½Ã¡ï¿½115200 8-N-1
+  * @param  ï¿½ï¿½
+  * @retval ï¿½ï¿½
   */  
 void DEBUG_USART_Config(void)
 { 
@@ -42,13 +42,13 @@ void DEBUG_USART_Config(void)
 
 
 /**
-  * @brief UART MSP ³õÊ¼»¯ 
+  * @brief UART MSP ï¿½ï¿½Ê¼ï¿½ï¿½ 
   * @param huart: UART handle
-  * @retval ÎŞ
+  * @retval ï¿½ï¿½
   */
 void HAL_UART_MspInit(UART_HandleTypeDef *huart)
 {
-    GPIO_InitTypeDef GPIO_InitStruct;
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
 
     if (huart->Instance == DEBUG_USART)
     {
@@ -58,6 +58,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef *huart)
         DEBUG_USART_TX_GPIO_CLK_ENABLE();
         DEBUG_USART_DE_GPIO_CLK_ENABLE();
 
+        /* ---- TX (PF7, AF8) ---- */
         GPIO_InitStruct.Pin = DEBUG_USART_TX_PIN;
         GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
         GPIO_InitStruct.Pull = GPIO_PULLUP;
@@ -65,16 +66,22 @@ void HAL_UART_MspInit(UART_HandleTypeDef *huart)
         GPIO_InitStruct.Alternate = DEBUG_USART_TX_AF;
         HAL_GPIO_Init(DEBUG_USART_TX_GPIO_PORT, &GPIO_InitStruct);
 
+        /* ---- RX (PF6, AF8) ---- */
         GPIO_InitStruct.Pin = DEBUG_USART_RX_PIN;
+        GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+        GPIO_InitStruct.Pull = GPIO_PULLUP;
+        GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
         GPIO_InitStruct.Alternate = DEBUG_USART_RX_AF;
         HAL_GPIO_Init(DEBUG_USART_RX_GPIO_PORT, &GPIO_InitStruct);
 
+        /* ---- DE (PF8, æ¨æŒ½è¾“å‡º, RS485 æ–¹å‘æ§åˆ¶) ---- */
         GPIO_InitStruct.Pin = DEBUG_USART_DE_PIN;
         GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
         GPIO_InitStruct.Pull = GPIO_NOPULL;
         GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+        GPIO_InitStruct.Alternate = 0;
         HAL_GPIO_Init(DEBUG_USART_DE_GPIO_PORT , &GPIO_InitStruct);
-        HAL_GPIO_WritePin(DEBUG_USART_DE_GPIO_PORT, DEBUG_USART_DE_PIN, GPIO_PIN_SET);  //Ä¬ÈÏ ·¢ËÍ=1
+        HAL_GPIO_WritePin(DEBUG_USART_DE_GPIO_PORT, DEBUG_USART_DE_PIN, GPIO_PIN_SET);  /* é»˜è®¤ DE=1 (å‘é€) */
 
         HAL_NVIC_SetPriority(DEBUG_USART_IRQ, 0, 1);
         HAL_NVIC_EnableIRQ(DEBUG_USART_IRQ);
@@ -82,7 +89,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef *huart)
 }
 
 
-/*****************  ·¢ËÍ×Ö·û´® **********************/
+/*****************  ï¿½ï¿½ï¿½ï¿½ï¿½Ö·ï¿½ï¿½ï¿½ **********************/
 void Usart_SendString(uint8_t *str)
 {
 	unsigned int k=0;
@@ -93,16 +100,16 @@ void Usart_SendString(uint8_t *str)
   } while(*(str + k)!='\0');
   
 }
-///ÖØ¶¨Ïòc¿âº¯Êıprintfµ½´®¿ÚDEBUG_USART£¬ÖØ¶¨Ïòºó¿ÉÊ¹ÓÃprintfº¯Êı
+///ï¿½Ø¶ï¿½ï¿½ï¿½cï¿½âº¯ï¿½ï¿½printfï¿½ï¿½ï¿½ï¿½ï¿½ï¿½DEBUG_USARTï¿½ï¿½ï¿½Ø¶ï¿½ï¿½ï¿½ï¿½ï¿½Ê¹ï¿½ï¿½printfï¿½ï¿½ï¿½ï¿½
 int fputc(int ch, FILE *f)
 {
-	/* ·¢ËÍÒ»¸ö×Ö½ÚÊı¾İµ½´®¿ÚDEBUG_USART */
+	/* ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ï¿½Ö½ï¿½ï¿½ï¿½ï¿½İµï¿½ï¿½ï¿½ï¿½ï¿½DEBUG_USART */
 	HAL_UART_Transmit(&UartHandle, (uint8_t *)&ch, 1, 1000);	
 	
 	return (ch);
 }
 
-///ÖØ¶¨Ïòc¿âº¯Êıscanfµ½´®¿ÚDEBUG_USART£¬ÖØĞ´Ïòºó¿ÉÊ¹ÓÃscanf¡¢getcharµÈº¯Êı
+///ï¿½Ø¶ï¿½ï¿½ï¿½cï¿½âº¯ï¿½ï¿½scanfï¿½ï¿½ï¿½ï¿½ï¿½ï¿½DEBUG_USARTï¿½ï¿½ï¿½ï¿½Ğ´ï¿½ï¿½ï¿½ï¿½Ê¹ï¿½ï¿½scanfï¿½ï¿½getcharï¿½Èºï¿½ï¿½ï¿½
 int fgetc(FILE *f)
 {
 		
