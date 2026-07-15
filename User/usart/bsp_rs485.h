@@ -156,6 +156,7 @@ extern uint8_t               portDLQX[UART_PORT_COUNT];           /* Per-port cu
 
 /* ---- 函数声明 ---- */
 uint32_t uart_get_baud_rate(uint8_t baud_code);
+uint32_t uart_get_baud_rate_port7(uint8_t dip_code);
 eMBErrorCode uart_init_port(uint8_t port_idx, uint32_t baud_rate, xMBMHandle *pxMBMaster);
 /* 自定义串口底层初始化 (非 Modbus 模式) */
 eMBErrorCode uart_init_custom_raw(uint8_t port_idx, uint32_t baud_rate);

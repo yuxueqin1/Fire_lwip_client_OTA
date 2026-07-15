@@ -48,6 +48,7 @@
 #include <lwip/sys.h>
 #include "lwip/dhcp.h"
 #include <string.h>
+#include "../dip_switch/bsp_dip_switch.h"
 
 int errno;
 
@@ -141,7 +142,7 @@ void sys_arch_unprotect(sys_prot_t pval)
 err_t
 sys_sem_new(sys_sem_t *sem, u8_t count)
 {
-  /* ���� sem */
+  /* Create semaphore */
   if(count <= 1)
   {    
     *sem = xSemaphoreCreateBinary();
@@ -178,7 +179,7 @@ sys_sem_free(sys_sem_t *sem)
 #if SYS_STATS
    --lwip_stats.sys.sem.used;
 #endif /* SYS_STATS */
-  /* ɾ�� sem */
+  /* Delete semaphore */
   vSemaphoreDelete(*sem);
   *sem = SYS_SEM_NULL;
 }
@@ -197,36 +198,35 @@ sys_sem_set_invalid(sys_sem_t *sem)
 }
 
 /* 
- ���timeout������Ϊ�㣬�򷵻�ֵΪ
- �ȴ��ź��������ѵĺ����������
- �ź���δ��ָ��ʱ���ڷ����źţ�����ֵΪ
- SYS_ARCH_TIMEOUT������̲߳��صȴ��ź���
- �ú��������㡣 */
+  /* If timeout is 0, function blocks indefinitely waiting for semaphore.
+   * If semaphore is signalled, function returns. If not signalled within
+   * the timeout period, returns SYS_ARCH_TIMEOUT. Thread stops waiting.
+   * This function must return 0. */
 u32_t
 sys_arch_sem_wait(sys_sem_t *sem, u32_t timeout)
 {
   u32_t wait_tick = 0;
   u32_t start_tick = 0 ;
   
-  //�����ź����Ƿ���Ч
+   /* Check if semaphore is valid */
   if(*sem == SYS_SEM_NULL)
     return SYS_ARCH_TIMEOUT;
   
-  //���Ȼ�ȡ��ʼ�ȴ��ź�����ʱ�ӽ���
+   /* Get initial tick count for timeout calculation */
   start_tick = xTaskGetTickCount();
   
-  //timeout != 0����Ҫ��ms����ϵͳ��ʱ�ӽ���
+   /* If timeout != 0, convert ms to system ticks */
   if(timeout != 0)
   {
-    //��msת����ʱ�ӽ���
+     /* Convert ms to ticks */
     wait_tick = timeout / portTICK_PERIOD_MS;
     if (wait_tick == 0)
       wait_tick = 1;
   }
   else
-    wait_tick = portMAX_DELAY;  //һֱ����
+     wait_tick = portMAX_DELAY;  /* Wait forever */
   
-  //�ȴ��ɹ�������ȴ���ʱ�䣬����ͱ�ʾ�ȴ���ʱ
+   /* Return success; or SYS_ARCH_TIMEOUT if wait expired */
   if(xSemaphoreTake(*sem, wait_tick) == pdTRUE)
     return ((xTaskGetTickCount()-start_tick)*portTICK_RATE_MS);
   else
@@ -243,7 +243,7 @@ sys_sem_signal(sys_sem_t *sem)
 err_t
 sys_mutex_new(sys_mutex_t *mutex)
 {
-  /* ���� sem */   
+   /* Init / signal semaphore */
   *mutex = xSemaphoreCreateMutex();
   if(*mutex != SYS_MRTEX_NULL)
     return ERR_OK;
@@ -269,14 +269,14 @@ sys_mutex_set_invalid(sys_mutex_t *mutex)
 void
 sys_mutex_lock(sys_mutex_t *mutex)
 {
-  xSemaphoreTake(*mutex,/* ��������� */
-                 portMAX_DELAY); /* �ȴ�ʱ�� */
+   xSemaphoreTake(*mutex,/* mutex handle */
+                  portMAX_DELAY); /* wait time */
 }
 
 void
 sys_mutex_unlock(sys_mutex_t *mutex)
 {
-  xSemaphoreGive( *mutex );//����������
+   xSemaphoreGive( *mutex ); /* release mutex */
 }
 
 
@@ -285,13 +285,13 @@ sys_thread_new(const char *name, lwip_thread_fn function, void *arg, int stacksi
 {
   sys_thread_t handle = NULL;
   BaseType_t xReturn = pdPASS;
-  /* ����MidPriority_Task���� */
-  xReturn = xTaskCreate((TaskFunction_t )function,  /* ������ں��� */
-                        (const char*    )name,/* �������� */
-                        (uint16_t       )(stacksize / sizeof(StackType_t)),  /* lwIP传入字节数, 转为FreeRTOS的字数 */
-                        (void*          )arg,/* ������ں������� */
-                        (UBaseType_t    )prio, /* ��������ȼ� */
-                        (TaskHandle_t*  )&handle);/* ������ƿ�ָ�� */ 
+   /* Create task */
+   xReturn = xTaskCreate((TaskFunction_t )function,  /* task function */
+                         (const char*    )name,     /* task name */
+                         (uint16_t       )(stacksize / sizeof(StackType_t)),  /* stack depth in words */
+                         (void*          )arg,      /* task parameter */
+                         (UBaseType_t    )prio,     /* task priority */
+                         (TaskHandle_t*  )&handle); /* task handle ptr */
   if(xReturn != pdPASS)
   {
     printf("[sys_arch]:create task fail!err:%#lx\n",xReturn);
@@ -303,9 +303,9 @@ sys_thread_new(const char *name, lwip_thread_fn function, void *arg, int stacksi
 err_t
 sys_mbox_new(sys_mbox_t *mbox, int size)
 {
-    /* ����Test_Queue */
-  *mbox = xQueueCreate((UBaseType_t ) size,/* ��Ϣ���еĳ��� */
-                       (UBaseType_t ) sizeof(void *));/* ��Ϣ�Ĵ�С */
+     /* Create queue */
+   *mbox = xQueueCreate((UBaseType_t ) size, /* queue length */
+                        (UBaseType_t ) sizeof(void *)); /* item size */
 #if SYS_STATS
       ++lwip_stats.sys.mbox.used;
       if (lwip_stats.sys.mbox.max < lwip_stats.sys.mbox.used) {
@@ -356,9 +356,9 @@ sys_mbox_set_invalid(sys_mbox_t *mbox)
 void
 sys_mbox_post(sys_mbox_t *q, void *msg)
 {
-  while(xQueueSend( *q, /* ��Ϣ���еľ�� */
-                    &msg,/* ���͵���Ϣ���� */
-                    portMAX_DELAY) != pdTRUE); /* �ȴ�ʱ�� */
+   while(xQueueSend( *q, /* queue handle */
+                     &msg,/* message to send */
+                     portMAX_DELAY) != pdTRUE); /* wait forever */
 }
 
 err_t
@@ -383,25 +383,25 @@ sys_arch_mbox_fetch(sys_mbox_t *q, void **msg, u32_t timeout)
   u32_t wait_tick = 0;
   u32_t start_tick = 0 ;
   
-  if ( msg == NULL )  //�����洢��Ϣ�ĵط��Ƿ���Ч
+   if ( msg == NULL )  /* check if message storage is valid */
 		msg = &dummyptr;
   
-  //���Ȼ�ȡ��ʼ�ȴ��ź�����ʱ�ӽ���
+   /* Get initial tick count for timeout calculation */
   start_tick = sys_now();
   
-  //timeout != 0����Ҫ��ms����ϵͳ��ʱ�ӽ���
+   /* If timeout != 0, convert ms to system ticks */
   if(timeout != 0)
   {
-    //��msת����ʱ�ӽ���
+     /* Convert ms to ticks */
     wait_tick = timeout / portTICK_PERIOD_MS;
     if (wait_tick == 0)
       wait_tick = 1;
   }
-  //һֱ����
+   /* Wait forever */
   else
     wait_tick = portMAX_DELAY;
   
-  //�ȴ��ɹ�������ȴ���ʱ�䣬����ͱ�ʾ�ȴ���ʱ
+   /* Return success; or SYS_ARCH_TIMEOUT if wait expired */
   if(xQueueReceive(*q,&(*msg), wait_tick) == pdTRUE)
     return ((sys_now() - start_tick)*portTICK_PERIOD_MS);
   else
@@ -418,7 +418,7 @@ sys_arch_mbox_tryfetch(sys_mbox_t *q, void **msg)
 	if ( msg == NULL )
 		msg = &dummyptr;
   
-  //�ȴ��ɹ�������ȴ���ʱ��
+   /* Wait succeeded; check for timeout */
   if(xQueueReceive(*q,&(*msg), 0) == pdTRUE)
     return ERR_OK;
   else
@@ -451,13 +451,13 @@ void TCPIP_Init(void)
   ip_addr_set_zero_ip4(&netmask);
   ip_addr_set_zero_ip4(&gw);
 #else
-  IP4_ADDR(&ipaddr,IP_ADDR0,IP_ADDR1,IP_ADDR2,IP_ADDR3);
+  IP4_ADDR(&ipaddr,IP_ADDR0,IP_ADDR1,IP_ADDR2,g_dip_ip_last_octet);
   IP4_ADDR(&netmask,NETMASK_ADDR0,NETMASK_ADDR1,NETMASK_ADDR2,NETMASK_ADDR3);
   IP4_ADDR(&gw,GW_ADDR0,GW_ADDR1,GW_ADDR2,GW_ADDR3);
 #endif /* USE_DHCP */
   /* USER CODE END 0 */
   /* Initilialize the LwIP stack without RTOS */
-  /* add the network interface (IPv4/IPv6) without RTOS  �ײ�������ʼ������ethernetif_init������ص�tcpip_input*/
+   /* add the network interface (IPv4/IPv6) without RTOS -- low_level_init calls ethernetif_init which calls tcpip_input */
   netif_add(&gnetif, &ipaddr, &netmask, &gw, NULL, &ethernetif_init, &tcpip_input);
 
   /* Registers the default network interface */
@@ -474,26 +474,26 @@ void TCPIP_Init(void)
     netif_set_down(&gnetif);
   }
   
-#if LWIP_DHCP	   			//��ʹ����DHCP
+ #if LWIP_DHCP	   		/* if LWIP_DHCP enabled */
   int err;
   /*  Creates a new DHCP client for this interface on the first call.
   Note: you must call dhcp_fine_tmr() and dhcp_coarse_tmr() at
   the predefined regular intervals after starting the client.
   You can peek in the netif->dhcp struct for the actual DHCP status.*/
   
-  printf("�����̽�ʹ��DHCP��̬����IP��ַ,�������Ҫ����lwipopts.h�н�LWIP_DHCP����Ϊ0\n\n");
+  printf("Attempting to obtain IP via DHCP. To disable, set LWIP_DHCP to 0 in lwipopts.h.\n\n");
   
-  err = dhcp_start(&gnetif);      //����dhcp
+  err = dhcp_start(&gnetif);      // Start DHCP
   if(err == ERR_OK)
     printf("lwip dhcp init success...\n\n");
   else
     printf("lwip dhcp init fail...\n\n");
-  while(ip_addr_cmp(&(gnetif.ip_addr),&ipaddr))   //�ȴ�dhcp�����ip��Ч
+  while(ip_addr_cmp(&(gnetif.ip_addr),&ipaddr))   // Wait for DHCP IP to become valid
   {
     vTaskDelay(1);
   } 
 #endif
-  printf("����IP��ַ��:%d.%d.%d.%d\n\n",  \
+  printf("DHCP IP address: %d.%d.%d.%d\n\n",  \
         ((gnetif.ip_addr.addr)&0x000000ff),       \
         (((gnetif.ip_addr.addr)&0x0000ff00)>>8),  \
         (((gnetif.ip_addr.addr)&0x00ff0000)>>16), \

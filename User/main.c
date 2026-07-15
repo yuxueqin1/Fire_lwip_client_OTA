@@ -47,6 +47,8 @@
 #include "ota_client.h"
 #include "bsp_rs485.h"
 #include "bsp_eeprom.h"
+#include "./dip_switch/bsp_dip_switch.h"
+#include "./task_rs485_7.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -222,6 +224,15 @@ static void AppTaskCreate(void *pvParameters)
 
     /* ---- 初始化 TCP 客户端 (创建 client_thread, prio=5) ---- */
     client_init();
+
+    /* ---- 打印拨码开关配置 ---- */
+    printf("\n[DIP] Board IP: 192.168.0.%u\n", g_dip_ip_last_octet);
+    printf("[DIP] Port7 baud: %lu, Mode: %s\n",
+           (unsigned long)g_dip_rs485_7_baudrate,
+           (g_dip_rs485_7_mode == 4U) ? "Master" : "Slave");
+
+    /* ---- 创建第7路 RS485 任务 (根据拨码初始化为主/从机) ---- */
+    rs485_7_task_create();
 
 
     /* ---- 初始化 OTA 客户端 ---- */

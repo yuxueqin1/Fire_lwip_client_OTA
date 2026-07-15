@@ -340,7 +340,7 @@
               <MiscControls>--c99</MiscControls>
               <Define>USE_HAL_DRIVER,STM32F429xx,USE_STM32F429I_DISCO,USE_FULL_ASSERT</Define>
               <Undefine></Undefine>
-              <IncludePath>..\Libraries\CMSIS\Include;..\Libraries\CMSIS\Device\ST\STM32F4xx\Include;..\Libraries\STM32F4xx_HAL_Driver\Inc;..\User;..\User\usart;..\User\led;..\User\sdram;..\FreeRTOS\include;..\FreeRTOS\port\RVDS\ARM_CM4F;..\LwIP\include;..\LwIP\include\compat;..\LwIP\include\lwip;..\LwIP\include\netif;..\LwIP\include\lwip\apps;..\LwIP\include\lwip\priv;..\LwIP\include\lwip\prot;..\User\arch;..\User\cm_backtrace;..\mbmaster\ascii;..\mbmaster\common;..\mbmaster\functions;..\mbmaster\rtu;..\mbslave\ascii;..\mbslave\functions;..\mbslave\rtu;..\mbslave\tcp;..\mbport;..\User\eeprom;..\User\eth;..\User\ota</IncludePath>
+              <IncludePath>..\Libraries\CMSIS\Include;..\Libraries\CMSIS\Device\ST\STM32F4xx\Include;..\Libraries\STM32F4xx_HAL_Driver\Inc;..\User;..\User\usart;..\User\led;..\User\sdram;..\FreeRTOS\include;..\FreeRTOS\port\RVDS\ARM_CM4F;..\LwIP\include;..\LwIP\include\compat;..\LwIP\include\lwip;..\LwIP\include\netif;..\LwIP\include\lwip\apps;..\LwIP\include\lwip\priv;..\LwIP\include\lwip\prot;..\User\arch;..\User\cm_backtrace;..\mbmaster\ascii;..\mbmaster\common;..\mbmaster\functions;..\mbmaster\rtu;..\mbslave\ascii;..\mbslave\functions;..\mbslave\rtu;..\mbslave\tcp;..\mbport;..\User\eeprom;..\User\eth;..\User\ota;..\User\dip_switch</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -596,6 +596,16 @@
               <FileName>ota_net.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\User\ota\ota_net.c</FilePath>
+            </File>
+            <File>
+              <FileName>bsp_dip_switch.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\User\dip_switch\bsp_dip_switch.c</FilePath>
+            </File>
+            <File>
+              <FileName>task_rs485_7.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\User\task_rs485_7.c</FilePath>
             </File>
           </Files>
         </Group>

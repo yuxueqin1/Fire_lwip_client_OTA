@@ -22,6 +22,7 @@
 #include "./led/bsp_led.h"  
 #include "./sdram/bsp_sdram.h"
 #include "bsp_eeprom.h"
+#include "./dip_switch/bsp_dip_switch.h"
 
 #include <string.h>
 #include <cm_backtrace.h>
@@ -476,18 +477,20 @@ void BSP_Init(void)
 {
   HAL_Init();    
   GPIO_CLK_Init();
+  /* ��ʼ��8λӲ���β���� (BA0-BA7: PE2-5, PI4-7) */
   /* ����ϵͳʱ��Ϊ180 MHz */ 
   SystemClock_Config();
 	/* ��ʼ��RGB�ʵ� */ 
   LED_GPIO_Config(); 
   SDRAM_Init();
   /* ---- 临时: SDRAM 曲线数据区诊断测试 (通过后可删除) ---- */
-  SDRAM_CurveArea_Test();
+//   SDRAM_CurveArea_Test();
   EEPROM_Init();    /* AT24C64D I2C EEPROM init (PB5=WP, PB6=SCL, PB7=SDA) */
   /* ---- 临时: EEPROM AT24C64D 诊断测试 (通过后可删除) ---- */
-  EEPROM_Test();
-  /*��ʼ��USART ����ģʽΪ 115200 8-N-1���жϽ���*/
-    // DEBUG_USART_Config();
+//   EEPROM_Test();
+  /* ��ʼ��UART7 (PF6-RX, PF7-TX), 115200 8-N-1, 用于 printf 调试输出 */
+    DEBUG_USART_Config();
+  DIP_SWITCH_Config();
   
   /* CmBacktrace initialize */
   // cm_backtrace_init("YH-F429", HARDWARE_VERSION, SOFTWARE_VERSION);

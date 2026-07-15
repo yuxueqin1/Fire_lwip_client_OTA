@@ -286,6 +286,22 @@ uint32_t uart_get_baud_rate(uint8_t baud_code)
     }
 }
 
+/**
+ * @brief  第7路RS485 波特率转换 — 拨码开关 BA5-BA6
+ * @param  dip_code  0=9600, 1=19200, 2=57600, 3=115200
+ * @return 实际波特率值, 默认 19200
+ */
+uint32_t uart_get_baud_rate_port7(uint8_t dip_code)
+{
+    switch (dip_code) {
+        case 0:  return 9600;
+        case 1:  return 19200;
+        case 2:  return 57600;
+        case 3:  return 115200;
+        default: return 19200;
+    }
+}
+
 
 /*======================================================================*/
 /*  六、串口初始化                                                        */
