@@ -34,7 +34,7 @@
 #include <lwip/arch.h>
 #include "tcpip.h"
 
- /* FreeRTOSͷ�ļ� */
+ /* FreeRTOSͷ�ļ� */
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
@@ -43,21 +43,21 @@
 /* USER CODE BEGIN 0 */
 #define DEST_IP_ADDR0               192
 #define DEST_IP_ADDR1               168
-#define DEST_IP_ADDR2                 0
-#define DEST_IP_ADDR3               46
+#define DEST_IP_ADDR2                 1
+#define DEST_IP_ADDR3               88
 
-#define DEST_PORT                  5001
+#define DEST_PORT                   502
 
 #define UDP_SERVER_PORT            5002   /* define the UDP local connection port */
 #define UDP_CLIENT_PORT            5002   /* define the UDP remote connection port */
 
-#define LOCAL_PORT                 5001
+#define LOCAL_PORT                  502
 
-/*Static IP ADDRESS: IP_ADDR0.IP_ADDR1.IP_ADDR2.IP_ADDR3 */
+/*Static IP ADDRESS: IP_ADDR0.IP_ADDR1.IP_ADDR2.g_dip_ip_last_octet */
 #define IP_ADDR0                    192
 #define IP_ADDR1                    168
-#define IP_ADDR2                      0
-#define IP_ADDR3                    122
+#define IP_ADDR2                      1
+#define IP_ADDR3                      0    /* 实际值由拨码开关 g_dip_ip_last_octet 覆盖 */
 
 /*NETMASK*/
 #define NETMASK_ADDR0               255
@@ -68,7 +68,7 @@
 /*Gateway Address*/
 #define GW_ADDR0                    192
 #define GW_ADDR1                    168
-#define GW_ADDR2                      0
+#define GW_ADDR2                      1
 #define GW_ADDR3                      1
 /* USER CODE END 0 */
 

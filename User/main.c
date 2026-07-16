@@ -15,20 +15,21 @@
  *   - 日志系统:           SendLogToServer / checkSendLog
  *
  * 优先级设计原则 (数值越大优先级越高):
- *   网络层 > 应用层
- *   tcpip_thread (lwIP 内核) 最高, 保证 TCP/IP 协议栈能及时处理报文.
- *   client_thread 次高, 保证上位机命令(配置/校时/心跳)能及时接收.
+ *   App_TaskStart 拥有最高优先级(8), 确保看门狗周期性喂狗,
+ *     即使 HAL_ETH_Init 忙等待 5s 也不会导致 SP706S 超时复位.
+ *   网络层(6/5) > 应用层(4/3), 保证网络协议栈能及时处理报文.
  *   串口采集优先级最低, 可被网络通信随时抢占.
  *
  * 任务列表:
  *   | 任务名            | 优先级 | 栈(字) | 功能                          |
  *   |-------------------|--------|--------|-------------------------------|
+ *   | App_TaskStart     | 8      | 256    | 看门狗喂狗 (最高优先级防超时)  |
  *   | AppTaskCreate     | 7      | 256    | 初始化 + 创建子任务 (用完即删) |
  *   | tcpip_thread      | 6      | 384    | lwIP 内核 (TCPIP_Init 自动创建)|
  *   | td_tcp_client     | 5      | 256    | TCP 连接管理 + 接收 (client.c) |
  *   | App_Task_TcpSend  | 4      | 256    | TCP 发送队列轮询               |
  *   | USART1..USART6    | 3      | 384    | 6 路串口数据采集               |
- *   | App_TaskStart     | 3      | 256    | 看门狗 + 心跳超时 + 日志检查   |
+ *   | RS485_7           | 3      | 384    | 第7路RS485 Modbus主/从机      |
  *   | Test1_Task        | 1      | 128    | LED1 心跳                     |
  *********************************************************************
  */
@@ -199,12 +200,12 @@ static void AppTaskCreate(void *pvParameters)
     if (pdPASS == xReturn)
         printf("Create App_Task_TcpSend success...\r\n");
 
-    /* ---- App_TaskStart (prio=3) ---- */
+    /* ---- App_TaskStart (prio=8) ---- */
     xReturn = xTaskCreate((TaskFunction_t)App_TaskStart,
                           (const char    *)"App_TaskStart",
                           (uint16_t       )256,
                           (void          *)NULL,
-                          (UBaseType_t    )3,
+                          (UBaseType_t    )8,
                           (TaskHandle_t  *)&App_TaskStart_Handle);
     if (pdPASS == xReturn)
         printf("Create App_TaskStart success...\r\n");
@@ -226,7 +227,7 @@ static void AppTaskCreate(void *pvParameters)
     client_init();
 
     /* ---- 打印拨码开关配置 ---- */
-    printf("\n[DIP] Board IP: 192.168.0.%u\n", g_dip_ip_last_octet);
+    printf("\n[DIP] Board IP: 192.168.1.%u\n", g_dip_ip_last_octet);
     printf("[DIP] Port7 baud: %lu, Mode: %s\n",
            (unsigned long)g_dip_rs485_7_baudrate,
            (g_dip_rs485_7_mode == 4U) ? "Master" : "Slave");

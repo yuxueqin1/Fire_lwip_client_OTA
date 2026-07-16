@@ -6,7 +6,7 @@
 ================================================================================
 
  功能概述:
-   - TCP 服务器监听 0.0.0.0:5001，等待通信板连接
+   - TCP 服务器监听 0.0.0.0:502，等待通信板连接
    - 收到申请配置帧后自动下发板卡配置 (BoardCfgTab)
    - 手动/自动发送校时命令 (Unix 时间戳)
    - 手动/自动发送心跳应答
@@ -17,7 +17,7 @@
 
  通信协议说明 (与 client.c / main.c 配套):
    板卡 → PC 帧格式 (11+N 字节):
-     [0] 端口号    (0=控制通道, 1-6=串口)
+     [0] 端口号    (0=控制通道, 1-7=串口)
      [1] 主类型    (0x07=申请配置, 0x50=日志)
      [2] 子类型
      [3] 标志/扩展
@@ -73,11 +73,11 @@ sys.stderr = _FilteredStderr(_sys_stderr)  # type: ignore[assignment]
 # 常量定义 (与嵌入式代码保持一致)
 # ============================================================================
 
-SERVER_PORT      = 5001
+SERVER_PORT      = 502
 LISTEN_BACKLOG   = 1
 RECV_BUF_SIZE    = 16384
-UART_PORT_COUNT  = 6
-BOARD_CONFIG_BYTES = 450       # 6 ports × 75 bytes
+UART_PORT_COUNT  = 7
+BOARD_CONFIG_BYTES = 525       # 7 ports × 75 bytes
 UART_MODULE_MAX_COUNT = 32
 MAX_FRAME_DATA_LEN  = 16384    # 最大允许的帧数据长度 (支持大寄存器模块)
 CONFIG_FILE      = "board_config.json"
@@ -158,7 +158,7 @@ def get_module_profile(module_type: int) -> dict:
     return MODULE_PROFILES.get(module_type, MODULE_PROFILES[0x31])
 
 # ---- 端口名称 (镜像 C 代码 uart_hw_config[]) ----
-PORT_NAMES = ["USART1", "USART2", "USART3", "UART4", "UART5", "USART6"]
+PORT_NAMES = ["UART7", "USART2", "UART5", "UART4", "USART1", "USART6", "USART3"]
 
 # ---- 端口类型 ----
 PORT_TYPE_MAP = {0: "禁用", 1: "自定义曲线", 3: "Modbus 从机", 4: "Modbus 主站"}
@@ -176,11 +176,11 @@ MODULE_TYPE_MAP = {
 
 
 # ============================================================================
-# 板卡配置数据结构 (BoardConfig_t, 每端口 75 字节, 共 6 端口 = 450 字节)
+# 板卡配置数据结构 (BoardConfig_t, 每端口 75 字节, 共 7 端口 = 525 字节)
 # ============================================================================
 
 class BoardConfig:
-    """管理 6 路端口的板卡配置，支持 JSON 持久化。"""
+    """管理 7 路端口的板卡配置，支持 JSON 持久化。"""
 
     # 每端口配置字段
     FIELD_NAMES = [
@@ -191,25 +191,28 @@ class BoardConfig:
     def __init__(self):
         self.ports = []  # list of 6 dicts
         for i in range(UART_PORT_COUNT):
-            # 端口2 默认配置: Modbus主站, 挂载1个信号机开关量从机
-            if i == 1:
+            # 端口1 默认配置: Modbus主站, 57600/8N1, 挂载13个从机
+            #   前5个: 高频25Hz轨道接收器(0x48), 后8个: 高频25Hz轨道发送器(0x49)
+            if i == 0:
                 port = {
                     "PortNum":       i + 1,
                     "PortType":      4,   # Modbus主站
-                    "BautRate":      2,   # 19200
+                    "BautRate":      4,   # 57600
                     "DataBit":       8,
                     "StopBit":       1,
                     "Parity":        0,   # 无校验
                     "MainProType":   1,
                     "SubProType":    2,
-                    "FenjiNum":      2,
+                    "FenjiNum":      1,
                     "QueryPeriod":   100,
-                    "SlaveModuelNum": 1,
+                    "SlaveModuelNum": 13,
                     "SlaveModuelAddress": [0] * UART_MODULE_MAX_COUNT,
                     "SlaveModuelType":    [0] * UART_MODULE_MAX_COUNT,
                 }
-                port["SlaveModuelAddress"][0] = 1
-                port["SlaveModuelType"][0]    = 0x31  # 信号机开关量
+                for j in range(13):
+                    port["SlaveModuelAddress"][j] = j + 1
+                    # 前5个: 高频25Hz轨道接收器, 后8个: 高频25Hz轨道发送器
+                    port["SlaveModuelType"][j] = 0x48 if j < 5 else 0x49
             else:
                 port = {
                     "PortNum":       i + 1,
@@ -777,8 +780,9 @@ class BoardServerGUI:
         info_frame.pack(fill=tk.X)
         info_text = ("通信板 上位机服务器 v2.0\n"
                      f"默认端口: {SERVER_PORT}\n"
-                     "协议: 6路串口通信板 (Modbus/Custom)\n"
-                     "适配: STM32F429 + lwIP + FreeRTOS")
+                     "协议: 7路串口通信板 (Modbus/Custom)\n"
+                     "适配: STM32F429 + lwIP + FreeRTOS\n"
+                     f"上位机: 192.168.1.88:{SERVER_PORT}")
         ttk.Label(info_frame, text=info_text, justify=tk.LEFT,
                   font=("Microsoft YaHei", 8), foreground="gray").pack()
 
@@ -1390,20 +1394,21 @@ class ConfigEditorWindow:
         for port_idx in range(UART_PORT_COUNT):
             port = self.config.ports[port_idx]
 
-            # 端口2 特殊默认值: Modbus主站 + 信号机开关量从机
-            if port_idx == 1:
+            # 端口1 默认配置: Modbus主站, 57600/8N1, 挂载13个从机
+            #   前5个: 高频25Hz轨道接收器(0x48), 后8个: 高频25Hz轨道发送器(0x49)
+            if port_idx == 0:
                 defaults = {
-                    "PortNum":       2,
+                    "PortNum":       1,
                     "PortType":      4,     # Modbus主站
-                    "BautRate":      2,     # 19200
+                    "BautRate":      4,     # 57600
                     "DataBit":       8,
                     "StopBit":       1,
                     "Parity":        0,
                     "MainProType":   1,
                     "SubProType":    2,
-                    "FenjiNum":      10,
+                    "FenjiNum":      1,
                     "QueryPeriod":   100,
-                    "SlaveModuelNum": 1,
+                    "SlaveModuelNum": 13,
                 }
             else:
                 defaults = {
@@ -1450,20 +1455,25 @@ class ConfigEditorWindow:
                 if type_var:
                     type_var.set("未配置")
 
-            # 端口2 从机默认: 地址=1, 类型=0x31 (信号机开关量)
-            if port_idx == 1:
-                port["SlaveModuelAddress"][0] = 1
-                port["SlaveModuelType"][0]    = 0x31
-                addr_var = self.slave_vars.get(f"{port_idx}_addr_0")
-                if addr_var:
-                    addr_var.set(1)
-                type_var = self.slave_vars.get(f"{port_idx}_type_0")
-                if type_var:
-                    type_var.set("0x31 - 信号机开关量")
+            # 端口1 从机默认: 地址1-13, 前5个=0x48(高频25Hz轨道接收器), 后8个=0x49(高频25Hz轨道发送器)
+            if port_idx == 0:
+                for j in range(13):
+                    port["SlaveModuelAddress"][j] = j + 1
+                    mtype = 0x48 if j < 5 else 0x49
+                    port["SlaveModuelType"][j] = mtype
+                    addr_var = self.slave_vars.get(f"{port_idx}_addr_{j}")
+                    if addr_var:
+                        addr_var.set(j + 1)
+                    type_var = self.slave_vars.get(f"{port_idx}_type_{j}")
+                    if type_var:
+                        type_name = "高频25Hz轨道接收器" if j < 5 else "高频25Hz轨道发送器"
+                        type_var.set(f"0x{mtype:02X} - {type_name}")
 
         messagebox.showinfo("默认配置", "已加载默认配置:\n"
-                            "  端口2 (USART2): Modbus主站, 19200/8N1,\n"
-                            "                  从机1台 (0x31 信号机开关量)\n"
+                            "  端口1 (UART7): Modbus主站, 57600/8N1,\n"
+                            "                  从机13台:\n"
+                            "                    前5台 0x48 (高频25Hz轨道接收器)\n"
+                            "                    后8台 0x49 (高频25Hz轨道发送器)\n"
                             "  其余端口: 未配置")
 
     def _load_max_config(self):
@@ -1689,7 +1699,7 @@ class SerialDataMonitor:
                                     command=lambda: self._switch_port(-1))
         self.prev_btn.pack(side=tk.LEFT, padx=(10, 2))
 
-        self.port_label = ttk.Label(toolbar, text="端口 1 (USART1)",
+        self.port_label = ttk.Label(toolbar, text="端口 1 (UART7)",
                                      font=("Microsoft YaHei", 10, "bold"),
                                      width=20, anchor=tk.CENTER)
         self.port_label.pack(side=tk.LEFT, padx=2)

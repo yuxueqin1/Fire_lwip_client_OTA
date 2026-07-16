@@ -30,8 +30,15 @@
 #define HARDWARE_VERSION               "V1.0.0"
 #define SOFTWARE_VERSION               "V0.1.0"
 
+/* ---- SP706S 外部看门狗 WDI 引脚 (PF10) ---- */
+#define WDI_PORT                        GPIOF
+#define WDI_PIN                         GPIO_PIN_10
+#define WDI_CLK_ENABLE()                __HAL_RCC_GPIOF_CLK_ENABLE()
+
 static void SystemClock_Config(void);
 static void GPIO_CLK_Init(void);
+static void WDI_GPIO_Init(void);
+static void Startup_LED_Running(void);
 
 /*
  * ===========================================================================
@@ -477,11 +484,11 @@ void BSP_Init(void)
 {
   HAL_Init();    
   GPIO_CLK_Init();
-  /* ��ʼ��8λӲ���β���� (BA0-BA7: PE2-5, PI4-7) */
   /* ����ϵͳʱ��Ϊ180 MHz */ 
   SystemClock_Config();
 	/* ��ʼ��RGB�ʵ� */ 
   LED_GPIO_Config(); 
+  Startup_LED_Running();
   SDRAM_Init();
   /* ---- 临时: SDRAM 曲线数据区诊断测试 (通过后可删除) ---- */
 //   SDRAM_CurveArea_Test();
@@ -489,8 +496,10 @@ void BSP_Init(void)
   /* ---- 临时: EEPROM AT24C64D 诊断测试 (通过后可删除) ---- */
 //   EEPROM_Test();
   /* ��ʼ��UART7 (PF6-RX, PF7-TX), 115200 8-N-1, 用于 printf 调试输出 */
-    DEBUG_USART_Config();
+    // DEBUG_USART_Config();
   DIP_SWITCH_Config();
+  WDI_GPIO_Init();
+  WatchDog_Clear();
   
   /* CmBacktrace initialize */
   // cm_backtrace_init("YH-F429", HARDWARE_VERSION, SOFTWARE_VERSION);
@@ -591,9 +600,59 @@ static void GPIO_CLK_Init(void)
 }
 
 
+/**
+  * @brief  启动流水灯 — 7颗LED依次点亮, 3个循环
+  * @note   每次上电/复位后执行, 用于目视确认板子是否重启.
+  *         流水方向: LED_485_1 → 2 → 3 → 4 → 5 → 6 → RUN, 每步80ms.
+  *         3个循环约1.7秒.
+  */
+static void Startup_LED_Running(void)
+{
+    uint8_t cycle;
+    for (cycle = 0; cycle < 2; cycle++) {
+        LED_485_1_ON;  HAL_Delay(80);  LED_485_1_OFF;
+        LED_485_2_ON;  HAL_Delay(80);  LED_485_2_OFF;
+        LED_485_3_ON;  HAL_Delay(80);  LED_485_3_OFF;
+        LED_485_4_ON;  HAL_Delay(80);  LED_485_4_OFF;
+        LED_485_5_ON;  HAL_Delay(80);  LED_485_5_OFF;
+        LED_485_6_ON;  HAL_Delay(80);  LED_485_6_OFF;
+        LED_RUN_ON;    HAL_Delay(80);  LED_RUN_OFF;
+    }
+}
+
+
+/**
+  * @brief  SP706S 外部看门狗 WDI 引脚初始化 (PF10)
+  * @note   推挽输出, 初始低电平.
+  *         上电后首次 WatchDog_Clear() 会产生上升沿, 启动看门狗.
+  */
+static void WDI_GPIO_Init(void)
+{
+    GPIO_InitTypeDef gpio_init = {0};
+
+    /* GPIOF 时钟已在 GPIO_CLK_Init() 中使能, 此处再次使能保证安全 (幂等) */
+    WDI_CLK_ENABLE();
+
+    gpio_init.Pin   = WDI_PIN;
+    gpio_init.Mode  = GPIO_MODE_OUTPUT_PP;
+    gpio_init.Pull  = GPIO_NOPULL;
+    gpio_init.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(WDI_PORT, &gpio_init);
+
+    /* 初始输出低电平, 之后每次 WatchDog_Clear() 翻转一次 */
+    HAL_GPIO_WritePin(WDI_PORT, WDI_PIN, GPIO_PIN_RESET);
+}
+
+
 void WatchDog_Clear(void)
 {
-  // todo:待写
+  /*
+   * SP706S: WDI 引脚需要一个跳变沿 (上升沿或下降沿) 来清除内部看门狗定时器.
+   *         典型超时周期 1.6s, 超时后 SP706S 拉低 RST 复位 MCU.
+   *         此处通过翻转 PF10 产生跳变沿来喂狗.
+   *         PF10 在 WDI_GPIO_Init() 中初始化为推挽输出, 初始低电平.
+   */
+  HAL_GPIO_TogglePin(WDI_PORT, WDI_PIN);
 }
 
 void assert_failed(uint8_t* file, uint32_t line)
