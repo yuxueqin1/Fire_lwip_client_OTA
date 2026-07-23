@@ -29,6 +29,7 @@ typedef struct {
 #define UART_PORT_CUSTOM            1
 #define UART_PORT_SLAVE             3
 #define UART_PORT_MODBUS_MASTER     4
+#define UART_PORT_AXLE_COUNTER      7    /* 0x07 — 非标485计轴(防雷分线柜)端口 */
 #define UART_DEFAULT_DELAY_MS       440
 #define UART_MODULE_MAX_COUNT       32
 #define UART_MODULE_DEFAULT_REGS    13
@@ -54,6 +55,9 @@ typedef struct {
 #define FLFXG_AC_ZZJ_HIGH           0x4B    /* 高频交流转辙机         */
 #define FLFXG_DC_ZZJ4_HIGH          0x4C    /* 高频直流转辙机4路      */
 #define FLFXG_DC_ZZJ6_HIGH          0x4D    /* 高频直流转辙机6路      */
+
+/* 防雷分线柜模块类型 */
+#define FLFXG_AXLE_COUNTER          0x50    /* 计轴采集传感器 WBTQ301JH-1B3 */
 
 /* SDRAM curve buffer layout */
 /* Realtime data (SSZ): port_idx * 0x1000 bytes from SDRAM_BASE_ADDR */
@@ -118,6 +122,11 @@ typedef struct {
     uint16_t      *qx_buf;        /* SDRAM curve data base pointer             */
 } UART_PortRuntime_t;
 
+/* ---- 计轴模块通讯确认码状态 (每端口一份) ---- */
+typedef struct {
+    uint16_t comm_confirm[UART_MODULE_MAX_COUNT];   /* 上次收到的通讯确认码 */
+} AxleCounterState_t;
+
 /* ---- Global variables for 6 UART ports ---- */
 extern BoardConfig_t    BoardCfgTab[UART_PORT_COUNT];
 extern uint8_t          SerialDataBuf[UART_PORT_COUNT][UART_SERIAL_BUF_SIZE];
@@ -153,6 +162,7 @@ extern uint8_t               logWTD_RESET;                        /* WDT reset l
 extern uint8_t               jiaoshi;                             /* Time-calibration log flag         */
 extern uint8_t               portError[UART_PORT_COUNT];          /* Per-port data error log flags     */
 extern uint8_t               portDLQX[UART_PORT_COUNT];           /* Per-port curve upload log flags   */
+extern AxleCounterState_t     axle_counter_state[UART_PORT_COUNT];  /* Axle counter comm_confirm state    */
 
 /* ---- 函数声明 ---- */
 uint32_t uart_get_baud_rate(uint8_t baud_code);

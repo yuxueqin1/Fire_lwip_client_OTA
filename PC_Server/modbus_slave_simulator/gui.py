@@ -37,7 +37,7 @@ from typing import Optional
 
 from serial_io import SerialPort
 from slave_device import SlaveDevice
-from module_profiles import get_module_name, get_profile, FALLBACK_PROFILE
+from module_profiles import get_module_name, get_profile, FALLBACK_PROFILE, FLFXG_AXLE_COUNTER
 
 # ============================================================================
 # 常量
@@ -53,6 +53,7 @@ MODULE_TYPE_NAMES = {
     0x47: "高频信号机",    0x48: "高频25Hz轨道接收", 0x49: "高频25Hz轨道发送",
     0x4A: "高频采集模块",  0x4B: "高频交流转辙机",   0x4C: "高频直流四线制",
     0x4D: "高频直流六线制",
+    0x50: "计轴采集传感器",
 }
 
 BAUD_RATE_OPTIONS = ["9600", "19200", "38400", "57600"]
@@ -273,7 +274,12 @@ class SimulatorThread(threading.Thread):
                 module_name = get_module_name(device.module_type)
                 flag_info = ""
                 is_curve = device.is_curve_capable
-                if is_curve and len(response) > device.profile.curve_flag_offset:
+                if device.module_type == FLFXG_AXLE_COUNTER:
+                    # 计轴模块: 显示未读脉冲数 (resp offset 29-30)
+                    if len(response) > 32:
+                        unread = (response[29] << 8) | response[30]
+                        flag_info = f" [未读脉冲={unread}]"
+                elif is_curve and len(response) > device.profile.curve_flag_offset:
                     flag_byte = response[device.profile.curve_flag_offset]
                     flag_names = {0x00: "实时帧", 0x55: "中间帧", 0xFF: "结束帧"}
                     flag_info = f" [{flag_names.get(flag_byte, f'0x{flag_byte:02X}')}]"
@@ -287,7 +293,9 @@ class SimulatorThread(threading.Thread):
 
                 # 发送事件给 GUI
                 flags = {}
-                if is_curve and len(response) > device.profile.curve_flag_offset:
+                if device.module_type == FLFXG_AXLE_COUNTER:
+                    flags["axle_counter"] = True
+                elif is_curve and len(response) > device.profile.curve_flag_offset:
                     flag_byte = response[device.profile.curve_flag_offset]
                     flags["frame_flag"] = flag_byte
                     flags["frame_seq"] = (
@@ -1141,16 +1149,22 @@ class SlaveSimulatorGUI:
             f"保持寄存器: {dev.profile.holding_regs}",
         ]
         if dev.is_curve_capable:
-            info_parts.append(f"曲线模式: {dev.curve_mode}")
-            info_parts.append(f"分支数: {dev.profile.curve_branch_count}")
+            mode_label = "脉冲模式" if dev.module_type == FLFXG_AXLE_COUNTER else "曲线模式"
+            info_parts.append(f"{mode_label}: {dev.curve_mode}")
+            if not dev.module_type == FLFXG_AXLE_COUNTER:
+                info_parts.append(f"分支数: {dev.profile.curve_branch_count}")
         if dev.profile.is_high_frequency:
             info_parts.append("高频模块")
+        if dev.module_type == FLFXG_AXLE_COUNTER:
+            info_parts.append("计轴模块")
         self.sel_dev_info.config(text="  |  ".join(info_parts))
 
-        # 曲线开关按钮
+        # 曲线/脉冲开关按钮
         if dev.is_curve_capable:
+            btn_label = ("切换脉冲模式" if dev.module_type == FLFXG_AXLE_COUNTER
+                         else "切换曲线模式")
             self.curve_btn.config(state=tk.NORMAL,
-                                  text=f"切换曲线模式 (当前: {dev.curve_mode})")
+                                  text=f"{btn_label} (当前: {dev.curve_mode})")
         else:
             self.curve_btn.config(state=tk.DISABLED, text="非曲线模块")
 
@@ -1475,7 +1489,8 @@ class AddDeviceDialog:
 
         profile = get_profile(mtype)
 
-        if profile.is_custom_curve:
+        # 自定义曲线模块 和 计轴模块 都需要使能模式选择 (realtime / curve)
+        if profile.is_custom_curve or mtype == FLFXG_AXLE_COUNTER:
             for child in self.curve_frame.winfo_children():
                 child.configure(state=tk.NORMAL)
         else:
@@ -1497,10 +1512,12 @@ class AddDeviceDialog:
         profile = get_profile(mtype)
         is_curve = "是" if profile.is_custom_curve else "否"
         is_hf = "是" if profile.is_high_frequency else "否"
+        is_axle = "是" if mtype == FLFXG_AXLE_COUNTER else "否"
         self.info_var.set(
             f"输入寄存器: {profile.input_regs}  |  "
             f"保持寄存器: {profile.holding_regs}  |  "
             f"自定义曲线: {is_curve}  |  "
+            f"计轴模块: {is_axle}  |  "
             f"高频模块: {is_hf}"
             + (f"  |  曲线分支数: {profile.curve_branch_count}"
                if profile.is_custom_curve else "")
@@ -1658,8 +1675,8 @@ class DeviceEditDialog:
         profile = get_profile(mtype)
         self._update_info(profile)
 
-        # 曲线模块才显示曲线设置
-        if profile.is_custom_curve:
+        # 曲线模块 和 计轴模块 才显示曲线/脉冲设置
+        if profile.is_custom_curve or mtype == FLFXG_AXLE_COUNTER:
             for child in self.curve_frame.winfo_children():
                 child.configure(state=tk.NORMAL)
             if self.curve_var.get() not in ("realtime", "curve"):

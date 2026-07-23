@@ -118,6 +118,9 @@ uint8_t           portError[UART_PORT_COUNT] = {0};
 /* 端口曲线上传完成标志 (每端口): 非零=有曲线数据需要上传 */
 uint8_t           portDLQX[UART_PORT_COUNT] = {0};
 
+/* 计轴模块通讯确认码状态 (每端口每模块跟踪上次收到的确认码) */
+AxleCounterState_t axle_counter_state[UART_PORT_COUNT];
+
 
 /*======================================================================*/
 /*  二、串口硬件配置表                                                    */
@@ -192,6 +195,9 @@ static const UART_ModuleProfile_t uart_module_profiles[] = {
     {FLFXG_DC_ZZJ4_HIGH,  23, 21,   1,     1,      46,      70,      69,      61,       63,       120,     1},
     /* DC_ZZJ6_HIGH:  高频直流六线制, 26 个寄存器 (52 字节), 2 分支       */
     {FLFXG_DC_ZZJ6_HIGH,  26, 24,   1,     1,      52,      76,      75,      67,       69,       176,     2},
+    /* ---- 防雷分线柜模块 ---- */
+    /* Axle Counter: 计轴采集传感器, 14 寄存器(28B), 带报警(KGL开关量), 非标准Modbus */
+    {FLFXG_AXLE_COUNTER, 14, 0,    1,     0,      28,      0,       0,       0,        0,       0,       0},
     /* ---- 哨兵条目 (未匹配到类型时的回退) ---- */
     {0x00,           13, 11,   1,     0,      0,       0,       0,       0,        0,       0,       0}
 };
@@ -330,8 +336,12 @@ eMBErrorCode uart_init_port(uint8_t port_idx, uint32_t baud_rate, xMBMHandle *px
             UART_delay[port_idx] = UART_DEFAULT_DELAY_MS;
             return MB_EPORTERR;
         }
-    } else if (BoardCfgTab[port_idx].PortType == UART_PORT_CUSTOM) {
-        /* 自定义串口模式: 使用 HAL 底层直接控制 (用于曲线模块的非 Modbus 协议) */
+    } else if ((BoardCfgTab[port_idx].PortType == UART_PORT_CUSTOM) ||
+               (BoardCfgTab[port_idx].PortType == UART_PORT_AXLE_COUNTER)) {
+        /* 自定义串口模式: 使用 HAL 底层直接控制
+         *   - UART_PORT_CUSTOM (1):      曲线模块的非 Modbus 协议
+         *   - UART_PORT_AXLE_COUNTER (7): 计轴传感器非标 485 协议
+         */
         UART_Custom[port_idx] = 1;
         if (uart_init_custom_raw(port_idx, baud_rate) != MB_ENOERR) {
             UART_delay[port_idx] = UART_DEFAULT_DELAY_MS;

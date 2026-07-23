@@ -26,6 +26,15 @@
 import os
 import sys
 
+# ── Windows 高精度定时器 (提升串口响应速度) ──
+if sys.platform == 'win32':
+    try:
+        import ctypes
+        _winmm = ctypes.WinDLL('winmm')
+        _winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
+
 # 将 modbus_slave_simulator 包目录加入 sys.path
 _pkg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "modbus_slave_simulator")

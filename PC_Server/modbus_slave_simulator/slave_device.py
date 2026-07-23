@@ -13,10 +13,12 @@ from typing import Optional
 
 from module_profiles import (
     ModuleProfile, get_profile, get_module_name, FALLBACK_PROFILE,
+    FLFXG_AXLE_COUNTER,
 )
 from data_simulator import DataSimulator
 from standard_handler import StandardHandler
 from custom_handler import CustomHandler, CurveMode
+from axle_counter_handler import AxleCounterHandler, AxlePulseMode
 
 
 class SlaveDevice:
@@ -39,7 +41,8 @@ class SlaveDevice:
                  allow_extended_read: bool = False,
                  alarm_probability: float = 0.02,
                  sine_period_s: float = 10.0,
-                 random_walk_step: float = 5.0) -> None:
+                 random_walk_step: float = 5.0,
+                 pulse_interval: float = 5.0) -> None:
         """
         Args:
             address: Slave address (1-247).
@@ -51,6 +54,7 @@ class SlaveDevice:
             alarm_probability: Per-read alarm bit probability.
             sine_period_s: Period in seconds for sine-wave generators.
             random_walk_step: Step size for random-walk generators.
+            pulse_interval: Seconds between simulated pulse events (axle counter only).
         """
         if not (1 <= address <= 247):
             raise ValueError(f"Invalid slave address: {address}")
@@ -79,8 +83,18 @@ class SlaveDevice:
             random_walk_step=random_walk_step,
         )
 
-        self._handler: StandardHandler | CustomHandler
-        if self._profile.is_custom_curve:
+        self._handler: StandardHandler | CustomHandler | AxleCounterHandler
+        if module_type == FLFXG_AXLE_COUNTER:
+            # 计轴传感器: 自定义 0x03/0x10 协议 (通讯确认码 + 脉冲)
+            pulse = AxlePulseMode(curve_mode)
+            self._handler = AxleCounterHandler(
+                address=address,
+                profile=self._profile,
+                data_gen=self._data_gen,
+                pulse_mode=pulse,
+                pulse_interval=pulse_interval,
+            )
+        elif self._profile.is_custom_curve:
             mode = CurveMode(curve_mode)
             self._handler = CustomHandler(
                 address=address,
@@ -108,13 +122,15 @@ class SlaveDevice:
 
     @property
     def is_curve_capable(self) -> bool:
-        """True if this device type supports curve data."""
-        return self._profile.is_custom_curve
+        """True if this device type supports curve/pulse data."""
+        return self._profile.is_custom_curve or self.module_type == FLFXG_AXLE_COUNTER
 
     @property
     def curve_mode(self) -> Optional[str]:
-        """Current curve mode string, or None for non-curve modules."""
+        """Current curve/pulse mode string, or None for standard modules."""
         if isinstance(self._handler, CustomHandler):
+            return self._handler.curve_mode.value
+        if isinstance(self._handler, AxleCounterHandler):
             return self._handler.curve_mode.value
         return None
 
@@ -159,17 +175,22 @@ class SlaveDevice:
 
     def set_curve_mode(self, mode: str) -> None:
         """
-        Switch curve mode at runtime.
+        Switch curve/pulse mode at runtime.
 
         Args:
             mode: "realtime" or "curve"
         """
         if isinstance(self._handler, CustomHandler):
             self._handler.set_curve_mode(CurveMode(mode))
+        elif isinstance(self._handler, AxleCounterHandler):
+            self._handler.set_curve_mode(AxlePulseMode(mode))
 
     def toggle_curve_mode(self) -> str:
-        """Toggle curve mode; returns the new mode string."""
+        """Toggle curve/pulse mode; returns the new mode string."""
         if isinstance(self._handler, CustomHandler):
+            new = self._handler.toggle_curve_mode()
+            return new.value
+        if isinstance(self._handler, AxleCounterHandler):
             new = self._handler.toggle_curve_mode()
             return new.value
         return "N/A"
@@ -214,12 +235,15 @@ class SlaveDevice:
         name = get_module_name(self.module_type)
         curve_info = ""
         if self.is_curve_capable:
+            mode_label = "pulse" if self.module_type == FLFXG_AXLE_COUNTER else "curve"
             curve_info = f" [{self.curve_mode}]"
         flags = []
         if self._profile.is_high_frequency:
             flags.append("HF")
         if self._profile.exceeds_125_regs:
             flags.append(">125reg")
+        if self.module_type == FLFXG_AXLE_COUNTER:
+            flags.append("AXLE")
         flag_str = f" ({', '.join(flags)})" if flags else ""
         return (f"  [{self.address:3d}] 0x{self.module_type:02X} "
                 f"{name}{flag_str}{curve_info} "

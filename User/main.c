@@ -106,6 +106,17 @@ static void uart_handle_curve_frame_dispatch(uint8_t port_idx, uint8_t module_id
                                              const UART_ModuleProfile_t *profile,
                                              uint8_t *ser_buf);
 
+/* ---- Axle counter protocol (0x07) ---- */
+static void     uart_process_axle_counter(UART_PortRuntime_t *runtime);
+static uint16_t uart_axle_counter_module_exchange(uint8_t port_idx, uint8_t module_idx);
+static void     uart_axle_counter_online(UART_PortRuntime_t *runtime, uint8_t module_idx,
+                                         uint16_t rx_len, uint16_t *dc_offset);
+static void     uart_axle_counter_offline(UART_PortRuntime_t *runtime, uint8_t module_idx,
+                                          uint16_t *dc_offset);
+static void     uart_axle_counter_upload_pulse(uint8_t port_idx, uint8_t module_idx,
+                                               const uint8_t *pulse_data,
+                                               uint16_t pulse_len, uint32_t link_mask);
+
 /* ---- Modbus slave callbacks ---- */
 static eMBException eMBSRegHoldingCB(UBYTE *pubRegBuffer, USHORT usAddress,
                                       USHORT usNRegs, eMBSRegisterMode eRegMode);
@@ -488,6 +499,11 @@ static void uart_task_handler(void *pvParameters)
             uart_process_custom_port(&runtime);
             break;
 
+        case UART_PORT_AXLE_COUNTER:
+            /* 计轴传感器端口: 非标485协议 (通讯确认码 + 脉冲数据) */
+            uart_process_axle_counter(&runtime);
+            break;
+
         default:
             break;
         }
@@ -551,6 +567,16 @@ static void uart_task_handler(void *pvParameters)
             /* Modbus port: 使用 uart_flush_realtime_frame 统一设置帧标志 */
             uart_flush_realtime_frame(port_idx, runtime.data_len,
                                       20U + port_idx * 6U);
+            break;
+
+        case UART_PORT_AXLE_COUNTER:
+            /* 计轴端口实时帧: 帧标志 = 0x01 (区别于脉冲帧 0x09) */
+            *((uint16_t *)&SerialDataBuf[port_idx][5]) = runtime.data_len + 4U;
+            SerialDataBuf[port_idx][3] = 0x01;
+            memcpy(&SerialDataBuf[port_idx][11], runtime.ssz_buf, runtime.data_len);
+            client_add_to_tcp_send_buf(&SerialDataBuf[port_idx][0],
+                                       (uint16_t)(runtime.data_len + 11U),
+                                       20U + port_idx * 6U, port_idx);
             break;
 
         default:
@@ -1020,7 +1046,8 @@ static void uart_check_port_error_and_arm(UART_PortRuntime_t *runtime)
         runtime->port_error++;
         if (runtime->port_error < 4U) {
             if ((BoardCfgTab[runtime->port_idx].PortType == UART_PORT_MODBUS_MASTER) ||
-                (BoardCfgTab[runtime->port_idx].PortType == UART_PORT_CUSTOM)) {
+                (BoardCfgTab[runtime->port_idx].PortType == UART_PORT_CUSTOM) ||
+                (BoardCfgTab[runtime->port_idx].PortType == UART_PORT_AXLE_COUNTER)) {
 
                 /*
                  * Before re-initializing a Modbus port, close the old handle
@@ -1069,6 +1096,323 @@ static void uart_check_port_error_and_arm(UART_PortRuntime_t *runtime)
         /* 至少有一个从机在线 → 清零错误计数 */
         runtime->port_error = 0;
     }
+}
+
+
+/*======================================================================*/
+/*  计轴模块 (PortType = 0x07) — 协议处理                                 */
+/*======================================================================*/
+
+/* 计轴传感器实时寄存器常量 */
+#define AXLE_REALTIME_REGS    14U
+#define AXLE_REALTIME_BYTES   (AXLE_REALTIME_REGS * 2U)  /* = 28 */
+
+/*======================================================================*/
+/*  uart_axle_counter_module_exchange                                    */
+/*  构建 0x03 查询帧 [addr,03,comm_confirm(2B),00,00,CRC]                */
+/*  发送并接收应答 (写入 SerialDataBuf[port_idx][11])                     */
+/*======================================================================*/
+static uint16_t uart_axle_counter_module_exchange(uint8_t port_idx, uint8_t module_idx)
+{
+    uint8_t  tx_buf[8];
+    uint16_t tx_crc;
+    uint16_t rx_len;
+    uint16_t rx_crc_calc, rx_crc_recv;
+    uint8_t *resp;
+    uint16_t comm_confirm;
+
+    resp = (uint8_t *)&SerialDataBuf[port_idx][11];
+
+    /* 获取上次的通讯确认码 (首次 = 0x0000) */
+    comm_confirm = axle_counter_state[port_idx].comm_confirm[module_idx];
+
+    /* 构建请求: [addr, 03, comm_confirm(2B), 00, 00, CRC] */
+    tx_buf[0] = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx];
+    tx_buf[1] = 0x03;
+    tx_buf[2] = (uint8_t)((comm_confirm >> 8) & 0xFFU);
+    tx_buf[3] = (uint8_t)(comm_confirm & 0xFFU);
+    tx_buf[4] = 0x00;    /* 脉冲个数 = 查询模式 (不清楚是否有脉冲) */
+    tx_buf[5] = 0x00;
+    tx_crc    = uart_crc16(tx_buf, 6);
+    tx_buf[6] = (uint8_t)(tx_crc & 0xFFU);
+    tx_buf[7] = (uint8_t)((tx_crc >> 8) & 0xFFU);
+
+    /* 发送 + 接收 */
+    rx_len = uart_custom_exchange(port_idx, tx_buf, 8, resp,
+                                  (uint16_t)(UART_SERIAL_BUF_SIZE - 11U),
+                                  100, 300);
+    if (rx_len < 5U) {
+        return 0;
+    }
+
+    /* CRC16 校验 */
+    rx_crc_calc = uart_crc16(resp, rx_len - 2U);
+    rx_crc_recv = (uint16_t)((uint16_t)resp[rx_len - 1U] << 8)
+                | (uint16_t)resp[rx_len - 2U];
+    if (rx_crc_calc != rx_crc_recv) {
+        return 0;
+    }
+
+    return rx_len;
+}
+
+
+/*======================================================================*/
+/*  uart_axle_counter_upload_pulse                                       */
+/*  将传感器原始脉冲数据打包为 TCP 脉冲帧 (帧标志 0x09) 上传              */
+/*                                                                       */
+/*  TCP 脉冲数据包格式 (协议文档 Table 1.4):                              */
+/*    设备ID(1B) + 通道号(1B) + 时间戳秒(4B) + 时间戳毫秒(2B)            */
+/*    + 采集标志(1B) + 当前脉冲数量(2B)                                   */
+/*    + Σ(脉冲N_时间偏移(2B) + 脉冲N_采样点数(1B) + 采集值[n](1B×n))    */
+/*                                                                       */
+/*  时间偏移 = ((pulse_ts - curve_ts)×1000 + (pulse_tms - curve_ms)) / 4 */
+/*======================================================================*/
+static void uart_axle_counter_upload_pulse(uint8_t port_idx, uint8_t module_idx,
+                                           const uint8_t *pulse_data,
+                                           uint16_t pulse_len, uint32_t link_mask)
+{
+    uint8_t  *pkt;
+    uint16_t  pkt_offset;
+    uint16_t  read_offset;
+    uint16_t  pkt_pulse_count;
+    uint32_t  curve_unix;
+    uint16_t  curve_ms;
+    uint16_t  p, i;
+
+    if ((pulse_data == NULL) || (pulse_len < 10U)) {
+        return;
+    }
+
+    /* 读取"本包上报脉冲个数"(前2字节) */
+    pkt_pulse_count = ((uint16_t)pulse_data[0] << 8) | (uint16_t)pulse_data[1];
+    read_offset = 2;
+
+    /*
+     * 从实时数据中提取曲线起始时间戳.
+     * 实时数据已由 uart_axle_counter_online 写入 SerialDataBuf[port][11..38].
+     * 偏移: resp[3+4]=Uinx(4B), resp[3+22]=Uinx_ms(2B).
+     */
+    {
+        uint8_t *base = (uint8_t *)&SerialDataBuf[port_idx][11];
+        curve_unix = ((uint32_t)base[7]  << 24) | ((uint32_t)base[8]  << 16)
+                   | ((uint32_t)base[9]  << 8)  |  (uint32_t)base[10];
+        curve_ms   = ((uint16_t)base[25] << 8)  |  (uint16_t)base[26];
+    }
+
+    /* 脉冲数据包写入 SerialDataBuf 中 (复用缓冲区) */
+    pkt = (uint8_t *)&SerialDataBuf[port_idx][11];
+    pkt_offset = 0;
+
+    for (p = 0; p < pkt_pulse_count && read_offset < pulse_len; p++) {
+        uint32_t pulse_ts;
+        uint16_t pulse_tms;
+        uint8_t  ch_no;
+        uint8_t  pulse_size;
+        int32_t  delta_s, delta_ms, total_ms;
+        uint32_t time_offset;
+
+        /* ---- 解析传感器脉冲结构 ---- */
+        pulse_ts   = ((uint32_t)pulse_data[read_offset]     << 24)
+                   | ((uint32_t)pulse_data[read_offset + 1] << 16)
+                   | ((uint32_t)pulse_data[read_offset + 2] << 8)
+                   |  (uint32_t)pulse_data[read_offset + 3];
+        pulse_tms  = ((uint16_t)pulse_data[read_offset + 4] << 8)
+                   |  (uint16_t)pulse_data[read_offset + 5];
+        ch_no      = pulse_data[read_offset + 6];
+        pulse_size = pulse_data[read_offset + 7];
+        read_offset += 8;
+
+        if ((uint16_t)(read_offset + pulse_size) > pulse_len) {
+            break;
+        }
+
+        /* 时间偏移 = ((pulse_ts - curve_unix)×1000 + (pulse_tms - curve_ms)) / 4 */
+        delta_s  = (int32_t)(pulse_ts  - curve_unix);
+        delta_ms = (int32_t)(pulse_tms - curve_ms);
+        total_ms = delta_s * 1000 + delta_ms;
+        time_offset = (uint32_t)(total_ms / 4);
+
+        /* ---- 写入 TCP 脉冲数据包条目 ---- */
+        pkt[pkt_offset++] = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx]; /* 设备ID */
+        pkt[pkt_offset++] = ch_no;                          /* 通道号 */
+        pkt[pkt_offset++] = (uint8_t)(pulse_ts >> 24);      /* 时间戳(秒) */
+        pkt[pkt_offset++] = (uint8_t)(pulse_ts >> 16);
+        pkt[pkt_offset++] = (uint8_t)(pulse_ts >> 8);
+        pkt[pkt_offset++] = (uint8_t)(pulse_ts);
+        pkt[pkt_offset++] = (uint8_t)(pulse_tms >> 8);      /* 时间戳(毫秒) */
+        pkt[pkt_offset++] = (uint8_t)(pulse_tms);
+        pkt[pkt_offset++] = 0x01;                           /* 采集标志 = 1 (完成) */
+        pkt[pkt_offset++] = (uint8_t)((pulse_size >> 8) & 0xFFU); /* 当前脉冲数量(高) */
+        pkt[pkt_offset++] = (uint8_t)(pulse_size & 0xFFU);        /* 当前脉冲数量(低) */
+        pkt[pkt_offset++] = (uint8_t)((time_offset >> 8) & 0xFFU); /* 时间偏移 */
+        pkt[pkt_offset++] = (uint8_t)(time_offset & 0xFFU);
+        pkt[pkt_offset++] = pulse_size;                     /* 采样点数 */
+        for (i = 0; i < pulse_size; i++) {
+            pkt[pkt_offset++] = pulse_data[read_offset + i]; /* 采集值(×0.1V) */
+        }
+        read_offset += pulse_size;
+    }
+
+    /* ---- 构建完整 TCP 帧: [端口,主协议,子协议,0x09,分机号,len(2B),link_mask(4B),脉冲包] ---- */
+    if (pkt_offset > 0U) {
+        uint8_t *frame = (uint8_t *)&SerialDataBuf[port_idx][0];
+        uint16_t f_len;
+
+        frame[0] = (uint8_t)(port_idx + 1U);
+        frame[1] = BoardCfgTab[port_idx].MainProType;
+        frame[2] = BoardCfgTab[port_idx].SubProType;
+        frame[3] = 0x09;                                     /* 帧标志: 脉冲曲线帧 */
+        frame[4] = BoardCfgTab[port_idx].FenjiNum;
+        *((uint16_t *)&frame[5]) = (uint16_t)(pkt_offset + 4U); /* 数据长度 */
+        *((uint32_t *)&frame[7]) = link_mask;                /* 模块状态 */
+
+        f_len = (uint16_t)(pkt_offset + 11U);
+        client_add_to_tcp_send_buf(frame, f_len,
+                                   20U + port_idx * 6U, port_idx);
+    }
+}
+
+
+/*======================================================================*/
+/*  uart_axle_counter_online                                            */
+/*  计轴模块在线处理:                                                    */
+/*  1. 清除错误计数, 设置在线位                                          */
+/*  2. 提取实时数据 (28 字节) 到 SDRAM                                  */
+/*  3. 检查 KGL 报警位, 更新 ALARM_TEMP                                 */
+/*  4. 保存通讯确认码 (寄存器 12)                                        */
+/*  5. 检查未读脉冲数 → 触发脉冲上传                                     */
+/*======================================================================*/
+static void uart_axle_counter_online(UART_PortRuntime_t *runtime,
+                                     uint8_t module_idx, uint16_t rx_len,
+                                     uint16_t *dc_offset)
+{
+    uint8_t *resp = (uint8_t *)&SerialDataBuf[runtime->port_idx][11];
+    uint16_t comm_confirm;
+    uint16_t unread_pulses;
+    uint16_t kgl_val;
+
+    runtime->module_error[module_idx] = 0;
+    runtime->link_mask |= (1UL << module_idx);
+
+    /* ---- 提取实时数据 28 字节 (resp[3] = 跳过 addr+func+len) ---- */
+    if (rx_len >= (uint16_t)(3U + AXLE_REALTIME_BYTES + 2U)) {
+        memcpy(&runtime->ssz_buf[*dc_offset], &resp[3], AXLE_REALTIME_BYTES);
+        uart_swap16(&runtime->ssz_buf[*dc_offset], AXLE_REALTIME_REGS);
+        runtime->data_len += AXLE_REALTIME_BYTES;
+    }
+
+    /* ---- 报警检查: KGL 寄存器 (寄存器1, resp offset 3+2=5) ---- */
+    kgl_val = runtime->ssz_buf[*dc_offset + 1];  /* 已做 swap16, 第二个16位字 = 寄存器1 */
+    if ((kgl_val & 0x3fU) == 0U) {
+        /* KGL bit0-5 全为0 → 报警 */
+        ALARM_TEMP[runtime->port_idx] |= (1UL << module_idx);
+    } else {
+        ALARM_TEMP[runtime->port_idx] &= ~(1UL << module_idx);
+    }
+
+    /* ---- 保存通讯确认码 (寄存器12, resp offset 3+24=27) ---- */
+    comm_confirm = ((uint16_t)resp[27] << 8) | (uint16_t)resp[28];
+    axle_counter_state[runtime->port_idx].comm_confirm[module_idx] = comm_confirm;
+
+    /* ---- 检查未读脉冲数 (寄存器13, resp offset 3+26=29) ---- */
+    unread_pulses = ((uint16_t)resp[29] << 8) | (uint16_t)resp[30];
+
+    if (unread_pulses > 0U) {
+        /*
+         * 脉冲数据位于 resp[31] 之后.
+         * resp[0..2]=头(3B), resp[3..30]=实时数据(28B,含未读脉冲数),
+         * resp[31..]=脉冲块(pulse_count+events), resp[last-2..last-1]=CRC.
+         * 脉冲数据长度 = rx_len - 3(头) - 28(实时) - 2(CRC) = rx_len - 33.
+         */
+        uart_axle_counter_upload_pulse(runtime->port_idx, module_idx,
+                                       &resp[31],
+                                       (uint16_t)(rx_len - 33U),
+                                       runtime->link_mask);
+    }
+
+    *dc_offset += AXLE_REALTIME_REGS;
+}
+
+
+/*======================================================================*/
+/*  uart_axle_counter_offline                                           */
+/*  计轴模块离线处理: SDRAM 填充 0xFFFF, 累计错误计数                    */
+/*======================================================================*/
+static void uart_axle_counter_offline(UART_PortRuntime_t *runtime,
+                                      uint8_t module_idx, uint16_t *dc_offset)
+{
+    uint16_t i;
+
+    if (runtime->module_error[module_idx] > 3U) {
+        runtime->link_mask &= ~(1UL << module_idx);
+    } else {
+        runtime->module_error[module_idx]++;
+    }
+
+    /* 填充 0xFFFF (离线标志) */
+    for (i = 0; i < AXLE_REALTIME_REGS; i++) {
+        runtime->ssz_buf[*dc_offset + i] = 0xFFFFU;
+    }
+
+    *dc_offset += AXLE_REALTIME_REGS;
+    runtime->data_len += AXLE_REALTIME_BYTES;
+}
+
+
+/*======================================================================*/
+/*  uart_process_axle_counter                                           */
+/*  计轴传感器端口主处理函数 (PortType = 0x07)                           */
+/*                                                                       */
+/*  遍历从机模块 → 校时(如需) → 0x03查询 → 解析应答                      */
+/*  → 实时数据 SDRAM → 脉冲检测 → 更新链路掩码                          */
+/*======================================================================*/
+static void uart_process_axle_counter(UART_PortRuntime_t *runtime)
+{
+    uint8_t  m;
+    uint8_t  module_count;
+    uint16_t rx_len;
+    uint16_t dc_offset = 0;
+
+    if (runtime == NULL) {
+        return;
+    }
+
+    module_count = BoardCfgTab[runtime->port_idx].SlaveModuelNum;
+    if (module_count > UART_MODULE_MAX_COUNT) {
+        module_count = UART_MODULE_MAX_COUNT;
+    }
+
+    runtime->link_mask = 0;
+    runtime->data_len  = 0;
+
+    for (m = 0; m < module_count; m++) {
+        /* ---- 校时 (每个模块只需发送一次) ---- */
+        if (changetime[runtime->port_idx] == 1U) {
+            (void)uart_custom_send_adjust_time(
+                runtime->port_idx,
+                (uint8_t)runtime->port_idx,
+                BoardCfgTab[runtime->port_idx].SlaveModuelAddress[m],
+                Systemtime);
+            TaskAdjustNum[runtime->port_idx]++;
+        }
+
+        /* ---- 发送 0x03 查询 + 接收应答 ---- */
+        rx_len = uart_axle_counter_module_exchange(runtime->port_idx, m);
+
+        if (rx_len > 0U) {
+            /* CRC OK — 在线, 提取实时数据 + 脉冲检测 */
+            uart_axle_counter_online(runtime, m, rx_len, &dc_offset);
+        } else {
+            /* CRC 失败或超时 — 离线 */
+            uart_axle_counter_offline(runtime, m, &dc_offset);
+        }
+
+        WDTUARTFLAG[runtime->port_idx] = 0;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    *((uint32_t *)&SerialDataBuf[runtime->port_idx][7]) = runtime->link_mask;
 }
 
 

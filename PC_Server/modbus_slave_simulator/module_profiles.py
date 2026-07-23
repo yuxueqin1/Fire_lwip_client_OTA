@@ -40,6 +40,9 @@ FLFXG_AC_ZZJ_HIGH   = 0x4B   # 高频交流转辙机 (4 分支)
 FLFXG_DC_ZZJ4_HIGH  = 0x4C   # 高频直流四线制 (1 分支)
 FLFXG_DC_ZZJ6_HIGH  = 0x4D   # 高频直流六线制 (2 分支)
 
+# --- 防雷分线柜模块 ---
+FLFXG_AXLE_COUNTER   = 0x50   # 计轴采集传感器 WBTQ301JH-1B3
+
 # ---------------------------------------------------------------------------
 # Profile data class
 # ---------------------------------------------------------------------------
@@ -158,6 +161,11 @@ _PROFILES: list[ModuleProfile] = [
                   46,  70,  69,  61,  63, 120, 1),
     ModuleProfile(FLFXG_DC_ZZJ6_HIGH,  26, 24, 1, 1,
                   52,  76,  75,  67,  69, 176, 2),
+
+    # ====== 防雷分线柜模块 ======
+    #  type              in  hold alarm cust  rt
+    ModuleProfile(FLFXG_AXLE_COUNTER,  14,  0, 1, 0,
+                  28),
 ]
 
 # Sentinel / fallback entry (type = 0x00, matches first entry config)
@@ -223,6 +231,7 @@ MODULE_TYPE_NAMES: dict[int, str] = {
     0x4B: "高频交流转辙机 (AC_ZZJ_HIGH)",
     0x4C: "高频直流四线制 (DC_ZZJ4_HIGH)",
     0x4D: "高频直流六线制 (DC_ZZJ6_HIGH)",
+    0x50: "计轴采集传感器 (AXLE_COUNTER)",
 }
 
 

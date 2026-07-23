@@ -23,7 +23,7 @@ from typing import Optional
 
 from serial_io import SerialPort
 from slave_device import SlaveDevice
-from module_profiles import get_module_name
+from module_profiles import get_module_name, FLFXG_AXLE_COUNTER
 from cli import SimulatorCLI
 
 
@@ -260,7 +260,12 @@ class Simulator:
                     # ── 控制台数据交互流 (在发送之后打印, 不占用通信超时窗口) ──
                     module_name = get_module_name(device.module_type)
                     flag_info = ""
-                    if device.is_curve_capable and len(response) > device.profile.curve_flag_offset:
+                    if device.module_type == FLFXG_AXLE_COUNTER:
+                        # 计轴模块: 显示未读脉冲数 (resp offset 29-30)
+                        if len(response) > 32:
+                            unread = (response[29] << 8) | response[30]
+                            flag_info = f" [未读脉冲={unread}]"
+                    elif device.is_curve_capable and len(response) > device.profile.curve_flag_offset:
                         flag_byte = response[device.profile.curve_flag_offset]
                         flag_names = {0x00: "实时帧", 0x55: "中间帧", 0xFF: "结束帧"}
                         flag_info = f" [{flag_names.get(flag_byte, f'0x{flag_byte:02X}')}]"
@@ -374,6 +379,8 @@ def cmd_example_config() -> None:
              "comment": "高频轨道接收(133寄存器, 扩展读模式)"},
             {"address": 3, "module_type": "0x37", "curve_mode": "curve",
              "curve_frames_per_cycle": 8, "comment": "交流转辙机(带曲线)"},
+            {"address": 4, "module_type": "0x50", "curve_mode": "realtime",
+             "comment": "计轴采集传感器(realtime=无脉冲, curve=模拟脉冲)"},
         ],
         "simulation": {
             "alarm_probability": 0.02,

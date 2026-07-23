@@ -173,22 +173,33 @@ class SerialPort:
     # Frame-level read
     # ------------------------------------------------------------------
 
-    def read_frame(self) -> Optional[bytes]:
+    def read_frame(self, block: bool = True) -> Optional[bytes]:
         """
-        Try to read one complete Modbus RTU / custom protocol frame.
+        Read one complete Modbus RTU / custom protocol frame.
 
-        Returns a complete frame (bytes) when the 3.5-char inter-frame gap
-        is detected, or None if no complete frame is available yet.
+        Args:
+            block: If True, blocks up to ``timeout`` seconds waiting for the
+                   first byte.  If False, returns None immediately when no
+                   data is available.
 
-        Non-blocking: returns immediately with None if the port buffer is empty
-        or a frame is still being accumulated.
+        Returns:
+            Complete frame when the 3.5-char inter-frame gap is detected,
+            or None if no complete frame is available.
         """
         if not self.is_open or not self._ser:
             return None
 
         try:
             with self._lock:
-                # Read all available bytes
+                # 阻塞等待首字节 (如果缓存为空且 block=True)
+                if not self._rx_buf and block:
+                    chunk = self._ser.read(1)  # 最多阻塞 timeout=5ms
+                    if chunk:
+                        self._rx_buf.extend(chunk)
+                        self._last_byte_time = time.monotonic()
+                        self.rx_byte_count += 1
+
+                # 读取所有可用字节
                 available = self._ser.in_waiting
                 if available > 0:
                     chunk = self._ser.read(available)
@@ -269,13 +280,13 @@ class SerialPort:
                 self._ser.write(data)
                 self._ser.flush()
                 self.tx_frame_count += 1
-            # ── 在锁外打印和延迟: print 很慢(10-30ms), 不能阻塞后续读操作 ──
+                # RS485 turnaround delay (must be inside lock — 总线方向切换优先于 print)
+                if self._rs485_delay > 0:
+                    time.sleep(self._rs485_delay)
+            # ── 在锁外打印: print 很慢(10-30ms), 不能阻塞串口通信 ──
             if self._verbose:
                 print(f"  [SERIAL] [{self._timestamp()}] "
                       f"→ 发送 ({len(data)}B): {self._hex_dump(data)}")
-            # RS485 turnaround delay (bus release)
-            if self._rs485_delay > 0:
-                time.sleep(self._rs485_delay)
         except (serial.SerialException, OSError) as e:
             print(f"  [SERIAL] Write error: {e}")
 

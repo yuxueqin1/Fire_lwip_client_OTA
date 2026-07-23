@@ -151,6 +151,7 @@ MODULE_PROFILES = {
     0x4B: {"input_regs": 68,  "holding_regs": 66,  "has_alarm": 1, "uses_custom_curve": 1, "realtime_bytes": 136},
     0x4C: {"input_regs": 23,  "holding_regs": 21,  "has_alarm": 1, "uses_custom_curve": 1, "realtime_bytes": 46},
     0x4D: {"input_regs": 26,  "holding_regs": 24,  "has_alarm": 1, "uses_custom_curve": 1, "realtime_bytes": 52},
+    0x50: {"input_regs": 14,  "holding_regs": 0,   "has_alarm": 1, "uses_custom_curve": 0, "realtime_bytes": 28},
 }
 
 def get_module_profile(module_type: int) -> dict:
@@ -161,7 +162,8 @@ def get_module_profile(module_type: int) -> dict:
 PORT_NAMES = ["UART7", "USART2", "UART5", "UART4", "USART1", "USART6", "USART3"]
 
 # ---- 端口类型 ----
-PORT_TYPE_MAP = {0: "禁用", 1: "自定义曲线", 3: "Modbus 从机", 4: "Modbus 主站"}
+PORT_TYPE_MAP = {0: "禁用", 1: "自定义曲线", 3: "Modbus 从机", 4: "Modbus 主站",
+                 7: "计轴(防雷分线柜)", 8: "直流3对线(防雷分线柜)"}
 
 # ---- 模块类型 ----
 MODULE_TYPE_MAP = {
@@ -172,6 +174,7 @@ MODULE_TYPE_MAP = {
     0x47: "高频信号机",    0x48: "高频25Hz轨道接收器", 0x49: "高频25Hz轨道发送器",
     0x4A: "高频采集模块",  0x4B: "高频交流转辙机", 0x4C: "高频直流四线制",
     0x4D: "高频直流六线制",
+    0x50: "计轴采集传感器",  0x51: "站联模块",      0x52: "直流3对线模块",
 }
 
 
@@ -1210,6 +1213,8 @@ class ConfigEditorWindow:
             side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="满配置 (13×0x48)", command=self._load_max_config).pack(
             side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="一键清空从机", command=self._clear_all_slaves).pack(
+            side=tk.LEFT, padx=5)
 
     def _build_port_page(self, parent, port: dict, port_idx: int):
         """构建单个端口的配置页面。"""
@@ -1222,7 +1227,8 @@ class ConfigEditorWindow:
 
         fields_left = [
             ("端口号", "PortNum", 1, 6),
-            ("端口类型", "PortType", [("禁用", 0), ("自定义曲线", 1), ("Modbus从机", 3), ("Modbus主站", 4)]),
+            ("端口类型", "PortType", [("禁用", 0), ("自定义曲线", 1), ("Modbus从机", 3), ("Modbus主站", 4),
+                                     ("计轴(防雷分线柜)", 7), ("直流3对线(防雷分线柜)", 8)]),
             ("波特率", "BautRate", [("9600", 1), ("19200", 2), ("38400", 3), ("57600", 4)]),
             ("数据位", "DataBit", [("5", 5), ("6", 6), ("7", 7), ("8", 8)]),
             ("停止位", "StopBit", [("1", 1), ("1.5", 15), ("2", 2)]),
@@ -1560,6 +1566,39 @@ class ConfigEditorWindow:
             f"  从机: {FULL_COUNT} 台 0x48 (高频25Hz轨道接收器)\n"
             f"  每台 133 个输入寄存器, 共 {total_regs} 个寄存器\n"
             f"  总帧长约 {total_regs * 2 + 11} 字节")
+
+    def _clear_all_slaves(self):
+        """一键清空所有 6 路端口的从机设备地址和类型。"""
+        if not messagebox.askyesno("确认清空",
+                                   "确定要清空全部 6 路端口的所有从机设备\n"
+                                   "（地址和类型全部归零）吗？"):
+            return
+
+        cleared = 0
+        for port_idx in range(UART_PORT_COUNT):
+            port = self.config.ports[port_idx]
+            port["SlaveModuelNum"] = 0
+
+            for i in range(UART_MODULE_MAX_COUNT):
+                port["SlaveModuelAddress"][i] = 0
+                port["SlaveModuelType"][i]    = 0
+
+                addr_var = self.slave_vars.get(f"{port_idx}_addr_{i}")
+                if addr_var:
+                    addr_var.set(0)
+                type_var = self.slave_vars.get(f"{port_idx}_type_{i}")
+                if type_var:
+                    type_var.set("未配置")
+                cleared += 1
+
+            # 更新从机数量显示
+            num_var = self.field_vars.get(f"{port_idx}_SlaveModuelNum")
+            if num_var:
+                num_var.set(0)
+
+        messagebox.showinfo("清空完成",
+            f"已清空 6 路端口共 {cleared} 个从机槽位\n"
+            f"（地址=0, 类型=未配置, 从机数=0）")
 
 
 # ============================================================================
