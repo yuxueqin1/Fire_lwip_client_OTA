@@ -37,7 +37,8 @@ from typing import Optional
 
 from serial_io import SerialPort
 from slave_device import SlaveDevice
-from module_profiles import get_module_name, get_profile, FALLBACK_PROFILE, FLFXG_AXLE_COUNTER
+from module_profiles import (get_module_name, get_profile, FALLBACK_PROFILE,
+                             FLFXG_AXLE_COUNTER, FLFXG_DC3WIRE_PLATFORM, FLFXG_DC3WIRE_STATION)
 
 # ============================================================================
 # 常量
@@ -54,6 +55,8 @@ MODULE_TYPE_NAMES = {
     0x4A: "高频采集模块",  0x4B: "高频交流转辙机",   0x4C: "高频直流四线制",
     0x4D: "高频直流六线制",
     0x50: "计轴采集传感器",
+    0x51: "站台门采集 (DC3W)",
+    0x52: "站场联采集 (DC3W)",
 }
 
 BAUD_RATE_OPTIONS = ["9600", "19200", "38400", "57600"]
@@ -279,6 +282,11 @@ class SimulatorThread(threading.Thread):
                     if len(response) > 32:
                         unread = (response[29] << 8) | response[30]
                         flag_info = f" [未读脉冲={unread}]"
+                elif device.module_type in (FLFXG_DC3WIRE_PLATFORM, FLFXG_DC3WIRE_STATION):
+                    # 直流3对线: 显示 CurveFlag (resp offset 25-26)
+                    if len(response) > 27:
+                        cf = (response[25] << 8) | response[26]
+                        flag_info = f" [曲线]" if cf == 0x80FF else f" [实时]"
                 elif is_curve and len(response) > device.profile.curve_flag_offset:
                     flag_byte = response[device.profile.curve_flag_offset]
                     flag_names = {0x00: "实时帧", 0x55: "中间帧", 0xFF: "结束帧"}
@@ -295,6 +303,8 @@ class SimulatorThread(threading.Thread):
                 flags = {}
                 if device.module_type == FLFXG_AXLE_COUNTER:
                     flags["axle_counter"] = True
+                elif device.module_type in (FLFXG_DC3WIRE_PLATFORM, FLFXG_DC3WIRE_STATION):
+                    flags["dc3wire"] = True
                 elif is_curve and len(response) > device.profile.curve_flag_offset:
                     flag_byte = response[device.profile.curve_flag_offset]
                     flags["frame_flag"] = flag_byte
@@ -1149,14 +1159,18 @@ class SlaveSimulatorGUI:
             f"保持寄存器: {dev.profile.holding_regs}",
         ]
         if dev.is_curve_capable:
-            mode_label = "脉冲模式" if dev.module_type == FLFXG_AXLE_COUNTER else "曲线模式"
+            mode_label = ("脉冲模式" if dev.module_type == FLFXG_AXLE_COUNTER
+                          else "曲线模式")
             info_parts.append(f"{mode_label}: {dev.curve_mode}")
-            if not dev.module_type == FLFXG_AXLE_COUNTER:
+            if (not dev.module_type == FLFXG_AXLE_COUNTER
+                    and dev.module_type not in (FLFXG_DC3WIRE_PLATFORM, FLFXG_DC3WIRE_STATION)):
                 info_parts.append(f"分支数: {dev.profile.curve_branch_count}")
         if dev.profile.is_high_frequency:
             info_parts.append("高频模块")
         if dev.module_type == FLFXG_AXLE_COUNTER:
             info_parts.append("计轴模块")
+        if dev.module_type in (FLFXG_DC3WIRE_PLATFORM, FLFXG_DC3WIRE_STATION):
+            info_parts.append("直流3对线")
         self.sel_dev_info.config(text="  |  ".join(info_parts))
 
         # 曲线/脉冲开关按钮
@@ -1489,8 +1503,9 @@ class AddDeviceDialog:
 
         profile = get_profile(mtype)
 
-        # 自定义曲线模块 和 计轴模块 都需要使能模式选择 (realtime / curve)
-        if profile.is_custom_curve or mtype == FLFXG_AXLE_COUNTER:
+        _DC3W_TYPES = (FLFXG_DC3WIRE_PLATFORM, FLFXG_DC3WIRE_STATION)
+        # 自定义曲线模块 / 计轴 / 直流3对线 都需要使能模式选择 (realtime / curve)
+        if profile.is_custom_curve or mtype == FLFXG_AXLE_COUNTER or mtype in _DC3W_TYPES:
             for child in self.curve_frame.winfo_children():
                 child.configure(state=tk.NORMAL)
         else:
@@ -1675,8 +1690,10 @@ class DeviceEditDialog:
         profile = get_profile(mtype)
         self._update_info(profile)
 
-        # 曲线模块 和 计轴模块 才显示曲线/脉冲设置
-        if profile.is_custom_curve or mtype == FLFXG_AXLE_COUNTER:
+        # 曲线模块 / 计轴 / 直流3对线 才显示曲线/脉冲设置
+        if profile.is_custom_curve or mtype in (FLFXG_AXLE_COUNTER,
+                                                 FLFXG_DC3WIRE_PLATFORM,
+                                                 FLFXG_DC3WIRE_STATION):
             for child in self.curve_frame.winfo_children():
                 child.configure(state=tk.NORMAL)
             if self.curve_var.get() not in ("realtime", "curve"):

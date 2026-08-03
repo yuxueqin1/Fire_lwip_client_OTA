@@ -152,6 +152,8 @@ MODULE_PROFILES = {
     0x4C: {"input_regs": 23,  "holding_regs": 21,  "has_alarm": 1, "uses_custom_curve": 1, "realtime_bytes": 46},
     0x4D: {"input_regs": 26,  "holding_regs": 24,  "has_alarm": 1, "uses_custom_curve": 1, "realtime_bytes": 52},
     0x50: {"input_regs": 14,  "holding_regs": 0,   "has_alarm": 1, "uses_custom_curve": 0, "realtime_bytes": 28},
+    0x51: {"input_regs": 12,  "holding_regs": 0,   "has_alarm": 1, "uses_custom_curve": 0, "realtime_bytes": 24},
+    0x52: {"input_regs": 12,  "holding_regs": 0,   "has_alarm": 1, "uses_custom_curve": 0, "realtime_bytes": 24},
 }
 
 def get_module_profile(module_type: int) -> dict:

@@ -117,6 +117,16 @@ static void     uart_axle_counter_upload_pulse(uint8_t port_idx, uint8_t module_
                                                const uint8_t *pulse_data,
                                                uint16_t pulse_len, uint32_t link_mask);
 
+/* ---- DC 3-wire protocol (0x08) ---- */
+static void     uart_process_dc3wire(UART_PortRuntime_t *runtime);
+static uint16_t uart_dc3wire_module_exchange(uint8_t port_idx, uint8_t module_idx);
+static void     uart_dc3wire_online(UART_PortRuntime_t *runtime, uint8_t module_idx,
+                                    uint16_t rx_len, uint16_t *dc_offset);
+static void     uart_dc3wire_offline(UART_PortRuntime_t *runtime, uint8_t module_idx,
+                                     uint16_t *dc_offset);
+static void     uart_dc3wire_upload_curve(uint8_t port_idx, uint8_t module_idx,
+                                          const uint8_t *resp, uint32_t link_mask);
+
 /* ---- Modbus slave callbacks ---- */
 static eMBException eMBSRegHoldingCB(UBYTE *pubRegBuffer, USHORT usAddress,
                                       USHORT usNRegs, eMBSRegisterMode eRegMode);
@@ -194,7 +204,7 @@ static void AppTaskCreate(void *pvParameters)
                               (const char    *)uart_hw_config[i].name,
                               (uint16_t       )384,
                               (void          *)(intptr_t)i,
-                              (UBaseType_t    )3,
+                              (UBaseType_t    )4,   //test：3改成了4
                               (TaskHandle_t  *)&Serial_Task_Handles[i]);
         if (pdPASS == xReturn) {
             printf("Create %s_Task success...\r\n", uart_hw_config[i].name);
@@ -216,7 +226,7 @@ static void AppTaskCreate(void *pvParameters)
                           (const char    *)"App_TaskStart",
                           (uint16_t       )256,
                           (void          *)NULL,
-                          (UBaseType_t    )8,
+                          (UBaseType_t    )7,   //test：8改成7
                           (TaskHandle_t  *)&App_TaskStart_Handle);
     if (pdPASS == xReturn)
         printf("Create App_TaskStart success...\r\n");
@@ -417,7 +427,7 @@ static void App_TaskStart(void *pvParameters)
         }
 
         /* ---- 检查并发送日志 ---- */
-        checkSendLog();
+        // checkSendLog();  //test：关闭日志
 
         vTaskDelay(pdMS_TO_TICKS(500));
     }
@@ -490,7 +500,7 @@ static void uart_task_handler(void *pvParameters)
         switch (BoardCfgTab[port_idx].PortType) {
 
         case UART_PORT_MODBUS_MASTER:
-            /* Modbus RTU 主站模式: 信号机/轨道/道岔/发送/场联/开关量 */
+            /* Modbus RTU 主站模式: 信号机/轨道/发送/场联/开关量 */
             uart_process_modbus_master(&runtime);
             break;
 
@@ -502,6 +512,11 @@ static void uart_task_handler(void *pvParameters)
         case UART_PORT_AXLE_COUNTER:
             /* 计轴传感器端口: 非标485协议 (通讯确认码 + 脉冲数据) */
             uart_process_axle_counter(&runtime);
+            break;
+
+        case UART_PORT_DC3WIRE:
+            /* 直流3对线端口: 非标485协议 (曲线序号ACK + 75点曲线数据) */
+            uart_process_dc3wire(&runtime);
             break;
 
         default:
@@ -579,6 +594,16 @@ static void uart_task_handler(void *pvParameters)
                                        20U + port_idx * 6U, port_idx);
             break;
 
+        case UART_PORT_DC3WIRE:
+            /* 直流3对线端口实时帧: 帧标志 = 0x01 (区别于曲线帧 0x0A) */
+            *((uint16_t *)&SerialDataBuf[port_idx][5]) = runtime.data_len + 4U;
+            SerialDataBuf[port_idx][3] = 0x01;
+            memcpy(&SerialDataBuf[port_idx][11], runtime.ssz_buf, runtime.data_len);
+            client_add_to_tcp_send_buf(&SerialDataBuf[port_idx][0],
+                                       (uint16_t)(runtime.data_len + 11U),
+                                       20U + port_idx * 6U, port_idx);
+            break;
+
         default:
             break;
         }
@@ -630,7 +655,7 @@ static void uart_process_modbus_master(UART_PortRuntime_t *runtime)
 
         runtime->data_len += (uint16_t)(profile->input_regs * 2U);
         WDTUARTFLAG[runtime->port_idx] = 0;
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(5));  
     }
 
     *((uint32_t *)&SerialDataBuf[runtime->port_idx][7]) = runtime->link_mask;
@@ -815,7 +840,7 @@ static uint16_t uart_custom_module_exchange(uint8_t port_idx, uint8_t module_idx
     rx_len = uart_custom_exchange(port_idx, tx_buf, 8,
                                   resp,
                                   (uint16_t)(UART_SERIAL_BUF_SIZE - 11U),
-                                  100, 300);
+                                  100, 20);
     if (rx_len < 4U) {
         return 0;
     }
@@ -1047,7 +1072,8 @@ static void uart_check_port_error_and_arm(UART_PortRuntime_t *runtime)
         if (runtime->port_error < 4U) {
             if ((BoardCfgTab[runtime->port_idx].PortType == UART_PORT_MODBUS_MASTER) ||
                 (BoardCfgTab[runtime->port_idx].PortType == UART_PORT_CUSTOM) ||
-                (BoardCfgTab[runtime->port_idx].PortType == UART_PORT_AXLE_COUNTER)) {
+                (BoardCfgTab[runtime->port_idx].PortType == UART_PORT_AXLE_COUNTER) ||
+                (BoardCfgTab[runtime->port_idx].PortType == UART_PORT_DC3WIRE)) {
 
                 /*
                  * Before re-initializing a Modbus port, close the old handle
@@ -1140,7 +1166,7 @@ static uint16_t uart_axle_counter_module_exchange(uint8_t port_idx, uint8_t modu
     /* 发送 + 接收 */
     rx_len = uart_custom_exchange(port_idx, tx_buf, 8, resp,
                                   (uint16_t)(UART_SERIAL_BUF_SIZE - 11U),
-                                  100, 300);
+                                  100, 20);
     if (rx_len < 5U) {
         return 0;
     }
@@ -1406,6 +1432,272 @@ static void uart_process_axle_counter(UART_PortRuntime_t *runtime)
         } else {
             /* CRC 失败或超时 — 离线 */
             uart_axle_counter_offline(runtime, m, &dc_offset);
+        }
+
+        WDTUARTFLAG[runtime->port_idx] = 0;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    *((uint32_t *)&SerialDataBuf[runtime->port_idx][7]) = runtime->link_mask;
+}
+
+
+/*======================================================================*/
+/*  直流3对线模块 (PortType = 0x08) — 协议处理                            */
+/*======================================================================*/
+
+#define DC3WIRE_REALTIME_REGS   12U
+#define DC3WIRE_REALTIME_BYTES  (DC3WIRE_REALTIME_REGS * 2U)  /* = 24 */
+
+/*======================================================================*/
+/*  uart_dc3wire_module_exchange                                         */
+/*  构建 0x03 查询帧 [addr,03,00,00,curve_seq(2B),CRC]                   */
+/*  curve_seq = 上次收到的 AllCurveFrame (首次 = 0)                       */
+/*======================================================================*/
+static uint16_t uart_dc3wire_module_exchange(uint8_t port_idx, uint8_t module_idx)
+{
+    uint8_t  tx_buf[8];
+    uint16_t tx_crc;
+    uint16_t rx_len;
+    uint16_t rx_crc_calc, rx_crc_recv;
+    uint8_t *resp;
+    uint16_t curve_seq;
+
+    resp = (uint8_t *)&SerialDataBuf[port_idx][11];
+
+    /* 获取上次的 AllCurveFrame (首次 = 0) */
+    curve_seq = dc3wire_state[port_idx].curve_seq[module_idx];
+
+    /* 构建请求: [addr, 03, 00, 00, curve_seq(2B), CRC] */
+    tx_buf[0] = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx];
+    tx_buf[1] = 0x03;
+    tx_buf[2] = 0x00;
+    tx_buf[3] = 0x00;
+    tx_buf[4] = (uint8_t)((curve_seq >> 8) & 0xFFU);
+    tx_buf[5] = (uint8_t)(curve_seq & 0xFFU);
+    tx_crc    = uart_crc16(tx_buf, 6);
+    tx_buf[6] = (uint8_t)(tx_crc & 0xFFU);
+    tx_buf[7] = (uint8_t)((tx_crc >> 8) & 0xFFU);
+
+    /* 发送 + 接收 */
+    rx_len = uart_custom_exchange(port_idx, tx_buf, 8, resp,
+                                  (uint16_t)(UART_SERIAL_BUF_SIZE - 11U),
+                                  100, 20);
+    if (rx_len < 5U) {
+        return 0;
+    }
+
+    /* CRC16 校验 */
+    rx_crc_calc = uart_crc16(resp, rx_len - 2U);
+    rx_crc_recv = (uint16_t)((uint16_t)resp[rx_len - 1U] << 8)
+                | (uint16_t)resp[rx_len - 2U];
+    if (rx_crc_calc != rx_crc_recv) {
+        return 0;
+    }
+
+    return rx_len;
+}
+
+
+/*======================================================================*/
+/*  uart_dc3wire_upload_curve                                            */
+/*  将传感器曲线帧(0x80FF)打包为 TCP 曲线帧(0x0A)上传                    */
+/*                                                                       */
+/*  TCP 曲线数据包 (协议文档 Table 1.5):                                  */
+/*    设备ID(1B) + 通道号(1B) + 时间戳秒(4B) + 曲线点数(2B)              */
+/*    + 电压采样1(2B ×0.01V) + ... + 电压采样N(2B ×0.01V)              */
+/*======================================================================*/
+static void uart_dc3wire_upload_curve(uint8_t port_idx, uint8_t module_idx,
+                                      const uint8_t *resp, uint32_t link_mask)
+{
+    uint8_t  device_id;
+    uint8_t  channel;       /* 曲线通道号 (寄存器13, resp[3+26..27]) */
+    uint16_t curve_len;     /* 曲线点数 (寄存器17, resp[3+34..35])    */
+    uint16_t point_count;   /* 75                                                                        */
+    uint32_t curve_time;    /* 曲线起始时间戳 (regs 15-16)                   */
+    uint8_t *pkt;
+    uint16_t pkt_offset;
+    uint16_t i;
+
+    if (resp == NULL) return;
+
+    device_id = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx];
+
+    /* 寄存器13: CurveCHx — 曲线通道号 */
+    channel = resp[3 + 26];  /* 高字节(0), 低字节 = 通道号 0/1/2 */
+
+    /* 寄存器15-16: CHx_CurveTime — 曲线起始时间戳(秒) */
+    curve_time = ((uint32_t)resp[3 + 30] << 24)
+               | ((uint32_t)resp[3 + 31] << 16)
+               | ((uint32_t)resp[3 + 32] << 8)
+               |  (uint32_t)resp[3 + 33];
+
+    /* 寄存器17: CHx_CurveLen — 有效数据点数 (固定75) */
+    curve_len  = ((uint16_t)resp[3 + 34] << 8) | (uint16_t)resp[3 + 35];
+    if (curve_len > 75U) curve_len = 75U;
+
+    /* 曲线数据从寄存器18开始 (resp offset 3+36) — 75×2=150 字节 */
+    point_count = curve_len;
+
+    /* 构建 TCP 曲线帧 */
+    pkt = (uint8_t *)&SerialDataBuf[port_idx][11];
+    pkt_offset = 0;
+
+    pkt[pkt_offset++] = device_id;
+    pkt[pkt_offset++] = channel;                       /* 通道号 */
+    pkt[pkt_offset++] = (uint8_t)(curve_time >> 24);   /* 时间戳(秒) */
+    pkt[pkt_offset++] = (uint8_t)(curve_time >> 16);
+    pkt[pkt_offset++] = (uint8_t)(curve_time >> 8);
+    pkt[pkt_offset++] = (uint8_t)(curve_time);
+    pkt[pkt_offset++] = (uint8_t)((point_count >> 8) & 0xFFU); /* 曲线点数高 */
+    pkt[pkt_offset++] = (uint8_t)(point_count & 0xFFU);        /* 曲线点数低 */
+
+    /* 拷贝电压采样点 (int16 ×0.01V, big-endian) */
+    for (i = 0; i < point_count && pkt_offset < (UART_SERIAL_BUF_SIZE - 30U); i++) {
+        uint16_t offset = (uint16_t)(3U + 36U + i * 2U);
+        pkt[pkt_offset++] = resp[offset];     /* 高字节 */
+        pkt[pkt_offset++] = resp[offset + 1]; /* 低字节 */
+    }
+
+    /* 构建完整 TCP 帧: [端口,主协议,子协议,0x0A,分机号,len(2B),link_mask(4B),曲线包] */
+    if (pkt_offset > 8U) {
+        uint8_t *frame = (uint8_t *)&SerialDataBuf[port_idx][0];
+        uint16_t f_len;
+
+        frame[0] = (uint8_t)(port_idx + 1U);
+        frame[1] = BoardCfgTab[port_idx].MainProType;
+        frame[2] = BoardCfgTab[port_idx].SubProType;
+        frame[3] = 0x0A;                                     /* 帧标志: 曲线帧 */
+        frame[4] = BoardCfgTab[port_idx].FenjiNum;
+        *((uint16_t *)&frame[5]) = (uint16_t)(pkt_offset + 4U);
+        *((uint32_t *)&frame[7]) = link_mask;
+
+        f_len = (uint16_t)(pkt_offset + 11U);
+        client_add_to_tcp_send_buf(frame, f_len,
+                                   20U + port_idx * 6U, port_idx);
+    }
+}
+
+
+/*======================================================================*/
+/*  uart_dc3wire_online                                                  */
+/*  直流3对线模块在线处理:                                                */
+/*  1. 提取实时数据 24 字节 (跳过 addr+func+len)                           */
+/*  2. 检查 KGL 报警位                                                    */
+/*  3. 检查 CurveFlag = 0x80FF → 触发曲线上传                             */
+/*  4. 保存 AllCurveFrame (用于下次查询的 curve_seq)                       */
+/*======================================================================*/
+static void uart_dc3wire_online(UART_PortRuntime_t *runtime,
+                                uint8_t module_idx, uint16_t rx_len,
+                                uint16_t *dc_offset)
+{
+    uint8_t *resp = (uint8_t *)&SerialDataBuf[runtime->port_idx][11];
+    uint16_t curve_flag;
+    uint16_t all_curve_frame;
+    uint16_t kgl_val;
+
+    runtime->module_error[module_idx] = 0;
+    runtime->link_mask |= (1UL << module_idx);
+
+    /* 提取实时数据 24 字节 (resp[3] = 跳过 addr+func+len) */
+    if (rx_len >= (uint16_t)(3U + DC3WIRE_REALTIME_BYTES + 2U)) {
+        memcpy(&runtime->ssz_buf[*dc_offset], &resp[3], DC3WIRE_REALTIME_BYTES);
+        uart_swap16(&runtime->ssz_buf[*dc_offset], DC3WIRE_REALTIME_REGS);
+        runtime->data_len += DC3WIRE_REALTIME_BYTES;
+    }
+
+    /* 报警检查: KGL (寄存器1, ssz_buf offset 1) */
+    kgl_val = runtime->ssz_buf[*dc_offset + 1];
+    if ((kgl_val & 0x3fU) == 0U) {
+        ALARM_TEMP[runtime->port_idx] |= (1UL << module_idx);
+    } else {
+        ALARM_TEMP[runtime->port_idx] &= ~(1UL << module_idx);
+    }
+
+    /* 读取 CurveFlag (寄存器11, resp offset 3+22=25) */
+    curve_flag = ((uint16_t)resp[25] << 8) | (uint16_t)resp[26];
+
+    /* 读取 AllCurveFrame (寄存器12, resp offset 3+24=27) */
+    all_curve_frame = ((uint16_t)resp[27] << 8) | (uint16_t)resp[28];
+
+    /* 保存 AllCurveFrame (下次查询的 curve_seq 沿用此值做ACK) */
+    if (all_curve_frame > 0U) {
+        dc3wire_state[runtime->port_idx].curve_seq[module_idx] = all_curve_frame;
+    }
+
+    /* CurveFlag = 0x80FF → 有曲线数据, 立即上传 */
+    if (curve_flag == 0x80FFU) {
+        uart_dc3wire_upload_curve(runtime->port_idx, module_idx,
+                                  resp, runtime->link_mask);
+    }
+
+    *dc_offset += DC3WIRE_REALTIME_REGS;
+}
+
+
+/*======================================================================*/
+/*  uart_dc3wire_offline                                                  */
+/*  离线处理: SDRAM 填充 0xFFFF, 累计错误计数                             */
+/*======================================================================*/
+static void uart_dc3wire_offline(UART_PortRuntime_t *runtime,
+                                  uint8_t module_idx, uint16_t *dc_offset)
+{
+    uint16_t i;
+
+    if (runtime->module_error[module_idx] > 3U) {
+        runtime->link_mask &= ~(1UL << module_idx);
+    } else {
+        runtime->module_error[module_idx]++;
+    }
+
+    for (i = 0; i < DC3WIRE_REALTIME_REGS; i++) {
+        runtime->ssz_buf[*dc_offset + i] = 0xFFFFU;
+    }
+    *dc_offset += DC3WIRE_REALTIME_REGS;
+    runtime->data_len += DC3WIRE_REALTIME_BYTES;
+}
+
+
+/*======================================================================*/
+/*  uart_process_dc3wire                                                  */
+/*  直流3对线端口主处理函数 (PortType = 0x08)                              */
+/*                                                                       */
+/*  遍历从机 → 校时 → 0x03查询 → 解析应答 → 实时数据/曲线                 */
+/*======================================================================*/
+static void uart_process_dc3wire(UART_PortRuntime_t *runtime)
+{
+    uint8_t  m;
+    uint8_t  module_count;
+    uint16_t rx_len;
+    uint16_t dc_offset = 0;
+
+    if (runtime == NULL) return;
+
+    module_count = BoardCfgTab[runtime->port_idx].SlaveModuelNum;
+    if (module_count > UART_MODULE_MAX_COUNT) {
+        module_count = UART_MODULE_MAX_COUNT;
+    }
+
+    runtime->link_mask = 0;
+    runtime->data_len  = 0;
+
+    for (m = 0; m < module_count; m++) {
+        /* 校时 */
+        if (changetime[runtime->port_idx] == 1U) {
+            (void)uart_custom_send_adjust_time(
+                runtime->port_idx, (uint8_t)runtime->port_idx,
+                BoardCfgTab[runtime->port_idx].SlaveModuelAddress[m],
+                Systemtime);
+            TaskAdjustNum[runtime->port_idx]++;
+        }
+
+        /* 0x03 查询 */
+        rx_len = uart_dc3wire_module_exchange(runtime->port_idx, m);
+
+        if (rx_len > 0U) {
+            uart_dc3wire_online(runtime, m, rx_len, &dc_offset);
+        } else {
+            uart_dc3wire_offline(runtime, m, &dc_offset);
         }
 
         WDTUARTFLAG[runtime->port_idx] = 0;

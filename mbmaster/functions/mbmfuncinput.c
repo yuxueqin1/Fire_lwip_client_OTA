@@ -174,15 +174,70 @@ eMBMReadInputRegisters( xMBHandle xHdl, UCHAR ucSlaveAddress,
                         USHORT usRegStartAddress, UBYTE ubNRegs, USHORT arusBufferOut[] )
 {
     eMBErrorCode    eStatus;
-    eMBMQueryState  eState = MBM_STATE_NONE;
+    eMBMQueryState  eState;
 
+    /*
+     * ============================================================
+     * Modbus RTU 协议限制:
+     *   应答帧的 "字节计数" 字段仅有 1 个字节 (最大 0xFF = 255).
+     *   而每个寄存器占 2 字节, 因此单次最多可读 127 个寄存器
+     *   (127 x 2 = 254 字节 < 255). 当请求超过 127 个寄存器时,
+     *   从机的应答数据会超出该字段的可表示范围, 导致帧校验失败.
+     *
+     *   当前项目中, 超过此限制的仅有 "高频 25Hz 轨道接收模块"
+     *   (FLFXG_GD_25_J_HIGH, 0x48), 其固定需要 133 个输入寄存器.
+     *
+     * 解决: 当 ubNRegs > 127 时, 在库内部自动拆分为两次独立的
+     *   Modbus 事务, 对上层调用者完全透明.
+     *   第 1 次: 读 100 个寄存器 -> arusBufferOut[0..99]
+     *   第 2 次: 读剩余寄存器    -> arusBufferOut[100..N-1]
+     * ============================================================
+     */
+    if( ubNRegs > 127U )
+    {
+        UBYTE remaining;
+
+        /* ---- 第 1 次事务: 前 100 个寄存器 ---- */
+        eState = MBM_STATE_NONE;
+        do
+        {
+            vMBMReadInputRegistersPolled( xHdl, ucSlaveAddress,
+                                          usRegStartAddress, 100,
+                                          arusBufferOut, &eState, &eStatus );
+            HAL_Delay( 1 );
+        }
+        while( eState != MBM_STATE_DONE );
+
+        if( eStatus != MB_ENOERR )
+        {
+            return eStatus;
+        }
+
+        /* ---- 第 2 次事务: 剩余寄存器 (偏移 100) ---- */
+        remaining = ( UBYTE )( ubNRegs - 100U );
+        eState = MBM_STATE_NONE;
+        do
+        {
+            vMBMReadInputRegistersPolled( xHdl, ucSlaveAddress,
+                                          ( USHORT )( usRegStartAddress + 100U ),
+                                          remaining,
+                                          &arusBufferOut[100], &eState, &eStatus );
+            HAL_Delay( 1 );
+        }
+        while( eState != MBM_STATE_DONE );
+
+        return eStatus;
+    }
+
+    /*
+     * 普通路径: ubNRegs <= 127, 单次 Modbus 事务即可.
+     */
+    eState = MBM_STATE_NONE;
     do
     {
-        vMBMReadInputRegistersPolled( xHdl, ucSlaveAddress, usRegStartAddress, ubNRegs, arusBufferOut, &eState,
-                                      &eStatus );
-			   HAL_Delay (1);				                  /* Delay for 1ms.		*/
-                     
-			
+        vMBMReadInputRegistersPolled( xHdl, ucSlaveAddress, usRegStartAddress,
+                                      ubNRegs, arusBufferOut, &eState, &eStatus );
+        HAL_Delay( 1 );
     }
     while( eState != MBM_STATE_DONE );
     return eStatus;

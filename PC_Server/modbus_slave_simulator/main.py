@@ -23,7 +23,8 @@ from typing import Optional
 
 from serial_io import SerialPort
 from slave_device import SlaveDevice
-from module_profiles import get_module_name, FLFXG_AXLE_COUNTER
+from module_profiles import (get_module_name, FLFXG_AXLE_COUNTER,
+                             FLFXG_DC3WIRE_PLATFORM, FLFXG_DC3WIRE_STATION)
 from cli import SimulatorCLI
 
 
@@ -265,6 +266,11 @@ class Simulator:
                         if len(response) > 32:
                             unread = (response[29] << 8) | response[30]
                             flag_info = f" [未读脉冲={unread}]"
+                    elif device.module_type in (FLFXG_DC3WIRE_PLATFORM, FLFXG_DC3WIRE_STATION):
+                        # 直流3对线: 显示 CurveFlag (resp offset 25-26)
+                        if len(response) > 27:
+                            cf = (response[25] << 8) | response[26]
+                            flag_info = f" [曲线]" if cf == 0x80FF else f" [实时]"
                     elif device.is_curve_capable and len(response) > device.profile.curve_flag_offset:
                         flag_byte = response[device.profile.curve_flag_offset]
                         flag_names = {0x00: "实时帧", 0x55: "中间帧", 0xFF: "结束帧"}

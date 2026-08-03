@@ -13,12 +13,13 @@ from typing import Optional
 
 from module_profiles import (
     ModuleProfile, get_profile, get_module_name, FALLBACK_PROFILE,
-    FLFXG_AXLE_COUNTER,
+    FLFXG_AXLE_COUNTER, FLFXG_DC3WIRE_PLATFORM, FLFXG_DC3WIRE_STATION,
 )
 from data_simulator import DataSimulator
 from standard_handler import StandardHandler
 from custom_handler import CustomHandler, CurveMode
 from axle_counter_handler import AxleCounterHandler, AxlePulseMode
+from dc3wire_handler import DC3WireHandler, DC3WireCurveMode
 
 
 class SlaveDevice:
@@ -83,7 +84,7 @@ class SlaveDevice:
             random_walk_step=random_walk_step,
         )
 
-        self._handler: StandardHandler | CustomHandler | AxleCounterHandler
+        self._handler: StandardHandler | CustomHandler | AxleCounterHandler | DC3WireHandler
         if module_type == FLFXG_AXLE_COUNTER:
             # 计轴传感器: 自定义 0x03/0x10 协议 (通讯确认码 + 脉冲)
             pulse = AxlePulseMode(curve_mode)
@@ -93,6 +94,16 @@ class SlaveDevice:
                 data_gen=self._data_gen,
                 pulse_mode=pulse,
                 pulse_interval=pulse_interval,
+            )
+        elif module_type in (FLFXG_DC3WIRE_PLATFORM, FLFXG_DC3WIRE_STATION):
+            # 直流3对线: 自定义 0x03/0x10 协议 (曲线序号ACK + 75点曲线)
+            curve = DC3WireCurveMode(curve_mode)
+            self._handler = DC3WireHandler(
+                address=address,
+                profile=self._profile,
+                data_gen=self._data_gen,
+                curve_mode=curve,
+                realtime_bytes=self._profile.realtime_bytes,
             )
         elif self._profile.is_custom_curve:
             mode = CurveMode(curve_mode)
@@ -123,7 +134,10 @@ class SlaveDevice:
     @property
     def is_curve_capable(self) -> bool:
         """True if this device type supports curve/pulse data."""
-        return self._profile.is_custom_curve or self.module_type == FLFXG_AXLE_COUNTER
+        return (self._profile.is_custom_curve
+                or self.module_type in (FLFXG_AXLE_COUNTER,
+                                        FLFXG_DC3WIRE_PLATFORM,
+                                        FLFXG_DC3WIRE_STATION))
 
     @property
     def curve_mode(self) -> Optional[str]:
@@ -131,6 +145,8 @@ class SlaveDevice:
         if isinstance(self._handler, CustomHandler):
             return self._handler.curve_mode.value
         if isinstance(self._handler, AxleCounterHandler):
+            return self._handler.curve_mode.value
+        if isinstance(self._handler, DC3WireHandler):
             return self._handler.curve_mode.value
         return None
 
@@ -184,6 +200,8 @@ class SlaveDevice:
             self._handler.set_curve_mode(CurveMode(mode))
         elif isinstance(self._handler, AxleCounterHandler):
             self._handler.set_curve_mode(AxlePulseMode(mode))
+        elif isinstance(self._handler, DC3WireHandler):
+            self._handler.set_curve_mode(DC3WireCurveMode(mode))
 
     def toggle_curve_mode(self) -> str:
         """Toggle curve/pulse mode; returns the new mode string."""
@@ -191,6 +209,9 @@ class SlaveDevice:
             new = self._handler.toggle_curve_mode()
             return new.value
         if isinstance(self._handler, AxleCounterHandler):
+            new = self._handler.toggle_curve_mode()
+            return new.value
+        if isinstance(self._handler, DC3WireHandler):
             new = self._handler.toggle_curve_mode()
             return new.value
         return "N/A"
@@ -244,6 +265,8 @@ class SlaveDevice:
             flags.append(">125reg")
         if self.module_type == FLFXG_AXLE_COUNTER:
             flags.append("AXLE")
+        if self.module_type in (FLFXG_DC3WIRE_PLATFORM, FLFXG_DC3WIRE_STATION):
+            flags.append("DC3W")
         flag_str = f" ({', '.join(flags)})" if flags else ""
         return (f"  [{self.address:3d}] 0x{self.module_type:02X} "
                 f"{name}{flag_str}{curve_info} "

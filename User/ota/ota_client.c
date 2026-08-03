@@ -10,7 +10,7 @@
 #include "ota_client.h"
 
 /* OTA客户端配置 */
-#define OTA_SERVER_IP       "192.168.0.181"     // 需要修改为您的服务器IP
+#define OTA_SERVER_IP       "192.168.1.99"     // 需要修改为您的服务器IP
 #define OTA_SERVER_PORT     5002                 // OTA服务器端口
 #define OTA_RECONNECT_INTERVAL  10000            // 断线重连间隔(ms)
 #define OTA_HELLO_INTERVAL  60000                // HELLO心跳间隔(ms)

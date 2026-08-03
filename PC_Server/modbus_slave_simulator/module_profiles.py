@@ -41,7 +41,9 @@ FLFXG_DC_ZZJ4_HIGH  = 0x4C   # 高频直流四线制 (1 分支)
 FLFXG_DC_ZZJ6_HIGH  = 0x4D   # 高频直流六线制 (2 分支)
 
 # --- 防雷分线柜模块 ---
-FLFXG_AXLE_COUNTER   = 0x50   # 计轴采集传感器 WBTQ301JH-1B3
+FLFXG_AXLE_COUNTER        = 0x50   # 计轴采集传感器 WBTQ301JH-1B3
+FLFXG_DC3WIRE_PLATFORM    = 0x51   # 站台门采集 WBTQ802JH-1B3
+FLFXG_DC3WIRE_STATION     = 0x52   # 站场联采集 WBTQ402JH-1B3
 
 # ---------------------------------------------------------------------------
 # Profile data class
@@ -164,8 +166,9 @@ _PROFILES: list[ModuleProfile] = [
 
     # ====== 防雷分线柜模块 ======
     #  type              in  hold alarm cust  rt
-    ModuleProfile(FLFXG_AXLE_COUNTER,  14,  0, 1, 0,
-                  28),
+    ModuleProfile(FLFXG_AXLE_COUNTER,       14,  0, 1, 0, 28),
+    ModuleProfile(FLFXG_DC3WIRE_PLATFORM,    12,  0, 1, 0, 24),
+    ModuleProfile(FLFXG_DC3WIRE_STATION,     12,  0, 1, 0, 24),
 ]
 
 # Sentinel / fallback entry (type = 0x00, matches first entry config)
@@ -232,6 +235,8 @@ MODULE_TYPE_NAMES: dict[int, str] = {
     0x4C: "高频直流四线制 (DC_ZZJ4_HIGH)",
     0x4D: "高频直流六线制 (DC_ZZJ6_HIGH)",
     0x50: "计轴采集传感器 (AXLE_COUNTER)",
+    0x51: "站台门采集 (DC3W_PLATFORM)",
+    0x52: "站场联采集 (DC3W_STATION)",
 }
 
 
