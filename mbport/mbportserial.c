@@ -19,6 +19,41 @@
 #define MBP_SERIAL_PORTS            ( 7 )
 #define IDX_INVALID                 ( 255 )
 
+/*
+ * 自定义串口 RX 环形缓冲区 (与 bsp_rs485.h 完全一致, 524 字节).
+ * 注意: 修改此处时必须同步更新 bsp_rs485.h 中的 UART_RxRing_t.
+ */
+#define UART_RX_RING_SIZE           512
+typedef struct {
+    uint8_t  buffer[UART_RX_RING_SIZE];  /* 512 B                        */
+    uint32_t last_byte_tick;             /*   4 B, offset 512 (512%4=0)  */
+    uint16_t head;                       /*   2 B, offset 516            */
+    uint16_t tail;                       /*   2 B, offset 518            */
+    uint16_t count;                      /*   2 B, offset 520            */
+    uint8_t  rx_active;                  /*   1 B, offset 522            */
+    uint8_t  _pad;                       /*   1 B, 对齐到 524            */
+} UART_RxRing_t;
+extern UART_RxRing_t       uart_rx_ring[6];
+extern uint8_t             UART_Custom[6];
+
+/*
+ * 自定义串口 TX 状态 (与 bsp_rs485.h 中的 UART_CustomTxState_t 完全一致).
+ * 请求帧由 TXE 中断逐字节发出, TC 中断负责拉低 DE 并开启 RXNE 接收窗口.
+ * 与 UART_RxRing_t 一致: 移植层自包含, 通过 extern 共享底层数组, 不 include
+ * bsp_rs485.h (避免引入其整条 include 链, 也便于本文件独立编译).
+ * 注意: 修改此处时必须同步更新 bsp_rs485.h.
+ */
+typedef struct {
+    const uint8_t   *tx_buf;       /* 待发送数据指针 (来自调用方)   */
+    uint16_t         tx_len;       /* 待发送字节数                  */
+    uint16_t         tx_idx;       /* 下一个待发送字节下标 (ISR 自增) */
+    volatile uint8_t tx_active;    /* 1 = TXE 中断正在发送帧        */
+    volatile uint8_t tx_done;      /* 1 = TC 完成, DE 已切回接收    */
+    GPIO_TypeDef    *de_port;      /* DE 引脚端口 (TC 完成时拉低)   */
+    uint16_t         de_pin;       /* DE 引脚号                     */
+} UART_CustomTxState_t;
+extern UART_CustomTxState_t uart_custom_tx[6];
+
 
 typedef struct
 {
@@ -295,6 +330,41 @@ static void prvUARTTcISR( xSerialPortInternal *pxSerial )
 //     }
 // }
 
+/*
+ * 为自定义串口端口 (PortType 0x07/0x08) 注入 UART 实例指针.
+ *
+ * 自定义端口通过 uart_init_custom_raw() 初始化自己的 HAL 句柄,
+ * 但 mbport 层的 arxSerialPorts[] 数组仅由 eMBPSerialInit() 填充
+ * (该函数仅被 Modbus 端口调用).  对于自定义端口,
+ * arxSerialPorts[port_idx].huart.Instance 保持 BSS 零值 (NULL).
+ *
+ * prvUARTIRQHandler 总是通过 arxSerialPorts[] 访问 UART 寄存器:
+ *   sr = pxSerial->huart.Instance->SR;
+ * 当 Instance==NULL 时, 读取的是 Flash 地址 0x00 的垃圾数据,
+ * 而不是真实 UART 的 SR 寄存器 → 中断标志永远不会被清除 →
+ * CPU 反复进入 ISR → 中断风暴 → 看门狗复位.
+ *
+ * 本函数由 uart_init_custom_raw 在 HAL_UART_Init 成功后调用,
+ * 通过 Instance 指针在 arxSerialPortConfig[] 中查找匹配项,
+ * 并将 Instance 写入对应的 arxSerialPorts[].  (O(1) 查找, 仅 7 项.)
+ */
+void mbport_set_custom_uart_instance( void *instance )
+{
+    int i;
+    if( instance == NULL )
+    {
+        return;
+    }
+    for( i = 0; i < MBP_SERIAL_PORTS; i++ )
+    {
+        if( arxSerialPortConfig[i].Instance == ( USART_TypeDef * )instance )
+        {
+            arxSerialPorts[i].huart.Instance = ( USART_TypeDef * )instance;
+            return;
+        }
+    }
+}
+
 static void prvUARTIRQHandler( xSerialPortInternal *pxSerial )
 {
     ULONG sr;
@@ -305,6 +375,125 @@ static void prvUARTIRQHandler( xSerialPortInternal *pxSerial )
     if( pxSerial == NULL )
     {
         return;
+    }
+
+    /*
+     * ── 自定义串口模式 (非 Modbus) 中断处理 ──
+     * 通过 (pxSerial - arxSerialPorts) 反推端口索引, O(1) 直接判断.
+     *
+     * 自定义端口的中断必须始终由我们接管, 不能落入 FreeModbus 分支:
+     *   FreeModbus 的 prvUARTRxISR 发现 pvRXFN==NULL 会直接 return,
+     *   不读 DR → RXNE 不清除 → CPU 反复进入 ISR → 中断风暴 → 看门狗复位.
+     *
+     * rx_active=1: 正在接收 → 字节填入环形缓冲区
+     * rx_active=0: 未在接收 → 仅读 DR 清除标志位, 防止中断风暴
+     */
+    {
+        int _port = ( int )( pxSerial - arxSerialPorts );
+        if( _port >= 0 && _port < 6 && UART_Custom[_port] )
+        {
+            sr  = pxSerial->huart.Instance->SR;
+            cr1 = pxSerial->huart.Instance->CR1;
+
+            /* ── TXE: 中断驱动发送请求帧 (与 Modbus prvUARTTxISR 同思路) ──
+             * 请求帧字节由 ISR 按波特率连续移出, 与任务调度无关, 免疫抢占拆帧.
+             *
+             * 每个 TXE 中断移出一个字节: 写 DR 后 TXE 清, 硬件把字节移入移位
+             * 寄存器后 TXE 重新置位 → 触发下一次 TXE 中断. 字节因此按波特率
+             * 等间隔连续发出 (9600 时约 1.04ms/字节), 帧内间隙恒小于 T3.5.
+             *
+             * tx_idx 走满 tx_len (末字节已写入 DR) 后关 TXE、开 TC: 此时末字节
+             * 仍在移位寄存器中, 必须等 TC (移位完成) 才能切回接收, 否则提前
+             * 拉低 DE 会把末字节截断, 从机同样判帧无效.
+             *
+             * 安全前提: 任务在 uart_custom_exchange 中阻塞等待 tx_done, 期间
+             * tx_buf (调用方局部数组) 保持有效, ISR 读写它是安全的. */
+            if( ( sr & USART_SR_TXE ) && ( cr1 & USART_CR1_TXEIE ) )
+            {
+                UART_CustomTxState_t *_tx = &uart_custom_tx[_port];
+
+                if( ( _tx->tx_active != 0U ) && ( _tx->tx_idx < _tx->tx_len ) )
+                {
+                    /* 逐字节写入 DR, 由硬件按波特率移出 */
+                    pxSerial->huart.Instance->DR = _tx->tx_buf[_tx->tx_idx++];
+                }
+                else
+                {
+                    /* 全部字节已写入 → 关闭 TXE, 打开 TC, 等最后一字节移出 */
+                    __HAL_UART_DISABLE_IT( &pxSerial->huart, UART_IT_TXE );
+                    __HAL_UART_ENABLE_IT( &pxSerial->huart, UART_IT_TC );
+                }
+            }
+
+            /* ── TC: 最后一字节移出 → DE 切回接收, 立即开启 RXNE 窗口 ──
+             * 在 ISR 内直接打开接收窗口, 消除 DE→RX 切换间隙:
+             * 即使任务尚未从 vTaskDelay 醒来, 快速应答字节也会被收入 ring.
+             *
+             * 顺序固定: 先关 TCIE → 清 TC → 拉低 DE → 复位 ring → 开 RXNE.
+             * TC 标志在移位完成后一直保持, 这里用写 SR 方式清除 (清 TC), 保持
+             * 标志语义干净, 防止同一 ISR 再次进入本分支 (尽管 TCIE 已关不会触发
+             * 新中断, 但重复进入会重复复位 ring, 把刚收到的字节清掉).
+             *
+             * ring 复位与 RXNE 使能放在 ISR 而非任务, 目的有二:
+             *   1) 与拉低 DE 零间隙衔接, 快速应答不丢首字节;
+             *   2) 任务侧不再重复初始化 ring, 避免与 ISR 竞争清掉已收字节.
+             * 之后任务只等待 ring->count 增长. */
+            if( ( sr & USART_SR_TC ) && ( cr1 & USART_CR1_TCIE ) )
+            {
+                __HAL_UART_DISABLE_IT( &pxSerial->huart, UART_IT_TC );
+                __HAL_UART_CLEAR_FLAG( &pxSerial->huart, UART_FLAG_TC );
+                HAL_GPIO_WritePin( uart_custom_tx[_port].de_port,
+                                   uart_custom_tx[_port].de_pin, GPIO_PIN_RESET );
+
+                /* 直接进入接收窗口: 复位 ring 并开启 RXNE */
+                {
+                    UART_RxRing_t *_ring = &uart_rx_ring[_port];
+                    _ring->head   = 0;
+                    _ring->tail   = 0;
+                    _ring->count  = 0;
+                    _ring->rx_active = 1;
+                }
+                __HAL_UART_ENABLE_IT( &pxSerial->huart, UART_IT_RXNE );
+
+                uart_custom_tx[_port].tx_active = 0;
+                uart_custom_tx[_port].tx_done   = 1;
+            }
+
+            /* ── RXNE: 正在接收 → 字节填入环形缓冲区 ── */
+            if( uart_rx_ring[_port].rx_active )
+            {
+                if( sr & USART_SR_RXNE )
+                {
+                    uint8_t _byte = ( uint8_t )( pxSerial->huart.Instance->DR & 0xFFU );
+                    UART_RxRing_t *_ring = &uart_rx_ring[_port];
+                    if( _ring->count < UART_RX_RING_SIZE )
+                    {
+                        _ring->buffer[_ring->head] = _byte;
+                        _ring->head = ( _ring->head + 1 ) % UART_RX_RING_SIZE;
+                        _ring->count++;
+                        _ring->last_byte_tick = HAL_GetTick();
+                    }
+                }
+            }
+            else
+            {
+                /* ── 未在接收: 仅排空中断标志, 防止风暴 ── */
+                if( sr & USART_SR_RXNE )
+                {
+                    tmp = pxSerial->huart.Instance->DR;  /* 读 DR 清除 RXNE */
+                }
+            }
+
+            /* 错误标志: 读 SR+DR 清除 (无论 rx_active 状态) */
+            if( sr & ( USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE ) )
+            {
+                tmp = pxSerial->huart.Instance->SR;
+                tmp = pxSerial->huart.Instance->DR;
+                ( void )tmp;
+            }
+
+            return;  /* 已处理, 不执行下方 FreeModbus 逻辑 */
+        }
     }
 
     sr  = pxSerial->huart.Instance->SR;

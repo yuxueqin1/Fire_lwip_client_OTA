@@ -26,6 +26,7 @@
 #include "./sdram/bsp_sdram.h"
 #include "bsp_eeprom.h"
 #include "mbmcrc.h"
+#include "client.h"
 
 /*======================================================================*/
 /*  一、全局变量定义                                                      */
@@ -122,6 +123,27 @@ uint8_t           portDLQX[UART_PORT_COUNT] = {0};
 AxleCounterState_t axle_counter_state[UART_PORT_COUNT];
 DC3WireState_t     dc3wire_state[UART_PORT_COUNT];
 
+/* ---- UART RX 环形缓冲区 (中断驱动, 防止高优先级任务抢占导致 ORE 丢字节) ---- */
+UART_RxRing_t       uart_rx_ring[UART_PORT_COUNT];
+
+/* ---- UART TX 状态 (中断驱动发送: TXE 逐字节, TC 完成切接收; 免疫任务抢占) ---- */
+UART_CustomTxState_t uart_custom_tx[UART_PORT_COUNT];
+
+/* ---- 计轴模块调试打印开关: 上位机写入 1=开启, 0=关闭 (默认关闭) ---- */
+uint8_t             g_debug_axle_enable = 0;
+uint8_t             g_debug_dc3w_enable = 0;
+uint8_t             g_debug_dc3w_port   = 3;   /* 0=全部端口, 非0=仅显示指定端口 */
+
+/* ---- UART IRQ 编号 (与 uart_init_custom_raw 的端口顺序一致) ---- */
+static const IRQn_Type uart_irq_numbers[UART_PORT_COUNT] = {
+    UART7_IRQn,     /* port 0: UART7  */
+    USART2_IRQn,    /* port 1: USART2 */
+    UART5_IRQn,     /* port 2: UART5  */
+    UART4_IRQn,     /* port 3: UART4  */
+    USART1_IRQn,    /* port 4: USART1 */
+    USART6_IRQn     /* port 5: USART6 */
+};
+
 
 /*======================================================================*/
 /*  二、串口硬件配置表                                                    */
@@ -175,11 +197,13 @@ static const UART_ModuleProfile_t uart_module_profiles[] = {
     {FLFXG_CL,       8,  6,    1,     0,      0,       0,       0,       0,        0,       0,       0},
     /* ---- 自定义曲线模块 (uses_custom_curve=1) ---- */
     /* AC_ZZJ:  交流转辙机, 29 个寄存器 (58 字节实时值), 4 分支曲线      */
-    {FLFXG_AC_ZZJ,   29, 27,   1,     1,      58,      82,      81,      73,       75,      282,     4},
+    {FLFXG_AC_ZZJ,   29, 27,   0,     1,      58,      71,      69,      61,       63,      271,     4},
     /* DC_ZZJ4: 直流四线制, 8 个寄存器 (16 字节实时值), 1 分支曲线        */
-    {FLFXG_DC_ZZJ4,  8,  5,    1,     1,      16,      40,      39,      31,       33,      90,      1},
+    {FLFXG_DC_ZZJ4,  8,  6,    0,     1,      16,      29,      27,      19,       21,      79,      1},
     /* DC_ZZJ6: 直流六线制, 11 个寄存器 (22 字节实时值), 2 分支曲线       */
-    {FLFXG_DC_ZZJ6,  11, 5,    1,     1,      22,      46,      45,      37,       39,      146,     2},
+    {FLFXG_DC_ZZJ6,  11, 9,    0,     1,      22,      35,      33,      25,       27,      135,     2},
+    /* S700K_C: 四线制交流道岔, 13 个寄存器 (26 字节实时值), 4 分支曲线  */
+    {FLFXG_S700K_C,  13, 11,   0,     1,      26,      38,      36,      28,       30,       238,     4},
     /* ---- 高频 Modbus 模块 (uses_custom_curve=0) ---- */
     /* NEW_XHJ:      高频信号机, 50 个输入寄存器                          */
     {FLFXG_NEW_XHJ,       50, 48,   1,     0,      0,       0,       0,       0,        0,       0,       0},
@@ -191,17 +215,19 @@ static const UART_ModuleProfile_t uart_module_profiles[] = {
     {FLFXG_CL_HIGH,       62, 60,   1,     0,      0,       0,       0,       0,        0,       0,       0},
     /* ---- 高频自定义曲线模块 (uses_custom_curve=1) ---- */
     /* AC_ZZJ_HIGH:   高频交流转辙机, 68 个寄存器 (136 字节), 4 分支      */
-    {FLFXG_AC_ZZJ_HIGH,   68, 66,   1,     1,      136,     160,     159,     151,      153,      360,     4},
+    {FLFXG_AC_ZZJ_HIGH,   68, 66,   0,     1,      136,     149,     147,     139,      141,      349,     4},
     /* DC_ZZJ4_HIGH:  高频直流四线制, 23 个寄存器 (46 字节), 1 分支       */
-    {FLFXG_DC_ZZJ4_HIGH,  23, 21,   1,     1,      46,      70,      69,      61,       63,       120,     1},
+    {FLFXG_DC_ZZJ4_HIGH,  23, 21,   0,     1,      46,      59,      57,      49,       51,       109,     1},
     /* DC_ZZJ6_HIGH:  高频直流六线制, 26 个寄存器 (52 字节), 2 分支       */
-    {FLFXG_DC_ZZJ6_HIGH,  26, 24,   1,     1,      52,      76,      75,      67,       69,       176,     2},
+    {FLFXG_DC_ZZJ6_HIGH,  26, 24,   0,     1,      52,      65,      63,      55,       57,       165,     2},
+    /* S700K_C_HIGH: 高频四线制交流道岔, 44 个寄存器 (88 字节实时值), 4 分支 */
+    {FLFXG_S700K_C_HIGH,  44, 42,   0,     1,      88,     100,      98,      90,       92,       300,     4},
     /* ---- 防雷分线柜模块 ---- */
     /* Axle Counter: 计轴采集传感器, 14 寄存器(28B), 带报警(KGL开关量), 非标准Modbus */
     {FLFXG_AXLE_COUNTER,       14, 0,    1,     0,      28,      0,       0,       0,        0,       0,       0},
     /* DC3Wire: 直流3对线, 12寄存器(24B), 带报警(KGL开关量位), 非标准Modbus */
-    {FLFXG_DC3WIRE_PLATFORM,   12, 0,    1,     0,      24,      0,       0,       0,        0,       0,       0},
-    {FLFXG_DC3WIRE_STATION,    12, 0,    1,     0,      24,      0,       0,       0,        0,       0,       0},
+    {FLFXG_DC3WIRE_ZTM,   12, 0,    1,     0,      24,      0,       0,       0,        0,       0,       0},
+    {FLFXG_DC3WIRE_ZCL,    12, 0,    1,     0,      24,      0,       0,       0,        0,       0,       0},
     /* ---- 哨兵条目 (未匹配到类型时的回退) ---- */
     {0x00,           13, 11,   1,     0,      0,       0,       0,       0,        0,       0,       0}
 };
@@ -504,6 +530,24 @@ eMBErrorCode uart_init_custom_raw(uint8_t port_idx, uint32_t baud_rate)
         return MB_EPORTERR;
     }
 
+    /*
+     * 启用 NVIC 中断通道 (RXNEIE 在 uart_custom_exchange 中按需开关,
+     * 仅在收发期间短暂开启, 避免总线噪声引发持续中断).
+     *
+     * 优先级 2: 与 FreeModbus 串口 ISR 一致, 高于 TIM6(3), 低于 SysTick(0).
+     */
+    HAL_NVIC_SetPriority(uart_irq_numbers[port_idx], 2, 0);
+    HAL_NVIC_EnableIRQ(uart_irq_numbers[port_idx]);
+    /* 注意: RXNEIE 不在此处开启, 由 uart_custom_exchange 管理 */
+
+    /*
+     * 将 UART 实例指针注入 mbport 层的 arxSerialPorts[],
+     * 使 prvUARTIRQHandler 可以通过 pxSerial->huart.Instance 访问
+     * 真实的 UART 寄存器 (SR/DR).  若此处缺失, Instance 为 NULL,
+     * ISR 解引用空指针 → 读取 Flash 0x00 的垃圾 → 中断风暴 → 看门狗复位.
+     */
+    mbport_set_custom_uart_instance(huart->Instance);
+
     return MB_ENOERR;
 }
 
@@ -540,6 +584,7 @@ void uart_setup_header(int port_idx)
  * @note   阻塞等待直到:
  *         1. download_flag == 1 (上位机已下发配置)
  *         2. PortType != 0 (未禁用) 且 != 3 (从机模式)
+ *         3. SlaveModuelNum != 0 (该端口已配置从机)
  *         等待期间持续清零 WDT 计数器, 防止看门狗误复位.
  * @param  port_idx  端口索引
  */
@@ -548,6 +593,7 @@ void uart_wait_until_configured(uint8_t port_idx)
     while ((port_idx >= UART_PORT_COUNT) ||
            (BoardCfgTab[port_idx].PortType == UART_PORT_DISABLED) ||
            (BoardCfgTab[port_idx].PortType == UART_PORT_SLAVE) ||
+           (BoardCfgTab[port_idx].SlaveModuelNum == 0) ||
            (download_flag == 0)) {
         if (port_idx < UART_PORT_COUNT) {
             WDTUARTFLAG[port_idx] = 0;  /* 喂狗: 告知看门狗本任务存活 */
@@ -638,11 +684,11 @@ uint16_t uart_custom_exchange(uint8_t port_idx, const uint8_t *tx_buf, uint16_t 
     UART_HandleTypeDef *huart;
     const UART_RawConfig_t *cfg;
     uint16_t rx_len = 0;
-    uint8_t  byte = 0;
 
-    /* ---- 参数校验 ---- */
-    if ((port_idx >= UART_PORT_COUNT) || (tx_buf == NULL) || (rx_buf == NULL) ||
-        (tx_len == 0U) || (rx_max_len == 0U)) {
+    /* ---- 参数校验 ----
+     * 允许纯发送调用 (rx_buf==NULL 且 rx_max_len==0, 如校时命令无需应答).
+     * 修复: 此前 rx_buf==NULL/rx_max_len==0 直接返回, 导致校时命令从未真正发出. */
+    if ((port_idx >= UART_PORT_COUNT) || (tx_buf == NULL) || (tx_len == 0U)) {
         return 0U;
     }
 
@@ -659,48 +705,126 @@ uint16_t uart_custom_exchange(uint8_t port_idx, const uint8_t *tx_buf, uint16_t 
         return 0U;
     }
 
-    /* ---- 清除可能残留的错误标志 (上溢/帧错/噪声) ---- */
+    /* ---- 彻底清空 UART RX: 排空所有残留字节, 连带清除所有错误标志 ---- */
+    /* 循环读取 DR 直到 RXNE=0: 每次读 DR 都会同时清除 RXNE/ORE/FE/NE.
+     * HAL 自带的 CLEAR_FEFLAG/CLEAR_NEFLAG 宏只读 SR 不读 DR,
+     * 无法真正清除 FE/NE (STM32F4 手册要求 SR+DR 读序列), 故直接循环排空. */
+    {
+        uint32_t _drain_timeout = 100000U;
+        while (__HAL_UART_GET_FLAG(huart, UART_FLAG_RXNE) && _drain_timeout > 0U) {
+            (void)huart->Instance->DR;
+            _drain_timeout--;
+        }
+    }
+    /* 排空后再走一遍标准清理 (处理极端情况: DR 空但 SR 还有残余标志) */
     __HAL_UART_CLEAR_OREFLAG(huart);
-    __HAL_UART_CLEAR_FEFLAG(huart);
-    __HAL_UART_CLEAR_NEFLAG(huart);
 
     /* ---- 步骤 1-2: 拉高 DE, 切换到发送模式 ---- */
     HAL_GPIO_WritePin(cfg->de_port, cfg->de_pin, GPIO_PIN_SET);
 
-    /* ---- 步骤 3: 发送数据 ---- */
-    if (HAL_UART_Transmit(huart, (uint8_t *)tx_buf, tx_len, first_byte_timeout_ms) != HAL_OK) {
-        HAL_GPIO_WritePin(cfg->de_port, cfg->de_pin, GPIO_PIN_RESET);
-        return 0U;
-    }
+    /* ---- 步骤 3-5: 中断驱动发送 (TXE/TC 中断, 抗任务抢占) ----
+     * [为什么改] 原 HAL_UART_Transmit 是阻塞轮询发送: 请求帧 (8 字节 @9600
+     *   ≈ 9.2ms) 发送期间, 本任务 (prio 5) 若被更高优先级任务 (tcpip_thread=7,
+     *   App_Task_TcpSend=6, App_TaskStart=8) 或同级时间片 (1ms) 抢占停顿超过
+     *   从机 T3.5 (9600≈4ms), 帧被拆成两段. 从机按 Modbus RTU 帧间超时把两段
+     *   判为无效帧整体丢弃 → 该地址轮询无响应 → 上传数据全 FFFF
+     *   (道岔采集盒随机丢请求帧).
+     * [怎么改] 字节改由 TXE/TC 中断 (prio 2) 按波特率逐字节移出, 与任务调度
+     *   完全解耦, 不存在被抢占拆帧的可能.
+     * [关键点1] 先关 TCIE 再开 TXEIE: 防止上一次发送残留的 TC 标志在后续开
+     *   TCIE 时立即误触发, 提前拉低 DE 导致帧未发完就切入接收.
+     * [关键点2] TC 中断负责拉低 DE 并立即开启 RXNE 接收窗口: 消除 DE→RX 切换
+     *   间隙. 即使任务在 vTaskDelay 中尚未醒来, 从机快速应答的首字节也会被 ISR
+     *   直接收入 ring buffer, 不会丢首字节.
+     * [时序] DE高 → 开TXE → (ISR 发完 8 字节) → 末字节移出触发 TC → ISR 拉低
+     *   DE + 开 RXNE → 任务轮询到 tx_done → 进入接收等待. */
+    uart_custom_tx[port_idx].tx_buf    = tx_buf;
+    uart_custom_tx[port_idx].tx_len    = tx_len;
+    uart_custom_tx[port_idx].tx_idx    = 0;
+    uart_custom_tx[port_idx].tx_active = 1;
+    uart_custom_tx[port_idx].tx_done   = 0;
+    uart_custom_tx[port_idx].de_port   = cfg->de_port;
+    uart_custom_tx[port_idx].de_pin    = cfg->de_pin;
 
-    /* ---- 步骤 4: 等待发送完成 (TC = Transmission Complete) ---- */
-    /* 添加超时保护: 防止因硬件异常导致 TC 永远不置位而死循环.
-     * HAL_UART_Transmit 内部已等待过 TC, 正常情况下此循环立即通过. */
+    __HAL_UART_DISABLE_IT(huart, UART_IT_TC);    /* 防残留 TCIE 误触发 */
+    __HAL_UART_CLEAR_FLAG(huart, UART_FLAG_TC);  /* 清残留 TC 标志      */
+    __HAL_UART_ENABLE_IT(huart, UART_IT_TXE);    /* DR 空 → 立即进入首次 TXE 中断 */
+
+    /* 等待发送完成: TC 中断拉低 DE, 开启接收窗口并置位 tx_done.
+     * vTaskDelay(1) 让出 CPU: 发送由 ISR 驱动, 任务阻塞等待不影响帧连续性;
+     * 期间更高优先级任务可正常运行 (这正是中断驱动发送的意义). */
     {
-        uint32_t tc_tick = HAL_GetTick();
-        while (__HAL_UART_GET_FLAG(huart, UART_FLAG_TC) == RESET) {
-            if ((HAL_GetTick() - tc_tick) > first_byte_timeout_ms) {
+        uint32_t tx_start = HAL_GetTick();
+        while (uart_custom_tx[port_idx].tx_done == 0U) {
+            if ((HAL_GetTick() - tx_start) > first_byte_timeout_ms) {
+                /* 发送超时: 中止并回退到接收模式.
+                 * 8 字节请求在 first_byte_timeout_ms(80~100ms) 内必然发完, 此分支
+                 * 仅在 UART 硬件异常/总线被拉死时触发. 关掉 TXE/TC 中断、DE 拉低,
+                 * 返回 0 由上层按"该从机离线"处理, 下一轮轮询重试. */
+                __HAL_UART_DISABLE_IT(huart, UART_IT_TXE);
+                __HAL_UART_DISABLE_IT(huart, UART_IT_TC);
+                uart_custom_tx[port_idx].tx_active = 0;
+                uart_custom_tx[port_idx].tx_done   = 0;
                 HAL_GPIO_WritePin(cfg->de_port, cfg->de_pin, GPIO_PIN_RESET);
                 return 0U;
             }
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
+    uart_custom_tx[port_idx].tx_active = 0;
 
-    /* ---- 步骤 5: 拉低 DE, 切换到接收模式 ---- */
-    HAL_GPIO_WritePin(cfg->de_port, cfg->de_pin, GPIO_PIN_RESET);
+    /* ---- 步骤 6-7: 中断驱动接收 (ring buffer + vTaskDelay, 彻底消除 ORE) ---- */
+    /*
+     * ring buffer 已由 TC 中断复位并开启 RXNEIE (见 mbportserial.c 自定义分支),
+     * 此处只等待数据, 不再重复初始化 ring —— 避免任务在 vTaskDelay 醒来后重新
+     * 初始化 ring, 与 ISR 竞争把已经收入的应答字节清掉.
+     * 首字节由 first_byte_timeout_ms 兜底; 帧结束按 inter_byte_timeout_ms 字节
+     * 间隔超时判定 (与 Modbus T3.5 同理). 任务全程 vTaskDelay 让出 CPU, 不会
+     * 与同优先级任务互相抢占导致 ORE 丢字节.
+     */
+    {
+        UART_RxRing_t *ring = &uart_rx_ring[port_idx];
+        uint32_t       start_tick;
+        uint32_t       last_byte_tick;
+        uint16_t       prev_count;
 
-    /* ---- 步骤 6: 接收首字节 (阻塞等待, 超时即失败) ---- */
-    if (HAL_UART_Receive(huart, &byte, 1U, first_byte_timeout_ms) != HAL_OK) {
-        return 0U;
-    }
-    rx_buf[rx_len++] = byte;
-
-    /* ---- 步骤 7: 逐字节接收后续数据 (字节间隔超时 = 帧结束) ---- */
-    while (rx_len < rx_max_len) {
-        if (HAL_UART_Receive(huart, &byte, 1U, inter_byte_timeout_ms) != HAL_OK) {
-            break;  /* 超时 → 一帧接收完成 */
+        /* 等待首字节 (first_byte_timeout_ms 超时) */
+        start_tick = HAL_GetTick();
+        while (ring->count == 0U) {
+            if ((HAL_GetTick() - start_tick) > first_byte_timeout_ms) {
+                __HAL_UART_DISABLE_IT(huart, UART_IT_RXNE);
+                ring->rx_active = 0;
+                return 0U;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
-        rx_buf[rx_len++] = byte;
+
+        /* 等待后续字节 (inter_byte_timeout_ms 字节间隔超时 = 帧结束) */
+        last_byte_tick = HAL_GetTick();
+        prev_count     = ring->count;
+        while (ring->count < rx_max_len) {
+            if (ring->count != prev_count) {
+                /* 有新字节到达, 重置超时计时器 */
+                last_byte_tick = HAL_GetTick();
+                prev_count     = ring->count;
+            } else if ((HAL_GetTick() - last_byte_tick) > inter_byte_timeout_ms) {
+                /* 字节间隔超时 → 帧接收完成 */
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+
+        rx_len = ring->count;
+        __HAL_UART_DISABLE_IT(huart, UART_IT_RXNE);
+        ring->rx_active = 0;   /* 通知 ISR: 接收完毕 */
+
+        /* 从 ring buffer 拷贝到 rx_buf (纯发送调用 rx_buf==NULL, 不拷贝) */
+        if (rx_buf != NULL) {
+            uint16_t _i;
+            for (_i = 0; _i < rx_len; _i++) {
+                rx_buf[_i] = ring->buffer[(ring->tail + _i) % UART_RX_RING_SIZE];
+            }
+        }
     }
 
     return rx_len;
@@ -820,9 +944,10 @@ void uart_handle_curve_continue_frame(uint8_t port_idx, uint8_t module_idx,
 
     resp = ser_buf + 11U;
 
-    /* 更新帧序号和帧标记 */
+    /* 更新帧序号 (16 位大端序) 和帧标记 */
     AC_module_infor[port_idx].Frame_sequence[module_idx] =
-        resp[profile->curve_seq_offset];
+        ((uint16_t)resp[profile->curve_seq_offset] << 8)
+      | (uint16_t)resp[profile->curve_seq_offset + 1U];
     AC_module_infor[port_idx].Frame_mark[module_idx] = 0x55U;
 
     /* 首帧: 清零微步计数, 写入时间戳头部 */
@@ -840,7 +965,9 @@ void uart_handle_curve_continue_frame(uint8_t port_idx, uint8_t module_idx,
              *   其他: 保持不变
              */
             if ((profile->module_type == FLFXG_AC_ZZJ) ||
-                (profile->module_type == FLFXG_AC_ZZJ_HIGH)) {
+                (profile->module_type == FLFXG_AC_ZZJ_HIGH) ||
+                (profile->module_type == FLFXG_S700K_C) ||
+                (profile->module_type == FLFXG_S700K_C_HIGH)) {
                 flash_time[1] = n + 1;
             } else {
                 flash_time[1] = 5;
@@ -855,8 +982,9 @@ void uart_handle_curve_continue_frame(uint8_t port_idx, uint8_t module_idx,
         }
     }
 
-    /* 计算本帧曲线数据字节数: 长度字节 * 2 (每点 2 字节) */
-    weibo_temp = (uint16_t)(resp[profile->curve_len_offset] * 2U);
+    /* 计算本帧曲线数据字节数: 长度 (16 位大端序, 点数) * 2 (每点 2 字节) */
+    weibo_temp = (uint16_t)(((uint16_t)resp[profile->curve_len_offset] << 8)
+                           | (uint16_t)resp[profile->curve_len_offset + 1U]) * 2U;
 
     /* 将各分支曲线数据写入 SDRAM (追加到已有数据之后) */
     for (n = 0; n < profile->curve_branch_count; n++) {
@@ -893,45 +1021,54 @@ void uart_handle_curve_end_frame(uint8_t port_idx, uint8_t module_idx,
 
     resp = ser_buf + 11U;
 
-    /* 更新帧序号和帧标记 */
+    /* 更新帧序号 (16 位大端序) 和帧标记 */
     AC_module_infor[port_idx].Frame_sequence[module_idx] =
-        resp[profile->curve_seq_offset];
+        ((uint16_t)resp[profile->curve_seq_offset] << 8)
+      | (uint16_t)resp[profile->curve_seq_offset + 1U];
     AC_module_infor[port_idx].Frame_mark[module_idx] = 0xFFU;
 
-    /* 首帧检测: flag+1 字节为 0 且序列号为 1 */
-    if ((resp[profile->curve_flag_offset + 1U] == 0U) &&
-        (resp[profile->curve_seq_offset] == 1U)) {
-        uint8_t ft[6];
-        Weibo_number[port_idx][module_idx] = 0;
-        AC_module_infor[port_idx].Curve_number[module_idx] = 1;
+    /* 首帧检测: 传感器每个曲线周期的第一帧序号总是 1 */
+    {
+        uint16_t seq_word = ((uint16_t)resp[profile->curve_seq_offset] << 8)
+                          | (uint16_t)resp[profile->curve_seq_offset + 1U];
+        if (seq_word == 1U) {
+            uint8_t ft[6];
+            Weibo_number[port_idx][module_idx] = 0;
+            AC_module_infor[port_idx].Curve_number[module_idx] = 1;
 
-        /* 构建时间戳头部 (从响应帧中的时间字段读取) */
-        ft[0] = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx];
-        ft[2] = resp[profile->curve_flag_offset + 3U];  /* 年/月 */
-        ft[3] = resp[profile->curve_flag_offset + 4U];  /* 日/时 */
-        ft[4] = resp[profile->curve_flag_offset + 5U];  /* 分/秒 */
-        ft[5] = resp[profile->curve_flag_offset + 6U];
+            /* 构建时间戳头部 (从响应帧中的时间字段读取, 位于 FrameFlag+4) */
+            ft[0] = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx];
+            ft[2] = resp[profile->curve_flag_offset + 4U];  /* 年/月 */
+            ft[3] = resp[profile->curve_flag_offset + 5U];  /* 日/时 */
+            ft[4] = resp[profile->curve_flag_offset + 6U];  /* 分/秒 */
+            ft[5] = resp[profile->curve_flag_offset + 7U];
 
-        /* 为每个分支写入时间戳头部 */
-        for (n = 0; n < profile->curve_branch_count; n++) {
-            if ((profile->module_type == FLFXG_AC_ZZJ) ||
-                (profile->module_type == FLFXG_AC_ZZJ_HIGH)) {
-                ft[0] = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx];
-                ft[1] = n + 1;
-            } else {
-                ft[1] = 5;
+            /* 为每个分支写入时间戳头部 */
+            for (n = 0; n < profile->curve_branch_count; n++) {
+                if ((profile->module_type == FLFXG_AC_ZZJ) ||
+                    (profile->module_type == FLFXG_AC_ZZJ_HIGH) ||
+                    (profile->module_type == FLFXG_S700K_C) ||
+                    (profile->module_type == FLFXG_S700K_C_HIGH)) {
+                    ft[0] = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx];
+                    ft[1] = n + 1;
+                } else {
+                    ft[1] = 5;
+                }
+                if ((profile->module_type == FLFXG_DC_ZZJ6) ||
+                    (profile->module_type == FLFXG_DC_ZZJ6_HIGH)) {
+                    ft[0] = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx] + n;
+                }
+                memcpy((uint8_t *)(qx + n * (SDRAM_QX_BRANCH_SIZE / 2U)),
+                       ft, 6);
             }
-            if ((profile->module_type == FLFXG_DC_ZZJ6) ||
-                (profile->module_type == FLFXG_DC_ZZJ6_HIGH)) {
-                ft[0] = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx] + n;
-            }
-            memcpy((uint8_t *)(qx + n * (SDRAM_QX_BRANCH_SIZE / 2U)),
-                   ft, 6);
         }
-    }
+
+    }  /* 关闭 seq_word 作用域 */
 
     /* ---- 缓存最后一段曲线数据 ---- */
-    weibo_temp = (uint16_t)(resp[profile->curve_len_offset] * 2U);
+    /* 曲线长度: 16 位大端序, 单位是点数, 每点 2 字节 */
+    weibo_temp = (uint16_t)(((uint16_t)resp[profile->curve_len_offset] << 8)
+                           | (uint16_t)resp[profile->curve_len_offset + 1U]) * 2U;
     for (n = 0; n < profile->curve_branch_count; n++) {
         memcpy((uint8_t *)(qx + n * (SDRAM_QX_BRANCH_SIZE / 2U)
                            + 3U + Weibo_number[port_idx][module_idx] / 2U),
@@ -988,8 +1125,8 @@ void uart_handle_curve_end_frame(uint8_t port_idx, uint8_t module_idx,
              *   DC_ZZJ4 有 1 分支 → 复位码 3
              *   DC_ZZJ6 有 2 分支 → 复位码 3/5
              */
-            client_add_to_tcp_send_buf(&ser_buf[0], frame_len,
-                                       3U + (uint8_t)(n * 2U), port_idx);
+            client_add_curve_to_tcp_send_buf(&ser_buf[0], frame_len,
+                                             3U + (uint8_t)(n * 2U));
         }
 
         /* 标记曲线上传完成, 触发日志上报 (由 checkSendLog 处理) */

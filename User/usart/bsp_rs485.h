@@ -32,7 +32,8 @@ typedef struct {
 #define UART_PORT_AXLE_COUNTER      7    /* 0x07 — 非标485计轴(防雷分线柜)端口 */
 #define UART_PORT_DC3WIRE           8    /* 0x08 — 直流3对线(防雷分线柜)端口 */
 #define UART_DEFAULT_DELAY_MS       440
-#define UART_MODULE_MAX_COUNT       32
+#define UART_POLL_PERIOD_MS         1000  /* 每端口目标轮询周期: 补齐到 1 秒 */
+#define UART_MODULE_MAX_COUNT       13
 #define UART_MODULE_DEFAULT_REGS    13
 #define UART_HOLDING_REG_STRIDE     500
 #define BOARD_CONFIG_BYTES          (sizeof(BoardCfgTab))
@@ -47,6 +48,7 @@ typedef struct {
 #define FLFXG_AC_ZZJ                0x37
 #define FLFXG_DC_ZZJ4               0x38
 #define FLFXG_DC_ZZJ6               0x39
+#define FLFXG_S700K_C               0x3A    /* S700K_C 四线制交流道岔采集 (4分支) */
 
 /* 高频模块类型 (新增) */
 #define FLFXG_NEW_XHJ               0x47    /* 高频信号机           */
@@ -56,11 +58,12 @@ typedef struct {
 #define FLFXG_AC_ZZJ_HIGH           0x4B    /* 高频交流转辙机         */
 #define FLFXG_DC_ZZJ4_HIGH          0x4C    /* 高频直流转辙机4路      */
 #define FLFXG_DC_ZZJ6_HIGH          0x4D    /* 高频直流转辙机6路      */
+#define FLFXG_S700K_C_HIGH          0x4E    /* 高频S700K_C交流道岔采集(4分支) */
 
 /* 防雷分线柜模块类型 */
 #define FLFXG_AXLE_COUNTER          0x50    /* 计轴采集传感器 WBTQ301JH-1B3 */
-#define FLFXG_DC3WIRE_PLATFORM      0x51    /* 站台门采集 WBTQ802JH-1B3 */
-#define FLFXG_DC3WIRE_STATION       0x52    /* 站场联采集 WBTQ402JH-1B3 */
+#define FLFXG_DC3WIRE_ZTM      0x51    /* 站台门采集 WBTQ802JH-1B3 */
+#define FLFXG_DC3WIRE_ZCL       0x52    /* 站场联采集 WBTQ402JH-1B3 */
 
 /* SDRAM curve buffer layout */
 /* Realtime data (SSZ): port_idx * 0x1000 bytes from SDRAM_BASE_ADDR */
@@ -80,7 +83,7 @@ typedef struct {
 typedef struct {
     uint8_t  Curve_number[32];
     uint8_t  Frame_mark[32];
-    uint8_t  Frame_sequence[32];
+    uint16_t Frame_sequence[32];
     uint16_t Points_number[32];
 } CurveModuleInfo_t;
 
@@ -135,6 +138,46 @@ typedef struct {
     uint16_t curve_seq[UART_MODULE_MAX_COUNT];  /* 上次收到的 AllCurveFrame (ACK机制) */
 } DC3WireState_t;
 
+/* ---- UART RX 环形缓冲区 (中断驱动接收, 防抢占丢字节) ----
+ * 字段按对齐要求从大到小排列, 保证零内部填充, 结构体大小确定 524 字节.
+ * 注意: 修改此处时必须同步更新 mbport/mbportserial.c 中的同名定义. */
+#define UART_RX_RING_SIZE           512      /* 足够容纳最大曲线帧(~190B) */
+typedef struct {
+    uint8_t  buffer[UART_RX_RING_SIZE]; /* 512 B                        */
+    uint32_t last_byte_tick;            /*   4 B, offset 512 (512%4=0)  */
+    uint16_t head;                      /*   2 B, offset 516            */
+    uint16_t tail;                      /*   2 B, offset 518            */
+    uint16_t count;                     /*   2 B, offset 520            */
+    uint8_t  rx_active;                 /*   1 B, offset 522            */
+    uint8_t  _pad;                      /*   1 B, 对齐到 524            */
+} UART_RxRing_t;
+
+/* ---- 自定义串口 TX 状态 (中断驱动发送, 免疫任务抢占丢帧) ----
+ * 与 Modbus 主站一致, 请求帧由 TXE/TC 中断逐字节发出, 字节由 ISR 按波特率
+ * 连续移出, 与任务调度无关. 避免请求帧在阻塞轮询发送期间被高优先级任务/
+ * 时间片抢占拆断超过 T3.5 而从机丢弃 (道岔采集盒随机丢请求帧问题).
+ *
+ * 发送握手 (任务 ↔ TXE/TC 中断):
+ *   ① 任务: 拉高 DE → 填本结构 (tx_buf/tx_len/tx_idx=0/tx_active=1/tx_done=0)
+ *           → 清 TC 标志 → 开 TXE 中断
+ *   ② TXE 中断: 逐字节写 DR 发送; 写满 tx_len 后关 TXE、开 TC
+ *   ③ TC 中断: 末字节移出移位寄存器 → 拉低 DE → 复位 RX ring 并开 RXNE
+ *           → tx_active=0, tx_done=1
+ *   ④ 任务: 轮询 tx_done 退出等待, 进入接收等待
+ *
+ * tx_active / tx_done 用 volatile, 由任务写、ISR 读写, 保证跨上下文可见.
+ * tx_buf 指向调用方缓冲区, 任务在等待 tx_done 期间阻塞, 故 ISR 使用期间有效.
+ * 注意: 修改此处时必须同步更新 mbport/mbportserial.c 中的同名定义. */
+typedef struct {
+    const uint8_t   *tx_buf;       /* 待发送数据指针 (来自调用方, 任务阻塞至 tx_done) */
+    uint16_t         tx_len;       /* 待发送字节数                                   */
+    uint16_t         tx_idx;       /* 下一个待发送字节下标 (ISR 自增)                 */
+    volatile uint8_t tx_active;    /* 1 = TXE 中断正在发送帧                          */
+    volatile uint8_t tx_done;      /* 1 = TC 完成, DE 已切回接收                      */
+    GPIO_TypeDef    *de_port;      /* DE 引脚端口 (TC 完成时拉低, 切入接收)           */
+    uint16_t         de_pin;       /* DE 引脚号                                       */
+} UART_CustomTxState_t;
+
 /* ---- Global variables for 6 UART ports ---- */
 extern BoardConfig_t    BoardCfgTab[UART_PORT_COUNT];
 extern uint8_t          SerialDataBuf[UART_PORT_COUNT][UART_SERIAL_BUF_SIZE];
@@ -172,6 +215,11 @@ extern uint8_t               portError[UART_PORT_COUNT];          /* Per-port da
 extern uint8_t               portDLQX[UART_PORT_COUNT];           /* Per-port curve upload log flags   */
 extern AxleCounterState_t     axle_counter_state[UART_PORT_COUNT];  /* Axle counter comm_confirm state    */
 extern DC3WireState_t         dc3wire_state[UART_PORT_COUNT];        /* DC 3-wire curve_seq state          */
+extern UART_RxRing_t          uart_rx_ring[UART_PORT_COUNT];          /* Interrupt-driven RX ring buffers    */
+extern UART_CustomTxState_t   uart_custom_tx[UART_PORT_COUNT];        /* Interrupt-driven TX state           */
+extern uint8_t                g_debug_axle_enable;                     /* 计轴调试打印开关: 1=开, 0=关         */
+extern uint8_t                g_debug_dc3w_enable;                     /* 直流三对线调试打印开关: 1=开, 0=关         */
+extern uint8_t                g_debug_dc3w_port;                       /* 指定调试端口: 0=全部, 1-6=仅此端口        */
 
 /* ---- 函数声明 ---- */
 uint32_t uart_get_baud_rate(uint8_t baud_code);
