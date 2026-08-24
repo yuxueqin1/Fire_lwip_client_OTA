@@ -27,6 +27,7 @@
 #include "bsp_rs485.h"
 #include "bsp_eeprom.h"
 #include "debug.h"
+#include "./sdram/bsp_sdram.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -62,11 +63,20 @@
 #define CONFIG_REQ_RETRY_INTERVAL      100U      /* 配置请求重试间隔 (循环次数) */
 
 /*======================================================================*/
+/*  曲线 FIFO 常量 (放在 SDRAM, 不丢包)                                   */
+/*  - 实时数据: 覆盖式 (每端口1槽, 只保留最新帧)                           */
+/*  - 曲线数据: FIFO 追加式 (不覆盖, 不丢包)                              */
+/*======================================================================*/
+#define CURVE_FIFO_DEPTH              16U    /* 曲线 FIFO 深度 */
+/* QX 缓存区结束于 0xC0005000 + 6×0x1E000 = 0xC00B9000, FIFO 基址取其后 */
+#define CURVE_FIFO_BASE_ADDR          (SDRAM_BASE_ADDR + 0xC0000U)
+
+/*======================================================================*/
 /*  网络命令字 (与上位机协议)                                              */
 /*======================================================================*/
 #define NET_CMD_CONFIG                 0x00
 #define NET_CMD_CONFIG_MAGIC0          0xA1
-#define NET_CMD_CONFIG_MAGIC1          0x2C
+#define NET_CMD_CONFIG_MAGIC1          0xC2
 #define NET_CMD_CONFIG_MAGIC2          0x01
 #define NET_CMD_TIME_MAGIC0            0xA3
 #define NET_CMD_TIME_MAGIC1            0x04
@@ -118,6 +128,23 @@ typedef struct {
 } TcpSendSlot_t;
 
 /*======================================================================*/
+/*  曲线 FIFO 槽位 (放在 SDRAM)                                           */
+/*  - 曲线数据不可丢: FIFO 追加式, 而非实时数据的覆盖式.                   */
+/*======================================================================*/
+typedef struct {
+    uint16_t len;                       /* 数据长度 (2B, 对齐) */
+    uint8_t  reset_flag;                /* 看门狗复位码 */
+    uint8_t  send_buf[TCP_SEND_BUF_SIZE];
+} CurveFifoSlot_t;                      /* 4100 B, 4 字节对齐 */
+
+typedef struct {
+    volatile uint32_t head;             /* 发送任务读取位置 */
+    volatile uint32_t tail;             /* 串口任务写入位置 */
+    volatile uint32_t count;            /* 待发送帧数 (区分空/满) */
+    CurveFifoSlot_t   slot[CURVE_FIFO_DEPTH];
+} CurveFifo_t;
+
+/*======================================================================*/
 /*  静态全局变量                                                          */
 /*======================================================================*/
 static TcpSendSlot_t     tcp_waiting_send_buf[TCP_SEND_QUEUE_COUNT];
@@ -125,6 +152,7 @@ static SemaphoreHandle_t tcp_queue_lock;
 static struct netconn   *tcp_conn = NULL;
 static volatile uint8_t  tcp_connected = 0U;
 static uint8_t           tcp_recv_buf[TCP_RECV_BUF_SIZE];
+static CurveFifo_t      *curve_fifo = NULL;   /* 指向 SDRAM 曲线 FIFO (client_init 初始化) */
 
 /*======================================================================*/
 /*  前向声明                                                              */
@@ -156,7 +184,7 @@ void client_disconnect(void)
 
 /*======================================================================*/
 /*  client_add_to_tcp_send_buf()                                         */
-/*  将数据放入 TCP 发送队列 (槽位满时阻塞等待)                              */
+/*  将数据放入 TCP 发送队列 (覆盖式, 只保留最新帧)                          */
 /*  - buf:        数据指针                                                */
 /*  - len:        数据长度                                                */
 /*  - reset_flag: 发送失败时的看门狗复位码                                  */
@@ -180,16 +208,12 @@ void client_add_to_tcp_send_buf(const void *buf, uint16_t len,
 
     slot = &tcp_waiting_send_buf[port_flag];
 
-    /* ---- 等待槽位空闲 (上位机已取走上一次数据) ---- */
-    while (slot->ready != 0U) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-
+    /* ---- 覆盖式入队: 槽位满则直接覆盖旧数据 (实时数据只保留最新帧, 不阻塞) ---- */
     if (tcp_queue_lock != NULL) {
         xSemaphoreTake(tcp_queue_lock, portMAX_DELAY);
     }
 
-    slot->port_flag = port_flag;
+    slot->port_flag  = port_flag;
     slot->reset_flag = reset_flag;
     memcpy(slot->send_buf, buf, len);
     slot->len   = len;
@@ -201,9 +225,80 @@ void client_add_to_tcp_send_buf(const void *buf, uint16_t len,
 }
 
 /*======================================================================*/
+/*  client_add_curve_to_tcp_send_buf()                                   */
+/*  将曲线数据追加进 SDRAM 曲线 FIFO (不覆盖, 不丢包).                     */
+/*  - buf:        数据指针                                                */
+/*  - len:        数据长度                                                */
+/*  - reset_flag: 发送失败时的看门狗复位码                                  */
+/*  FIFO 满时阻塞等待 (背压), 保证曲线帧一定被发出.                         */
+/*======================================================================*/
+void client_add_curve_to_tcp_send_buf(const void *buf, uint16_t len,
+                                      uint8_t reset_flag)
+{
+    CurveFifoSlot_t *slot;
+
+    if ((curve_fifo == NULL) || (buf == NULL) || (len == 0U)) {
+        return;
+    }
+    if (len > TCP_SEND_BUF_SIZE) {
+        len = TCP_SEND_BUF_SIZE;
+    }
+
+    /* ---- 背压: FIFO 满则等待发送任务取走 (曲线数据不丢, 宁可短暂阻塞) ---- */
+    for (;;) {
+        if (tcp_queue_lock != NULL) {
+            xSemaphoreTake(tcp_queue_lock, portMAX_DELAY);
+        }
+        if (curve_fifo->count < CURVE_FIFO_DEPTH) {
+            break;
+        }
+        if (tcp_queue_lock != NULL) {
+            xSemaphoreGive(tcp_queue_lock);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    slot = &curve_fifo->slot[curve_fifo->tail];
+    slot->reset_flag = reset_flag;
+    memcpy(slot->send_buf, buf, len);
+    slot->len = len;
+
+    curve_fifo->tail = (curve_fifo->tail + 1U) % CURVE_FIFO_DEPTH;
+    curve_fifo->count++;
+
+    if (tcp_queue_lock != NULL) {
+        xSemaphoreGive(tcp_queue_lock);
+    }
+}
+
+/*======================================================================*/
+/*  client_send_frame()                                                  */
+/*  发送一帧数据 (带重试), 返回 err_t.                                     */
+/*======================================================================*/
+static err_t client_send_frame(const uint8_t *buf, uint16_t len)
+{
+    uint8_t retry = TCP_SEND_RETRY_COUNT;
+    err_t   err   = ERR_OK;
+
+    do {
+        err = netconn_write(tcp_conn, buf, len, NETCONN_COPY);
+        if (err == ERR_OK) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    } while (retry-- > 0U);
+
+    return err;
+}
+
+/*======================================================================*/
 /*  client_send_pending()                                                */
 /*  遍历发送队列, 将待发送数据通过 netconn_write 发出                       */
 /*  由 App_Task_TcpSend 任务周期性调用 (与原程序 App_Task_TcpSend 一致)     */
+/*                                                                       */
+/*  发送顺序:                                                             */
+/*    1) 实时/控制槽 (覆盖式, 每端口只保留最新帧)                          */
+/*    2) 曲线 FIFO   (追加式, 不丢包)                                     */
 /*                                                                       */
 /*  重试机制: 每帧最多重试 TCP_SEND_RETRY_COUNT 次, 全部失败则断开连接      */
 /*  看门狗: 发送失败时通过 reset_flag 触发 WTD_RESET                       */
@@ -212,54 +307,77 @@ void client_send_pending(void)
 {
     uint8_t i;
     TcpSendSlot_t *slot;
-    uint8_t  retry;
     err_t    err;
+    static uint8_t send_copy[TCP_SEND_BUF_SIZE];   /* 发送本地缓冲 (静态, 避免占用任务栈) */
+    uint16_t copy_len;
+    uint8_t  copy_reset_flag;
 
     if (tcp_conn == NULL || tcp_connected == 0U) {
         return;
     }
 
+    /* ---- 1) 实时/控制槽: 拷出并立即释放槽位 (覆盖式, 不拖住串口轮询) ---- */
     for (i = 0; i < TCP_SEND_QUEUE_COUNT; i++) {
         slot = &tcp_waiting_send_buf[i];
-        retry = TCP_SEND_RETRY_COUNT;
-        err   = ERR_OK;
 
         if (slot->ready == 0U) {
             continue;
         }
 
-        /* ---- 重试发送 ---- */
-        do {
-            err = netconn_write(tcp_conn, slot->send_buf, slot->len,
-                                NETCONN_COPY);
-            if (err == ERR_OK) {
-                
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(10));
-        } while (retry-- > 0U);
+        if (tcp_queue_lock != NULL) {
+            xSemaphoreTake(tcp_queue_lock, portMAX_DELAY);
+        }
+        copy_len        = slot->len;
+        copy_reset_flag = slot->reset_flag;
+        memcpy(send_copy, slot->send_buf, copy_len);
+        slot->len       = 0;
+        slot->ready     = 0U;
+        if (tcp_queue_lock != NULL) {
+            xSemaphoreGive(tcp_queue_lock);
+        }
 
-        if (err == ERR_OK) {
-            /* 发送成功: 清空槽位 */
-            if (tcp_queue_lock != NULL) {
-                xSemaphoreTake(tcp_queue_lock, portMAX_DELAY);
+        err = client_send_frame(send_copy, copy_len);
+        if (err != ERR_OK) {
+            if (copy_reset_flag != 0U) {
+                WTD_RESET = copy_reset_flag;
             }
-            slot->len   = 0;
-            slot->ready = 0U;
+            tcp_connected = 0U;
+            return;
+        }
+
+    }
+
+    /* ---- 2) 曲线 FIFO: 逐帧取出发送 (追加式, 不丢包) ---- */
+    for (;;) {
+        CurveFifoSlot_t *cslot;
+
+        if (tcp_queue_lock != NULL) {
+            xSemaphoreTake(tcp_queue_lock, portMAX_DELAY);
+        }
+        if (curve_fifo == NULL || curve_fifo->count == 0U) {
             if (tcp_queue_lock != NULL) {
                 xSemaphoreGive(tcp_queue_lock);
             }
-        } else {
-            /*
-             * 发送失败超过重试次数:
-             * - 断开 TCP 连接 (触发 client_thread 重连)
-             * - 设置看门狗复位码 (WatchDog 触发系统复位)
-             */
-            if (slot->reset_flag != 0U) {
-                WTD_RESET = slot->reset_flag;
+            break;
+        }
+
+        cslot = &curve_fifo->slot[curve_fifo->head];
+        copy_len        = cslot->len;
+        copy_reset_flag = cslot->reset_flag;
+        memcpy(send_copy, cslot->send_buf, copy_len);
+        curve_fifo->head  = (curve_fifo->head + 1U) % CURVE_FIFO_DEPTH;
+        curve_fifo->count--;
+
+        if (tcp_queue_lock != NULL) {
+            xSemaphoreGive(tcp_queue_lock);
+        }
+
+        err = client_send_frame(send_copy, copy_len);
+        if (err != ERR_OK) {
+            if (copy_reset_flag != 0U) {
+                WTD_RESET = copy_reset_flag;
             }
             tcp_connected = 0U;
-            
             return;
         }
     }
@@ -287,7 +405,7 @@ static uint8_t client_board_config_valid(void)
 /*  在原程序配置变更时调用, 防止曲线数据丢失                                */
 /*  通信板就绪后: 将下方 #if 0 改为 #if 1 恢复此函数                        */
 /*======================================================================*/
-#if 0
+
 static void client_save_curve_to_eeprom(void)
 {
     uint8_t i;
@@ -298,7 +416,7 @@ static void client_save_curve_to_eeprom(void)
                            MODE_8_BIT, CURVE_EEPROM_SIZE);
     }
 }
-#endif
+
 
 /*======================================================================*/
 /*  client_handle_rx()                                                   */
@@ -327,14 +445,17 @@ static void client_handle_rx(const uint8_t *buf, uint16_t len)
     /*==================================================================*/
     /*  配置下发: [0x00, 0xA1, 0x2C, 0x01, ...config_data...]           */
     /*==================================================================*/
-    if ((buf[1] == NET_CMD_CONFIG_MAGIC0) &&
-        (buf[2] == NET_CMD_CONFIG_MAGIC1) &&
-        (buf[3] == NET_CMD_CONFIG_MAGIC2)) {
+    // if ((buf[1] == NET_CMD_CONFIG_MAGIC0) &&
+    //     (buf[2] == NET_CMD_CONFIG_MAGIC1) &&
+    //     (buf[3] == NET_CMD_CONFIG_MAGIC2)) 
+        if ((buf[1] == NET_CMD_CONFIG_MAGIC0) ) 
+        {
 
         copy_len = (uint16_t)(len - 4U);
         if (copy_len > BOARD_CONFIG_BYTES) {
             copy_len = BOARD_CONFIG_BYTES;
         }
+
 
         /* ---- 将接收到的配置写入 BoardCfgTab ---- */
         memset(BoardCfgTab, 0, BOARD_CONFIG_BYTES);
@@ -401,6 +522,8 @@ static void client_handle_rx(const uint8_t *buf, uint16_t len)
          * 通信板就绪后, 删除下面两行, 并将上方 #if 0 改为 #if 1.
          */
         download_flag = 1U;
+
+
     }
     /*==================================================================*/
     /*  校时命令: [0x00, 0xA3, 0x04, 0x00, timestamp(4 bytes)]         */
@@ -473,7 +596,7 @@ static void client_thread(void *thread_param)
 
 #if LWIP_SO_RCVTIMEO
         /* 设置接收超时: 50ms, 避免永久阻塞 recv */
-        netconn_set_recvtimeout(tcp_conn, 50);
+        netconn_set_recvtimeout(tcp_conn, 100); //test:50ms改成100ms
 #endif
 
         /* ---- 连接服务器 ---- */
@@ -552,7 +675,7 @@ static void client_thread(void *thread_param)
                                                 (uint8_t)(TCP_SEND_QUEUE_COUNT - 1U));
                 }
             }
-
+            
             vTaskDelay(pdMS_TO_TICKS(10));
         }
 
@@ -571,5 +694,10 @@ static void client_thread(void *thread_param)
 void client_init(void)
 {
     tcp_queue_lock = xSemaphoreCreateMutex();
-    sys_thread_new("td_tcp_client", client_thread, NULL, 1024, 5);
+
+    /* ---- 初始化 SDRAM 曲线 FIFO (追加式, 不丢包) ---- */
+    curve_fifo = (CurveFifo_t *)CURVE_FIFO_BASE_ADDR;
+    memset(curve_fifo, 0, sizeof(CurveFifo_t));
+
+    sys_thread_new("td_tcp_client", client_thread, NULL, 1024, 6);  
 }

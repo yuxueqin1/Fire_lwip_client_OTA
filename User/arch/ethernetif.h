@@ -59,7 +59,12 @@
 #define NETIF_MTU								      ( 1500 )
 
 #define NETIF_IN_TASK_STACK_SIZE			( 1024 )
-#define NETIF_IN_TASK_PRIORITY			  ( 3 )
+/*
+ * ETHIN (ethernetif_input) 读取 DMA 接收环 → 必须高于所有应用任务,
+ * 否则 ACK 会滞留在环中被 DMA 丢弃 (RBUS), 导致发送窗口永不释放.
+ * 同时必须低于 tcpip_thread(7), 让 tcpip 能及时排空 mbox.
+ */
+#define NETIF_IN_TASK_PRIORITY			  ( 6 )
 
 #define NETIF_OUT_TASK_STACK_SIZE			( 1024 )
 #define NETIF_OUT_TASK_PRIORITY			  ( 3 )

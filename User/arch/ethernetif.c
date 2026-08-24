@@ -333,7 +333,7 @@ static struct pbuf * low_level_input(struct netif *netif)
   /* get received frame */
   if (HAL_ETH_GetReceivedFrame(&heth) != HAL_OK)
   {
-    PRINT_ERR("receive frame faild\n");
+    /* 帧未就绪/描述符忙: 直接返回, 不做阻塞打印 (关键区内禁止 printf) */
     return NULL;
   }
   /* Obtain the size of the packet and put it into the "len" variable. */

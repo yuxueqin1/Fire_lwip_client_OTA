@@ -88,8 +88,8 @@ void DIP_SWITCH_Read(void)
                                      | (ba3 << 3) | (ba4 << 4));
 
     /* 读取 BA5-BA6 → 波特率 */
-    ba5 = dip_read_bit(DIP_BA5_PORT, DIP_BA5_PIN);   /* PI6, bit0 */
-    ba6 = dip_read_bit(DIP_BA6_PORT, DIP_BA6_PIN);   /* PI5, bit1 */
+    ba5 = dip_read_bit(DIP_BA5_PORT, DIP_BA5_PIN);   
+    ba6 = dip_read_bit(DIP_BA6_PORT, DIP_BA6_PIN);   
     baud_code = (uint8_t)(ba5 | (ba6 << 1));
 
     switch (baud_code) {

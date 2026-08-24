@@ -139,6 +139,24 @@ void HAL_ETH_MspDeInit(ETH_HandleTypeDef* ethHandle)
   }
 }
 
+/*======================================================================*/
+/*  bsp_get_unique_mac()                                                */
+/*  从 STM32 每芯片唯一的 96-bit UID 派生本地管理单播 MAC.               */
+/*  格式: 02-00-XX-XX-XX-XX  (0x02 = 本地管理位 + 单播位)               */
+/*  同一个柜子的两块板是两颗不同芯片 → UID 不同 → MAC 必然不同.          */
+/*======================================================================*/
+static void bsp_get_unique_mac(uint8_t mac[6])
+{
+    volatile uint32_t *uid = (volatile uint32_t *)UID_BASE;
+
+    mac[0] = 0x02U;                                  /* 本地管理 + 单播  */
+    mac[1] = 0x00U;                                  /* 段位, 与上位机约定 */
+    mac[2] = (uint8_t)((uid[2]        ) & 0xFFU);    /* UID[95:64] 低字节 */
+    mac[3] = (uint8_t)((uid[2] >> 8U  ) & 0xFFU);
+    mac[4] = (uint8_t)((uid[1]        ) & 0xFFU);    /* UID[63:32] 低字节 */
+    mac[5] = (uint8_t)((uid[1] >> 8U  ) & 0xFFU);
+}
+
 HAL_StatusTypeDef Bsp_Eth_Init(void)
 {
   HAL_StatusTypeDef ret;
@@ -151,13 +169,11 @@ HAL_StatusTypeDef Bsp_Eth_Init(void)
 
   ETH->DMABMR |= ETH_DMABMR_SR;
 
-  /* Init ETH */
-  MACAddr[0] = 0x02;
-  MACAddr[1] = 0x00;
-  MACAddr[2] = 0x00;
-  MACAddr[3] = 0x00;
-  MACAddr[4] = 0x00;
-  MACAddr[5] = 0x00;
+  /* Init ETH: 每块板唯一的 MAC (由芯片 UID 派生) */
+  bsp_get_unique_mac(MACAddr);
+  PRINT_DEBUG("eth MAC = %02X:%02X:%02X:%02X:%02X:%02X\n",
+              MACAddr[0], MACAddr[1], MACAddr[2],
+              MACAddr[3], MACAddr[4], MACAddr[5]);
   heth.Instance = ETH;
   heth.Init.AutoNegotiation = ETH_AUTONEGOTIATION_ENABLE;  /* DP83848K strap AN_EN=1, let PHY negotiate with link partner */
   heth.Init.PhyAddress = DP83848_PHY_ADDRESS;
@@ -220,5 +236,5 @@ void HAL_ETH_TxCpltCallback(ETH_HandleTypeDef *heth)
 
 void HAL_ETH_ErrorCallback(ETH_HandleTypeDef *heth)
 {
-    PRINT_ERR("eth err\n");
+    /* 以太网错误回调: 已移除调试打印, 暂不处理 */
 }

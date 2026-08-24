@@ -9,27 +9,27 @@
 
 //���Ŷ���
 /*******************************************************/
-#define DEBUG_USART                             UART7
-#define DEBUG_USART_CLK_ENABLE()                __HAL_RCC_UART7_CLK_ENABLE();
+#define DEBUG_USART                             USART6
+#define DEBUG_USART_CLK_ENABLE()                __HAL_RCC_USART6_CLK_ENABLE();
 
-//注意: STM32F429 上 UART7 时钟固定为 PCLK1, 不支持时钟源选择 (无 RCC_PERIPHCLK_UART7 宏)
+// USART6 on APB2, PC6=TX, PC7=RX
 
-#define DEBUG_USART_RX_GPIO_PORT                GPIOF
-#define DEBUG_USART_RX_GPIO_CLK_ENABLE()        __HAL_RCC_GPIOF_CLK_ENABLE()
-#define DEBUG_USART_RX_PIN                      GPIO_PIN_6
-#define DEBUG_USART_RX_AF                       GPIO_AF8_UART7
+#define DEBUG_USART_RX_GPIO_PORT                GPIOC
+#define DEBUG_USART_RX_GPIO_CLK_ENABLE()        __HAL_RCC_GPIOC_CLK_ENABLE()
+#define DEBUG_USART_RX_PIN                      GPIO_PIN_7
+#define DEBUG_USART_RX_AF                       GPIO_AF8_USART6
 
-#define DEBUG_USART_TX_GPIO_PORT                GPIOF
-#define DEBUG_USART_TX_GPIO_CLK_ENABLE()        __HAL_RCC_GPIOF_CLK_ENABLE()
-#define DEBUG_USART_TX_PIN                      GPIO_PIN_7
-#define DEBUG_USART_TX_AF                       GPIO_AF8_UART7
+#define DEBUG_USART_TX_GPIO_PORT                GPIOC
+#define DEBUG_USART_TX_GPIO_CLK_ENABLE()        __HAL_RCC_GPIOC_CLK_ENABLE()
+#define DEBUG_USART_TX_PIN                      GPIO_PIN_6
+#define DEBUG_USART_TX_AF                       GPIO_AF8_USART6
 
-#define DEBUG_USART_DE_GPIO_PORT                GPIOF
-#define DEBUG_USART_DE_GPIO_CLK_ENABLE()        __HAL_RCC_GPIOF_CLK_ENABLE()
+#define DEBUG_USART_DE_GPIO_PORT                GPIOC
+#define DEBUG_USART_DE_GPIO_CLK_ENABLE()        __HAL_RCC_GPIOC_CLK_ENABLE()
 #define DEBUG_USART_DE_PIN                      GPIO_PIN_8
 
-#define DEBUG_USART_IRQHandler                  UART7_IRQHandler
-#define DEBUG_USART_IRQ                 		UART7_IRQn
+#define DEBUG_USART_IRQHandler                  USART6_IRQHandler
+#define DEBUG_USART_IRQ                 		USART6_IRQn
 /************************************************************/
 
 void Usart_SendString(uint8_t *str);

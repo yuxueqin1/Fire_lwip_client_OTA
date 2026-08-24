@@ -37,6 +37,7 @@
 
 void client_init(void);
 void client_add_to_tcp_send_buf(const void *buf, uint16_t len, uint8_t reset_flag, uint8_t port_flag);
+void client_add_curve_to_tcp_send_buf(const void *buf, uint16_t len, uint8_t reset_flag);
 void client_send_pending(void);   /* 由 App_Task_TcpSend 周期性调用 */
 uint8_t client_is_connected(void);
 void client_disconnect(void);     /* 主动断开连接 (重连前调用)    */

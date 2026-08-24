@@ -70,6 +70,12 @@ void                vMBPAssert( void );
 void                vMBPEnterCritical( void );
 void                vMBPExitCritical( void );
 
+/* 自定义串口端口 (PortType 0x07/0x08) 需将 HAL 句柄的 UART 实例指针
+   注入 arxSerialPorts, 否则 ISR 中 pxSerial->huart.Instance 为 NULL,
+   解引用 NULL 导致读取 Flash 地址 0x00 的垃圾数据 → ISR 永远不清除
+   对应 UART 的中断标志 → 无限 ISR 循环 → 看门狗复位. */
+void                mbport_set_custom_uart_instance( void *instance );
+
 #ifdef _cplusplus
 }
 #endif

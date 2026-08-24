@@ -70,6 +70,18 @@ void WatchDog_Clear(void);
 #define  MB_REG_INPUT_START						0
 #define  MB_REG_INPUT_NREGS						50
 
+/*======================================================================*/
+/*  ???? (PortType = 0x07) — ????                                 */
+/*======================================================================*/
+
+/* ???????????? */
+#define AXLE_REALTIME_REGS    14U
+#define AXLE_REALTIME_BYTES   (AXLE_REALTIME_REGS * 2U)  /* = 28 */
+
+/* ??3???????????? */
+#define DC3WIRE_REALTIME_REGS   12U
+#define DC3WIRE_REALTIME_BYTES  (DC3WIRE_REALTIME_REGS * 2U)  /* = 24 */
+
 /* Exported macro ------------------------------------------------------------*/
 typedef            void        CPU_VOID;
 typedef            char        CPU_CHAR;                        /*  8-bit character                                     */

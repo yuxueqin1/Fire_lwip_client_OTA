@@ -40,7 +40,7 @@
 #include "stm32f4xx_it.h"
 #include "./usart/bsp_debug_usart.h"
 
-#include "FreeRTOS.h"					//FreeRTOSÊ¹ÓÃ		  
+#include "FreeRTOS.h"					//FreeRTOSÊ¹ï¿½ï¿½		  
 #include "task.h" 
 
 /** @addtogroup STM32F4xx_HAL_Examples
@@ -73,16 +73,14 @@ void NMI_Handler(void)
 
 /**
   * @brief  This function handles Hard Fault exception.
+  *         HardFault_Handler is defined in cm_backtrace library
+  *         (User/cm_backtrace/fault_handler/keil/cmb_fault.S).
+  *         After backtrace dump, the CPU enters an infinite loop,
+  *         allowing the watchdog to reset the system.
   * @param  None
   * @retval None
   */
-//void HardFault_Handler(void)
-//{
-//  /* Go to infinite loop when Hard Fault exception occurs */
-//  while (1)
-//  {
-//  }
-//}
+/* HardFault_Handler is provided by cm_backtrace â€” see cmb_fault.S */
 
 /**
   * @brief  This function handles Memory Manage exception.
@@ -144,7 +142,7 @@ extern void xPortSysTickHandler(void);
 void SysTick_Handler(void)
 {
   uint32_t ulReturn;
-  /* ½øÈëÁÙ½ç¶Î£¬ÁÙ½ç¶Î¿ÉÒÔÇ¶Ì× */
+  /* ï¿½ï¿½ï¿½ï¿½ï¿½Ù½ï¿½Î£ï¿½ï¿½Ù½ï¿½Î¿ï¿½ï¿½ï¿½Ç¶ï¿½ï¿½ */
   ulReturn = taskENTER_CRITICAL_FROM_ISR();
   
   HAL_IncTick();
@@ -157,7 +155,7 @@ void SysTick_Handler(void)
   }
 #endif  /* INCLUDE_xTaskGetSchedulerState */
   
-  /* ÍË³öÁÙ½ç¶Î */
+  /* ï¿½Ë³ï¿½ï¿½Ù½ï¿½ï¿½ */
   taskEXIT_CRITICAL_FROM_ISR( ulReturn );
 }
 
