@@ -105,7 +105,9 @@ vMBMReadInputRegistersPolled( xMBHandle xHdl, UCHAR ucSlaveAddress, USHORT usReg
             *peState = MBM_STATE_DONE;
             if( ( MBM_PDU_FUNC_RD_RESP_SIZE( ubNRegs ) == pxIntHdl->usFrameMBPDULength ) &&
                 ( MBM_FUNC_RD_INPUT_REG == pxIntHdl->pubFrameMBPDUBuffer[MB_PDU_FUNC_OFF] ) &&
-                ( ( ( 2 * ubNRegs ) & 0xFF ) == pxIntHdl->pubFrameMBPDUBuffer[MBM_PDU_FUNC_RD_RESP_SIZE_BYTECNT_OFF] ) )
+                ( ( ( ( 2 * ubNRegs ) & 0xFF ) == pxIntHdl->pubFrameMBPDUBuffer[MBM_PDU_FUNC_RD_RESP_SIZE_BYTECNT_OFF] ) ||
+                  ( ( ( 2 * ubNRegs ) > 255U ) &&                       /* 读 >127 寄存器: 字节计数字段溢出, 模块回填 0xFF */
+                    ( 0xFFU == pxIntHdl->pubFrameMBPDUBuffer[MBM_PDU_FUNC_RD_RESP_SIZE_BYTECNT_OFF] ) ) ) )
             {
 
                 /* A pointer pointing to the first register value in the stream. */
@@ -179,59 +181,26 @@ eMBMReadInputRegisters( xMBHandle xHdl, UCHAR ucSlaveAddress,
     /*
      * ============================================================
      * Modbus RTU 协议限制:
-     *   应答帧的 "字节计数" 字段仅有 1 个字节 (最大 0xFF = 255).
-     *   而每个寄存器占 2 字节, 因此单次最多可读 127 个寄存器
-     *   (127 x 2 = 254 字节 < 255). 当请求超过 127 个寄存器时,
-     *   从机的应答数据会超出该字段的可表示范围, 导致帧校验失败.
+     *   应答帧的 "字节计数" 字段仅有 1 个字节 (最大 0xFF = 255),
+     *   每个寄存器占 2 字节. 因此当请求超过 127 个寄存器时,
+     *   应答的字节计数字段会溢出 — 见 vMBMReadInputRegistersPolled
+     *   DISASSEMBLE 态对该情况的放宽处理 (读 >127 寄存器时接受
+     *   模块回填的 0xFF).
      *
      *   当前项目中, 超过此限制的仅有 "高频 25Hz 轨道接收模块"
-     *   (FLFXG_GD_25_J_HIGH, 0x48), 其固定需要 133 个输入寄存器.
+     *   (FLFXG_GD_25_J_HIGH, 0x48), 固定需要 133 个输入寄存器.
      *
-     * 解决: 当 ubNRegs > 127 时, 在库内部自动拆分为两次独立的
-     *   Modbus 事务, 对上层调用者完全透明.
-     *   第 1 次: 读 100 个寄存器 -> arusBufferOut[0..99]
-     *   第 2 次: 读剩余寄存器    -> arusBufferOut[100..N-1]
+     * 注意: 对此类大寄存器模块绝不能再做 "拆分多次读取".
+     *   实测该模块会无视请求的寄存器数量, 永远返回其全部
+     *   133 个寄存器 (266 字节) 的固定应答. 若拆成两次事务,
+     *   第二次读取返回的仍是整段数据 (从寄存器 0 起), 会覆盖
+     *   arusBufferOut[100..], 数据全错. 因此必须一次性请求
+     *   全部寄存器, 靠 DISASSEMBLE 态的放宽字节计数校验来
+     *   接受其 266 字节应答.
      * ============================================================
      */
-    if( ubNRegs > 127U )
-    {
-        UBYTE remaining;
 
-        /* ---- 第 1 次事务: 前 100 个寄存器 ---- */
-        eState = MBM_STATE_NONE;
-        do
-        {
-            vMBMReadInputRegistersPolled( xHdl, ucSlaveAddress,
-                                          usRegStartAddress, 100,
-                                          arusBufferOut, &eState, &eStatus );
-            HAL_Delay( 1 );
-        }
-        while( eState != MBM_STATE_DONE );
-
-        if( eStatus != MB_ENOERR )
-        {
-            return eStatus;
-        }
-
-        /* ---- 第 2 次事务: 剩余寄存器 (偏移 100) ---- */
-        remaining = ( UBYTE )( ubNRegs - 100U );
-        eState = MBM_STATE_NONE;
-        do
-        {
-            vMBMReadInputRegistersPolled( xHdl, ucSlaveAddress,
-                                          ( USHORT )( usRegStartAddress + 100U ),
-                                          remaining,
-                                          &arusBufferOut[100], &eState, &eStatus );
-            HAL_Delay( 1 );
-        }
-        while( eState != MBM_STATE_DONE );
-
-        return eStatus;
-    }
-
-    /*
-     * 普通路径: ubNRegs <= 127, 单次 Modbus 事务即可.
-     */
+    /* 单次 Modbus 事务: 一次性请求全部 ubNRegs 个寄存器. */
     eState = MBM_STATE_NONE;
     do
     {
