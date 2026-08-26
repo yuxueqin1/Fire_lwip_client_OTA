@@ -44,7 +44,7 @@
 #include "./led/bsp_led.h" 
 #include "./eth/bsp_eth.h" 
 
-/* FreeRTOSÍ·ÎÄ¼þ */
+/* FreeRTOSÍ·ï¿½Ä¼ï¿½ */
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
@@ -71,16 +71,16 @@ void WatchDog_Clear(void);
 #define  MB_REG_INPUT_NREGS						50
 
 /*======================================================================*/
-/*  ???? (PortType = 0x07) — ????                                 */
+/*  ???? (PortType = 0x07) ï¿½ ????                                 */
 /*======================================================================*/
 
 /* ???????????? */
-#define AXLE_REALTIME_REGS    14U
-#define AXLE_REALTIME_BYTES   (AXLE_REALTIME_REGS * 2U)  /* = 28 */
+#define AXLE_REALTIME_REGS    10U
+#define AXLE_REALTIME_BYTES   (AXLE_REALTIME_REGS * 2U)  /* = 20 */
 
 /* ??3???????????? */
-#define DC3WIRE_REALTIME_REGS   12U
-#define DC3WIRE_REALTIME_BYTES  (DC3WIRE_REALTIME_REGS * 2U)  /* = 24 */
+#define DC3WIRE_REALTIME_REGS   10U
+#define DC3WIRE_REALTIME_BYTES  (DC3WIRE_REALTIME_REGS * 2U)  /* = 20 */
 
 /* Exported macro ------------------------------------------------------------*/
 typedef            void        CPU_VOID;

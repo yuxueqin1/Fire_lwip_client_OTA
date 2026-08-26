@@ -603,7 +603,7 @@ static void uart_task_handler(void *pvParameters)
             break;
 
         case UART_PORT_DC3WIRE:
-            /* 直流3对线端口实时帧: 帧标志 = 0x01 (区别于曲线帧 0x0A) */
+            /* 直流3对线端口实时帧: 帧标志 = 0x01 (区别于曲线帧 0x0B/0x0A) */
             *((uint16_t *)&SerialDataBuf[port_idx][5]) = runtime.data_len + 4U;
             SerialDataBuf[port_idx][3] = 0x01;
             memcpy(&SerialDataBuf[port_idx][11], runtime.ssz_buf, runtime.data_len);
@@ -1303,17 +1303,17 @@ static void uart_axle_counter_upload_pulse(uint8_t port_idx, uint8_t module_idx,
         /* ---- 写入 TCP 脉冲数据包条目 ---- */
         pkt[pkt_offset++] = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx]; /* 设备ID */
         pkt[pkt_offset++] = ch_no;                          /* 通道号 */
-        pkt[pkt_offset++] = (uint8_t)(pulse_ts >> 24);      /* 时间戳(秒) */
-        pkt[pkt_offset++] = (uint8_t)(pulse_ts >> 16);
+        pkt[pkt_offset++] = (uint8_t)(pulse_ts);            /* 时间戳(秒) 低字节在前 */
         pkt[pkt_offset++] = (uint8_t)(pulse_ts >> 8);
-        pkt[pkt_offset++] = (uint8_t)(pulse_ts);
-        pkt[pkt_offset++] = (uint8_t)(pulse_tms >> 8);      /* 时间戳(毫秒) */
-        pkt[pkt_offset++] = (uint8_t)(pulse_tms);
+        pkt[pkt_offset++] = (uint8_t)(pulse_ts >> 16);
+        pkt[pkt_offset++] = (uint8_t)(pulse_ts >> 24);
+        pkt[pkt_offset++] = (uint8_t)(pulse_tms);           /* 时间戳(毫秒) 低字节在前 */
+        pkt[pkt_offset++] = (uint8_t)(pulse_tms >> 8);
         pkt[pkt_offset++] = 0x01;                           /* 采集标志 = 1 (完成) */
+        pkt[pkt_offset++] = (uint8_t)(pulse_size & 0xFFU);  /* 当前脉冲数量(低) */
         pkt[pkt_offset++] = (uint8_t)((pulse_size >> 8) & 0xFFU); /* 当前脉冲数量(高) */
-        pkt[pkt_offset++] = (uint8_t)(pulse_size & 0xFFU);        /* 当前脉冲数量(低) */
-        pkt[pkt_offset++] = (uint8_t)((time_offset >> 8) & 0xFFU); /* 时间偏移 */
-        pkt[pkt_offset++] = (uint8_t)(time_offset & 0xFFU);
+        pkt[pkt_offset++] = (uint8_t)(time_offset & 0xFFU); /* 时间偏移(低) */
+        pkt[pkt_offset++] = (uint8_t)((time_offset >> 8) & 0xFFU); /* 时间偏移(高) */
         pkt[pkt_offset++] = pulse_size;                     /* 采样点数 */
         for (i = 0; i < pulse_size; i++) {
             pkt[pkt_offset++] = pulse_data[read_offset + i]; /* 采集值(×0.1V) */
@@ -1547,7 +1547,8 @@ static uint16_t uart_dc3wire_module_exchange(uint8_t port_idx, uint8_t module_id
 
 /*======================================================================*/
 /*  uart_dc3wire_upload_curve                                            */
-/*  将传感器曲线帧(0x80FF)打包为 TCP 曲线帧(0x0A)上传                    */
+/*  将传感器曲线帧(0x80FF)打包为 TCP 曲线帧上传                          */
+/*  帧标志: 站台门(ZTM)=0x0B, 站场联(ZCL)=0x0A                          */
 /*                                                                       */
 /*  TCP 曲线数据包 (协议文档 Table 1.5):                                  */
 /*    设备ID(1B) + 通道号(1B) + 时间戳秒(4B) + 曲线点数(2B)              */
@@ -1557,8 +1558,8 @@ static void uart_dc3wire_upload_curve(uint8_t port_idx, uint8_t module_idx,
                                       const uint8_t *resp, uint32_t link_mask)
 {
     uint8_t  device_id;
-    uint8_t  channel;       /* 曲线通道号 (寄存器13, resp[3+26..27]) */
-    uint16_t curve_len;     /* 曲线点数 (寄存器17, resp[3+34..35])    */
+    uint8_t  channel;       /* 曲线通道号 (寄存器13, resp[28..29] 低字节) */
+    uint16_t curve_len;     /* 曲线点数 (寄存器17, resp[36..37])        */
     uint16_t point_count;   /* 75                                                                        */
     uint32_t curve_time;    /* 曲线起始时间戳 (regs 15-16)                   */
     uint8_t *pkt;
@@ -1569,10 +1570,15 @@ static void uart_dc3wire_upload_curve(uint8_t port_idx, uint8_t module_idx,
 
     device_id = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx];
 
-    /* 寄存器13: CurveCHx — 曲线通道号
+    /* 寄存器13: CurveCHx — 曲线通道号 (2B BE)
      * 应答帧格式: [addr][03] + 24B数据 + ...  (无 byte_count 字节)
-     * reg N 偏移 = 2 + N*2                                          */
-    channel = resp[2 + 26];  /* 高字节(0), 低字节 = 通道号 0/1/2 */
+     * reg N 偏移 = 2 + N*2  →  reg13 = resp[28..29]
+     * 传感器用 1/2/3 表示三通道 (存于低字节 resp[29]);
+     * 上位机要求 0/1/2, 上传前需减 1.                          */
+    channel = resp[2 + 27];  /* reg13 低字节 = 传感器通道号 1/2/3 */
+    if (channel > 0U) {
+        channel -= 1U;       /* 上位机要求 0/1/2 */
+    }
 
     /* 寄存器15-16: CHx_CurveTime — 曲线起始时间戳(秒) */
     curve_time = ((uint32_t)resp[2 + 30] << 24)
@@ -1592,30 +1598,33 @@ static void uart_dc3wire_upload_curve(uint8_t port_idx, uint8_t module_idx,
     pkt_offset = 0;
 
     pkt[pkt_offset++] = device_id;
-    pkt[pkt_offset++] = channel;                       /* 通道号 */
-    pkt[pkt_offset++] = (uint8_t)(curve_time >> 24);   /* 时间戳(秒) */
-    pkt[pkt_offset++] = (uint8_t)(curve_time >> 16);
+    pkt[pkt_offset++] = channel;                       /* 通道号 0/1/2 */
+    pkt[pkt_offset++] = (uint8_t)(curve_time);          /* 时间戳(秒) 低字节在前 */
     pkt[pkt_offset++] = (uint8_t)(curve_time >> 8);
-    pkt[pkt_offset++] = (uint8_t)(curve_time);
-    pkt[pkt_offset++] = (uint8_t)((point_count >> 8) & 0xFFU); /* 曲线点数高 */
+    pkt[pkt_offset++] = (uint8_t)(curve_time >> 16);
+    pkt[pkt_offset++] = (uint8_t)(curve_time >> 24);
     pkt[pkt_offset++] = (uint8_t)(point_count & 0xFFU);        /* 曲线点数低 */
+    pkt[pkt_offset++] = (uint8_t)((point_count >> 8) & 0xFFU); /* 曲线点数高 */
 
-    /* 拷贝电压采样点 (int16 ×0.01V, big-endian) */
+    /* 拷贝电压采样点 (int16 ×0.01V, 低字节在前) */
     for (i = 0; i < point_count && pkt_offset < (UART_SERIAL_BUF_SIZE - 30U); i++) {
         uint16_t offset = (uint16_t)(2U + 36U + i * 2U);
-        pkt[pkt_offset++] = resp[offset];     /* 高字节 */
         pkt[pkt_offset++] = resp[offset + 1]; /* 低字节 */
+        pkt[pkt_offset++] = resp[offset];     /* 高字节 */
     }
 
-    /* 构建完整 TCP 帧: [端口,主协议,子协议,0x0A,分机号,len(2B),link_mask(4B),曲线包] */
+    /* 构建完整 TCP 帧: [端口,主协议,子协议,帧标志(0x0B站台门/0x0A站场联),分机号,len(2B),link_mask(4B),曲线包] */
     if (pkt_offset > 8U) {
         uint8_t *frame = (uint8_t *)&SerialDataBuf[port_idx][0];
+        uint8_t  module_type;
         uint16_t f_len;
 
+        /* 帧标志: 站台门(ZTM,0x51)曲线帧=0x0B, 站场联(ZCL,0x52)曲线帧=0x0A */
+        module_type = BoardCfgTab[port_idx].SlaveModuelType[module_idx];
         frame[0] = (uint8_t)(port_idx + 1U);
         frame[1] = BoardCfgTab[port_idx].MainProType;
         frame[2] = BoardCfgTab[port_idx].SubProType;
-        frame[3] = 0x0A;                                     /* 帧标志: 曲线帧 */
+        frame[3] = (module_type == FLFXG_DC3WIRE_ZTM) ? 0x0BU : 0x0AU;
         frame[4] = BoardCfgTab[port_idx].FenjiNum;
         *((uint16_t *)&frame[5]) = (uint16_t)(pkt_offset + 4U);
         *((uint32_t *)&frame[7]) = link_mask;

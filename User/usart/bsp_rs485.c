@@ -223,11 +223,11 @@ static const UART_ModuleProfile_t uart_module_profiles[] = {
     /* S700K_C_HIGH: 高频四线制交流道岔, 44 个寄存器 (88 字节实时值), 4 分支 */
     {FLFXG_S700K_C_HIGH,  44, 42,   0,     1,      88,     100,      98,      90,       92,       300,     4},
     /* ---- 防雷分线柜模块 ---- */
-    /* Axle Counter: 计轴采集传感器, 14 寄存器(28B), 带报警(KGL开关量), 非标准Modbus */
-    {FLFXG_AXLE_COUNTER,       14, 0,    1,     0,      28,      0,       0,       0,        0,       0,       0},
-    /* DC3Wire: 直流3对线, 12寄存器(24B), 带报警(KGL开关量位), 非标准Modbus */
-    {FLFXG_DC3WIRE_ZTM,   12, 0,    1,     0,      24,      0,       0,       0,        0,       0,       0},
-    {FLFXG_DC3WIRE_ZCL,    12, 0,    1,     0,      24,      0,       0,       0,        0,       0,       0},
+    /* Axle Counter: 计轴采集传感器, 10 寄存器(20B), 带报警(KGL开关量), 非标准Modbus */
+    {FLFXG_AXLE_COUNTER,       10, 0,    1,     0,      20,      0,       0,       0,        0,       0,       0},
+    /* DC3Wire: 直流3对线, 10寄存器(20B), 带报警(KGL开关量位), 非标准Modbus */
+    {FLFXG_DC3WIRE_ZTM,   10, 0,    1,     0,      20,      0,       0,       0,        0,       0,       0},
+    {FLFXG_DC3WIRE_ZCL,    10, 0,    1,     0,      20,      0,       0,       0,        0,       0,       0},
     /* ---- 哨兵条目 (未匹配到类型时的回退) ---- */
     {0x00,           13, 11,   1,     0,      0,       0,       0,       0,        0,       0,       0}
 };
