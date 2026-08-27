@@ -128,9 +128,10 @@ typedef struct {
     uint16_t      *qx_buf;        /* SDRAM curve data base pointer             */
 } UART_PortRuntime_t;
 
-/* ---- 计轴模块通讯确认码状态 (每端口一份) ---- */
+/* ---- 计轴模块通讯状态 (每端口一份) ---- */
 typedef struct {
-    uint16_t comm_confirm[UART_MODULE_MAX_COUNT];   /* 上次收到的通讯确认码 */
+    uint16_t comm_confirm[UART_MODULE_MAX_COUNT];       /* 上次收到的通讯确认码 (采集盒一直累加, 回显做水位ACK) */
+    uint16_t pending_pulse_count[UART_MODULE_MAX_COUNT]; /* 要读取的脉冲个数 (reg13剩余未读数, 填请求帧第5-6字节) */
 } AxleCounterState_t;
 
 /* ---- 直流3对线模块曲线序号状态 ---- */

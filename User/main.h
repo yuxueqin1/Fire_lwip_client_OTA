@@ -77,6 +77,7 @@ void WatchDog_Clear(void);
 /* ???????????? */
 #define AXLE_REALTIME_REGS    10U
 #define AXLE_REALTIME_BYTES   (AXLE_REALTIME_REGS * 2U)  /* = 20 */
+#define AXLE_MAX_CHANNELS     8U    /* 计轴脉冲最大通道数 (实际 0,1,2, 留余量) */
 
 /* ??3???????????? */
 #define DC3WIRE_REALTIME_REGS   10U

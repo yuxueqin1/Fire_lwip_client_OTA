@@ -926,15 +926,25 @@ static void uart_custom_module_online(UART_PortRuntime_t *runtime,
     MBRegHoldingBuf[runtime->holding_base] |= (1U << module_idx);
 
     /*
-     * 交换字节序 (大端 → 小端) 并拷贝实时寄存器到 SDRAM.
-     * 数据从 resp[3] 开始 (跳过 addr + func + len = 3 字节).
+     * 计算寄存器数据在应答中的起始偏移 data_offset.
+     *  多数模块应答含 1 字节字节计数 len: [地址][0x03][len][寄存器...] → 从 resp[3] 开始;
+     *  S700K_C (0x3A) / S700K_C_HIGH (0x4E) 应答无字节计数字段:
+     *  [地址][0x03][44寄存器...][曲线帧标识][曲线帧序号][时间高字][时间低字][有效长度]...
+     *  → 从 resp[2] 开始.
+     *  由 curve_flag_offset = data_offset + realtime_bytes 的关系可统一推导:
+     *    带 len 的模块 data_offset = 3;  S700K 模块 data_offset = 2.
      */
+    uint16_t data_offset = (profile->uses_custom_curve != 0U)
+                         ? (uint16_t)(profile->curve_flag_offset - profile->realtime_bytes)
+                         : 3U;
+
+    /* 交换字节序 (大端 → 小端) 并拷贝实时寄存器到 SDRAM. */
     reg_count = profile->realtime_bytes / 2U;
-    memcpy(&runtime->ssz_buf[*dc_offset], &resp[3], profile->realtime_bytes);
+    memcpy(&runtime->ssz_buf[*dc_offset], &resp[data_offset], profile->realtime_bytes);
     uart_swap16(&runtime->ssz_buf[*dc_offset], reg_count);
 
     /*
-     * 拷贝 holding 寄存器 (从 resp[7] 开始, 跳过 addr+func+len=3 + status+alarm=4).
+     * 拷贝 holding 寄存器 (跳过前 2 个寄存器, 从 data_offset + 4 字节开始).
      */
     holding_pos = (uint16_t)(runtime->holding_base + 2U
                              + module_idx * UART_MODULE_DEFAULT_REGS);
@@ -943,7 +953,7 @@ static void uart_custom_module_online(UART_PortRuntime_t *runtime,
         if ((holding_pos + copy) > MB_REG_HOLDING_NREGS) {
             copy = (uint16_t)(MB_REG_HOLDING_NREGS - holding_pos);
         }
-        memcpy(&MBRegHoldingBuf[holding_pos], &resp[7], copy * 2U);
+        memcpy(&MBRegHoldingBuf[holding_pos], &resp[data_offset + 4U], copy * 2U);
     }
 
     *dc_offset += reg_count;
@@ -1176,7 +1186,7 @@ static void uart_check_port_error_and_arm(UART_PortRuntime_t *runtime)
 
 /*======================================================================*/
 /*  uart_axle_counter_module_exchange                                    */
-/*  构建 0x03 查询帧 [addr,03,comm_confirm(2B),00,00,CRC]                */
+/*  构建 0x03 查询帧 [addr,03,comm_confirm(2B),pulse_count(2B),CRC]     */
 /*  发送并接收应答 (写入 SerialDataBuf[port_idx][11])                     */
 /*======================================================================*/
 static uint16_t uart_axle_counter_module_exchange(uint8_t port_idx, uint8_t module_idx)
@@ -1187,19 +1197,21 @@ static uint16_t uart_axle_counter_module_exchange(uint8_t port_idx, uint8_t modu
     uint16_t rx_crc_calc, rx_crc_recv;
     uint8_t *resp;
     uint16_t comm_confirm;
+    uint16_t pulse_count;
 
     resp = (uint8_t *)&SerialDataBuf[port_idx][11];
 
-    /* 获取上次的通讯确认码 (首次 = 0x0000) */
+    /* 获取上次的通讯确认码 (首次 = 0x0000) 和要读取的脉冲个数 (首次 = 0) */
     comm_confirm = axle_counter_state[port_idx].comm_confirm[module_idx];
+    pulse_count  = axle_counter_state[port_idx].pending_pulse_count[module_idx];
 
-    /* 构建请求: [addr, 03, comm_confirm(2B), 00, 00, CRC] */
+    /* 构建请求: [addr, 03, comm_confirm(2B), pulse_count(2B), CRC] */
     tx_buf[0] = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx];
     tx_buf[1] = 0x03;
     tx_buf[2] = (uint8_t)((comm_confirm >> 8) & 0xFFU);
     tx_buf[3] = (uint8_t)(comm_confirm & 0xFFU);
-    tx_buf[4] = 0x00;    /* 脉冲个数 = 查询模式 (不清楚是否有脉冲) */
-    tx_buf[5] = 0x00;
+    tx_buf[4] = (uint8_t)((pulse_count >> 8) & 0xFFU);   /* 要读取的脉冲个数 (reg13剩余未读数, 首次/无脉冲=0) */
+    tx_buf[5] = (uint8_t)(pulse_count & 0xFFU);
     tx_crc    = uart_crc16(tx_buf, 6);
     tx_buf[6] = (uint8_t)(tx_crc & 0xFFU);
     tx_buf[7] = (uint8_t)((tx_crc >> 8) & 0xFFU);
@@ -1228,115 +1240,185 @@ static uint16_t uart_axle_counter_module_exchange(uint8_t port_idx, uint8_t modu
 /*  uart_axle_counter_upload_pulse                                       */
 /*  将传感器原始脉冲数据打包为 TCP 脉冲帧 (帧标志 0x09) 上传              */
 /*                                                                       */
-/*  TCP 脉冲数据包格式 (协议文档 Table 1.4):                              */
+/*  TCP 曲线数据包格式 (协议文档 Table 1.4):                              */
 /*    设备ID(1B) + 通道号(1B) + 时间戳秒(4B) + 时间戳毫秒(2B)            */
-/*    + 采集标志(1B) + 当前脉冲数量(2B)                                   */
-/*    + Σ(脉冲N_时间偏移(2B) + 脉冲N_采样点数(1B) + 采集值[n](1B×n))    */
+/*    + 结束标志(1B) + 当前包脉冲数(2B)=N                                 */
+/*    + Σ(脉冲N_点偏移(2B) + 脉冲N_包含点数(1B) + 采集值[k](1B×k))       */
+/*    头部时间戳 = 本组曲线起始时间, 各脉冲点偏移相对它计算               */
+/*  点偏移 = ((pulse_ts - curve_ts)×1000 + (pulse_tms - curve_ms)) / 4  */
 /*                                                                       */
-/*  时间偏移 = ((pulse_ts - curve_ts)×1000 + (pulse_tms - curve_ms)) / 4 */
+/*  采集盒的脉冲自带通道号, 且不一定都在同一个通道. 因此按通道分组:       */
+/*  每个出现过的通道单独发一个 0x09 帧 (帧头通道号 = 该帧的通道),         */
+/*  同一通道的脉冲合并进同一个帧, 各帧共享同一曲线起始时间戳.             */
+/*                                                                       */
+/*  缓冲复用: SerialDataBuf[port][11..] 前部放压缩记录区 base[0..rec_len),*/
+/*  帧区从 base[rec_len] 开始. 记录 = 源脉冲逐字节原样, 写指针始终比源读  */
+/*  指针低 ~32B, 不会覆盖未读源数据; 帧区与记录区不重叠. 任务栈仅384字,   */
+/*  故不使用大局部数组, 全部就地于 4KB 串口缓冲中完成.                    */
 /*======================================================================*/
 static void uart_axle_counter_upload_pulse(uint8_t port_idx, uint8_t module_idx,
                                            const uint8_t *pulse_data,
                                            uint16_t pulse_len, uint32_t link_mask)
 {
-    uint8_t  *pkt;
-    uint16_t  pkt_offset;
-    uint16_t  read_offset;
+    uint8_t  *base;                       /* SerialDataBuf[port][11..] 记录区+帧区共用 */
+    uint8_t   ch_list[AXLE_MAX_CHANNELS]; /* 去重后的通道号列表 */
+    uint8_t   ch_num = 0;                 /* 实际出现过的通道数 */
     uint16_t  pkt_pulse_count;
+    uint16_t  src_pos;                    /* 源脉冲块 / 记录区读指针 */
+    uint16_t  rec_len = 0;                /* 压缩记录区长度 */
     uint32_t  curve_unix;
     uint16_t  curve_ms;
-    uint16_t  p, i;
+    uint16_t  p, c, k;
 
     if ((pulse_data == NULL) || (pulse_len < 10U)) {
         return;
     }
 
+    base = (uint8_t *)&SerialDataBuf[port_idx][11];
+
     /* 读取"本包上报脉冲个数"(前2字节) */
     pkt_pulse_count = ((uint16_t)pulse_data[0] << 8) | (uint16_t)pulse_data[1];
-    read_offset = 2;
 
     /*
      * 从实时数据中提取曲线起始时间戳.
      * 实时数据已由 uart_axle_counter_online 写入 SerialDataBuf[port][11..].
      * 偏移: resp[2+4]=Uinx(4B), resp[2+22]=Uinx_ms(2B). (无byte_count)
+     * 必须先取出, 因为下面的压缩记录会覆盖 base[0..29].
      */
-    {
-        uint8_t *base = (uint8_t *)&SerialDataBuf[port_idx][11];
-        curve_unix = ((uint32_t)base[6]  << 24) | ((uint32_t)base[7]  << 16)
-                   | ((uint32_t)base[8]  << 8)  |  (uint32_t)base[9];
-        curve_ms   = ((uint16_t)base[24] << 8)  |  (uint16_t)base[25];
-    }
+    curve_unix = ((uint32_t)base[6]  << 24) | ((uint32_t)base[7]  << 16)
+               | ((uint32_t)base[8]  << 8)  |  (uint32_t)base[9];
+    curve_ms   = ((uint16_t)base[24] << 8)  |  (uint16_t)base[25];
 
-    /* 脉冲数据包写入 SerialDataBuf 中 (复用缓冲区) */
-    pkt = (uint8_t *)&SerialDataBuf[port_idx][11];
-    pkt_offset = 0;
+    /*
+     * 第一遍: 解析源脉冲块, 压缩复制为记录写入 base[0..rec_len).
+     * 记录 = 源脉冲逐字节原样 [秒(4)+毫秒(2)+通道(1)+点数(1)+采集值(n)].
+     * 同时统计出现过的通道号, 供按通道拆帧.
+     */
+    src_pos = 2;
+    for (p = 0; p < pkt_pulse_count && src_pos < pulse_len; p++) {
+        uint8_t  ch, size;
+        uint16_t plen;
 
-    for (p = 0; p < pkt_pulse_count && read_offset < pulse_len; p++) {
-        uint32_t pulse_ts;
-        uint16_t pulse_tms;
-        uint8_t  ch_no;
-        uint8_t  pulse_size;
-        int32_t  delta_s, delta_ms, total_ms;
-        uint32_t time_offset;
-
-        /* ---- 解析传感器脉冲结构 ---- */
-        pulse_ts   = ((uint32_t)pulse_data[read_offset]     << 24)
-                   | ((uint32_t)pulse_data[read_offset + 1] << 16)
-                   | ((uint32_t)pulse_data[read_offset + 2] << 8)
-                   |  (uint32_t)pulse_data[read_offset + 3];
-        pulse_tms  = ((uint16_t)pulse_data[read_offset + 4] << 8)
-                   |  (uint16_t)pulse_data[read_offset + 5];
-        ch_no      = pulse_data[read_offset + 6];
-        pulse_size = pulse_data[read_offset + 7];
-        read_offset += 8;
-
-        if ((uint16_t)(read_offset + pulse_size) > pulse_len) {
+        if ((uint16_t)(src_pos + 8U) > pulse_len) {
+            break;
+        }
+        ch   = pulse_data[src_pos + 6];
+        size = pulse_data[src_pos + 7];
+        plen = (uint16_t)(8U + size);
+        if ((uint16_t)(src_pos + plen) > pulse_len) {
             break;
         }
 
-        /* 时间偏移 = ((pulse_ts - curve_unix)×1000 + (pulse_tms - curve_ms)) / 4 */
-        delta_s  = (int32_t)(pulse_ts  - curve_unix);
-        delta_ms = (int32_t)(pulse_tms - curve_ms);
-        total_ms = delta_s * 1000 + delta_ms;
-        time_offset = (uint32_t)(total_ms / 4);
-
-        /* ---- 写入 TCP 脉冲数据包条目 ---- */
-        pkt[pkt_offset++] = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx]; /* 设备ID */
-        pkt[pkt_offset++] = ch_no;                          /* 通道号 */
-        pkt[pkt_offset++] = (uint8_t)(pulse_ts);            /* 时间戳(秒) 低字节在前 */
-        pkt[pkt_offset++] = (uint8_t)(pulse_ts >> 8);
-        pkt[pkt_offset++] = (uint8_t)(pulse_ts >> 16);
-        pkt[pkt_offset++] = (uint8_t)(pulse_ts >> 24);
-        pkt[pkt_offset++] = (uint8_t)(pulse_tms);           /* 时间戳(毫秒) 低字节在前 */
-        pkt[pkt_offset++] = (uint8_t)(pulse_tms >> 8);
-        pkt[pkt_offset++] = 0x01;                           /* 采集标志 = 1 (完成) */
-        pkt[pkt_offset++] = (uint8_t)(pulse_size & 0xFFU);  /* 当前脉冲数量(低) */
-        pkt[pkt_offset++] = (uint8_t)((pulse_size >> 8) & 0xFFU); /* 当前脉冲数量(高) */
-        pkt[pkt_offset++] = (uint8_t)(time_offset & 0xFFU); /* 时间偏移(低) */
-        pkt[pkt_offset++] = (uint8_t)((time_offset >> 8) & 0xFFU); /* 时间偏移(高) */
-        pkt[pkt_offset++] = pulse_size;                     /* 采样点数 */
-        for (i = 0; i < pulse_size; i++) {
-            pkt[pkt_offset++] = pulse_data[read_offset + i]; /* 采集值(×0.1V) */
+        /* 逐字节前向拷贝: 写指针恒低于读指针, 即使与自身源重叠也安全 */
+        for (k = 0; k < plen; k++) {
+            base[rec_len + k] = pulse_data[src_pos + k];
         }
-        read_offset += pulse_size;
+        rec_len += plen;
+        src_pos += plen;
+
+        /* 收集通道号 (去重) */
+        for (c = 0; c < ch_num; c++) {
+            if (ch_list[c] == ch) {
+                break;
+            }
+        }
+        if (c >= ch_num) {
+            if (ch_num < AXLE_MAX_CHANNELS) {
+                ch_list[ch_num++] = ch;
+            }
+        }
     }
 
-    /* ---- 构建完整 TCP 帧: [端口,主协议,子协议,0x09,分机号,len(2B),link_mask(4B),脉冲包] ---- */
-    if (pkt_offset > 0U) {
-        uint8_t *frame = (uint8_t *)&SerialDataBuf[port_idx][0];
-        uint16_t f_len;
+    /* 第二遍: 每个出现过的通道单独组一个 0x09 帧 */
+    for (c = 0; c < ch_num; c++) {
+        uint8_t  *frame = &base[rec_len]; /* 帧区, 与记录区 [0,rec_len) 不重叠 */
+        uint16_t  off = 0;                /* 帧内写偏移 (含11B TCP帧头) */
+        uint16_t  n = 0;                  /* 本帧实际脉冲数 N */
 
+        /* ---- TCP 帧头: [端口,主协议,子协议,0x09,分机号,len(2B),link_mask(4B)] ---- */
         frame[0] = (uint8_t)(port_idx + 1U);
         frame[1] = BoardCfgTab[port_idx].MainProType;
         frame[2] = BoardCfgTab[port_idx].SubProType;
-        frame[3] = 0x09;                                     /* 帧标志: 脉冲曲线帧 */
+        frame[3] = 0x09;                                   /* 帧标志: 脉冲曲线帧 */
         frame[4] = BoardCfgTab[port_idx].FenjiNum;
-        *((uint16_t *)&frame[5]) = (uint16_t)(pkt_offset + 4U); /* 数据长度 */
-        *((uint32_t *)&frame[7]) = link_mask;                /* 模块状态 */
+        *((uint32_t *)&frame[7]) = link_mask;              /* 模块状态 */
 
-        f_len = (uint16_t)(pkt_offset + 11U);
-        client_add_curve_to_tcp_send_buf(frame, f_len,
-                                         20U + port_idx * 6U);
+        /* ---- 曲线数据包头部 (协议表1.4, 每帧只写一次) ---- */
+        off = 11;
+        frame[off++] = BoardCfgTab[port_idx].SlaveModuelAddress[module_idx]; /* 设备ID */
+        frame[off++] = ch_list[c];                         /* 通道号: 本帧只含该通道 */
+        frame[off++] = (uint8_t)(curve_unix);              /* 时间戳(秒) 低字节在前 */
+        frame[off++] = (uint8_t)(curve_unix >> 8);
+        frame[off++] = (uint8_t)(curve_unix >> 16);
+        frame[off++] = (uint8_t)(curve_unix >> 24);
+        frame[off++] = (uint8_t)(curve_ms);                /* 时间戳(毫秒) 低字节在前 */
+        frame[off++] = (uint8_t)(curve_ms >> 8);
+        frame[off++] = 0x01;                               /* 结束标志 = 1 (曲线采集结束) */
+        off += 2;                                          /* 当前包脉冲数 N, 稍后回填 */
+
+        /* ---- 扫描记录区, 只取本通道的脉冲 ---- */
+        src_pos = 0;
+        while (src_pos < rec_len) {
+            uint32_t pulse_ts;
+            uint16_t pulse_tms;
+            uint8_t  size;
+            int32_t  delta_s, delta_ms, total_ms;
+            uint32_t time_offset;
+
+            if ((uint16_t)(src_pos + 8U) > rec_len) {
+                break;
+            }
+            if (base[src_pos + 6] != ch_list[c]) {
+                src_pos += (uint16_t)(8U + base[src_pos + 7]);
+                continue;
+            }
+
+            pulse_ts  = ((uint32_t)base[src_pos]     << 24)
+                      | ((uint32_t)base[src_pos + 1] << 16)
+                      | ((uint32_t)base[src_pos + 2] << 8)
+                      |  (uint32_t)base[src_pos + 3];
+            pulse_tms = ((uint16_t)base[src_pos + 4] << 8)
+                      |  (uint16_t)base[src_pos + 5];
+            size      = base[src_pos + 7];
+
+            /* 防溢出: 记录区 + 帧头 + 本脉冲体 需都落在 4KB 缓冲内 (receive rx_len <= 4085) */
+            if ((uint16_t)(rec_len + off + (uint16_t)(3U + size)) >
+                (uint16_t)(UART_SERIAL_BUF_SIZE - 11U)) {
+                break;
+            }
+
+            /* 点偏移 = ((pulse_ts - curve_unix)×1000 + (pulse_tms - curve_ms)) / 4 */
+            delta_s  = (int32_t)(pulse_ts  - curve_unix);
+            delta_ms = (int32_t)(pulse_tms - curve_ms);
+            total_ms = delta_s * 1000 + delta_ms;
+            time_offset = (uint32_t)(total_ms / 4);
+
+            /* ---- 写入脉冲体: [点偏移(2)][包含点数(1)][采集值×n] ---- */
+            frame[off++] = (uint8_t)(time_offset & 0xFFU);       /* 点偏移(低) */
+            frame[off++] = (uint8_t)((time_offset >> 8) & 0xFFU);/* 点偏移(高) */
+            frame[off++] = size;                                 /* 包含点数 */
+            for (k = 0; k < size; k++) {
+                frame[off++] = base[src_pos + 8 + k];            /* 采集值(×0.1V) */
+            }
+            n++;
+            src_pos += (uint16_t)(8U + size);
+        }
+
+        if (n == 0U) {
+            continue;
+        }
+        /* 防溢出: 记录区 + 本帧 需都落在 4KB 缓冲内 */
+        if ((uint16_t)(rec_len + off) > (uint16_t)(UART_SERIAL_BUF_SIZE - 11U)) {
+            continue;
+        }
+
+        /* 回填当前包脉冲数 N (曲线包内偏移9-10, 小端) */
+        frame[20] = (uint8_t)(n & 0xFFU);
+        frame[21] = (uint8_t)((n >> 8) & 0xFFU);
+        /* 数据长度 = 曲线数据包长度 + 4 (模块状态) */
+        *((uint16_t *)&frame[5]) = (uint16_t)(off - 7U);
+
+        client_add_curve_to_tcp_send_buf(frame, off, 20U + port_idx * 6U);
     }
 }
 
@@ -1347,8 +1429,9 @@ static void uart_axle_counter_upload_pulse(uint8_t port_idx, uint8_t module_idx,
 /*  1. 清除错误计数, 设置在线位                                          */
 /*  2. 提取实时数据 (28 字节) 到 SDRAM                                  */
 /*  3. 检查 KGL 报警位, 更新 ALARM_TEMP                                 */
-/*  4. 保存通讯确认码 (寄存器 12)                                        */
-/*  5. 检查未读脉冲数 → 触发脉冲上传                                     */
+/*  4. 保存通讯确认码 (寄存器 12, 一直累加, 回显做水位ACK)              */
+/*  5. reg13剩余未读数 → 记录下次请求要读的脉冲个数                      */
+/*  6. 本次请求带了脉冲个数时, 应答里含脉冲块 → 解析上传                 */
 /*======================================================================*/
 static void uart_axle_counter_online(UART_PortRuntime_t *runtime,
                                      uint8_t module_idx, uint16_t rx_len,
@@ -1358,6 +1441,7 @@ static void uart_axle_counter_online(UART_PortRuntime_t *runtime,
     uint16_t comm_confirm;
     uint16_t unread_pulses;
     uint16_t kgl_val;
+    uint16_t requested;
 
     runtime->module_error[module_idx] = 0;
     runtime->link_mask |= (1UL << module_idx);
@@ -1377,36 +1461,40 @@ static void uart_axle_counter_online(UART_PortRuntime_t *runtime,
         ALARM_TEMP[runtime->port_idx] &= ~(1UL << module_idx);
     }
 
+    /* ---- 本次请求帧第5-6字节带的脉冲个数 (决定本条应答是否含脉冲块) ---- */
+    requested = axle_counter_state[runtime->port_idx].pending_pulse_count[module_idx];
+
     /* ---- 读取通讯确认码 (寄存器12, resp offset 2+24=26) ---- */
     comm_confirm = ((uint16_t)resp[26] << 8) | (uint16_t)resp[27];
 
     /* ---- 检查未读脉冲数 (寄存器13, resp offset 2+26=28) ---- */
     unread_pulses = ((uint16_t)resp[28] << 8) | (uint16_t)resp[29];
 
-    if (unread_pulses > 0U) {
-        /*
-         * 有脉冲: 保存本次的通讯确认码, 下次请求帧带上此值作为 ACK,
-         * 告诉采集器"已收到脉冲数据, 可以清除缓存".
-         */
-        axle_counter_state[runtime->port_idx].comm_confirm[module_idx] = comm_confirm;
+    /*
+     * 通讯确认码一直累加: 总是保存最新值, 下次请求帧第3-4字节原样带回 (水位ACK).
+     * 采集器靠回显值判断通信板已收到到哪一帧, 从而清除已确认的脉冲缓存.
+     */
+    axle_counter_state[runtime->port_idx].comm_confirm[module_idx] = comm_confirm;
 
-        /*
-         * 脉冲数据位于 resp[30] 之后.
-         * resp[0..1]=头(2B), resp[2..29]=实时数据(28B),
-         * resp[30..]=脉冲块(pulse_count+events), resp[last-2..last-1]=CRC.
-         * 脉冲数据长度 = rx_len - 2(头) - 28(实时) - 2(CRC) = rx_len - 32.
-         */
+    /*
+     * 只有本次请求带了脉冲个数 (>0) 时, 本条应答里才有脉冲块.
+     * 脉冲数据位于 resp[30] 之后:
+     * resp[0..1]=头(2B), resp[2..29]=实时数据(28B),
+     * resp[30..]=脉冲块(pulse_count+events), resp[last-2..last-1]=CRC.
+     * 脉冲数据长度 = rx_len - 2(头) - 28(实时) - 2(CRC) = rx_len - 32.
+     */
+    if (requested > 0U) {
         uart_axle_counter_upload_pulse(runtime->port_idx, module_idx,
                                        &resp[30],
                                        (uint16_t)(rx_len - 32U),
                                        runtime->link_mask);
-    } else {
-        /*
-         * 无脉冲: 通讯确认码清零, 下次请求帧填 0x0000 (普通查询),
-         * 表示"未收到脉冲"或"不需要采集器删除缓存".
-         */
-        axle_counter_state[runtime->port_idx].comm_confirm[module_idx] = 0x0000;
     }
+
+    /*
+     * 剩余未读脉冲数 (reg13) 作为下次请求帧第5-6字节继续读取,
+     * 为 0 时下次就是普通查询 (第5-6字节 = 0).
+     */
+    axle_counter_state[runtime->port_idx].pending_pulse_count[module_idx] = unread_pulses;
 
     *dc_offset += AXLE_REALTIME_REGS;
 }
