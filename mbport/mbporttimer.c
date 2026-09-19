@@ -18,7 +18,19 @@
 #include "mbframe.h"
 #include "mbutils.h"
 
-#define MAX_TIMER_HDLS                  ( 13 )
+/*
+ * 定时器句柄池容量 (主站/从站共用同一个池).
+ * 每个 Modbus RTU 实例占 2 个句柄:
+ *   主站: 应答超时定时器 (mbm.c pxMBMGetNewHdl) + T3.5 字符定时器 (mbmrtu.c)
+ *   从站: T3.5 字符定时器 + 发送后等待定时器 (MBS_RTU_WAITAFTERSEND_ENABLED=1)
+ * 本板最多同时存在 7 个实例 (6 路端口 + 第 7 路 RS485), 故需 7×2 = 14 个,
+ * 原值 13 是容量不足的隐患, 这里留到 16.
+ *
+ * 注意: 端口"无模块数据"的故障根因不是本池, 而是 mbportevent.c 的
+ * MAX_EVENT_HDLS (原值 4). pxMBMGetNewHdl 先申请应答超时定时器, 再申请
+ * 事件句柄, 事件池只有 4 个时第 5 个实例在此失败 —— 定时器池改大无效果.
+ */
+#define MAX_TIMER_HDLS                  ( 16 )
 #define IDX_INVALID                     ( 255 )
 #define TIMER_TIMEOUT_INVALID           ( 65535U )
 

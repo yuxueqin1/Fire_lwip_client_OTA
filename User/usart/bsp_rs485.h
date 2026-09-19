@@ -65,6 +65,8 @@ typedef struct {
 #define FLFXG_DC3WIRE_ZTM      0x51    /* 站台门采集 WBTQ802JH-1B3 */
 #define FLFXG_DC3WIRE_ZCL       0x52    /* 站场联采集 WBTQ402JH-1B3 */
 
+#define FLFXG_AXLE_COUNTER_HIGH      0x53    /* 高频计轴采集传感器 WBTQ301JH-1B3 */
+
 /* SDRAM curve buffer layout */
 /* Realtime data (SSZ): port_idx * 0x1000 bytes from SDRAM_BASE_ADDR */
 /* Curve data (QX):    per port, per module 0x1000 bytes blocks */
@@ -120,6 +122,9 @@ typedef struct {
     uint8_t        port_idx;
     xMBMHandle     xMBMaster;
     uint8_t        module_error[UART_MODULE_MAX_COUNT];
+    /* 离线跳过计数: 连续3次失败(module_error>=3)后跳过等待, 0=正常,
+     * 1..10=跳过状态下累计周期, ≥10 时本轮探测一次 (≈10s) */
+    uint8_t        skip_probe_count[UART_MODULE_MAX_COUNT];
     uint8_t        port_error;
     uint16_t       holding_base;
     uint32_t       link_mask;
@@ -140,9 +145,12 @@ typedef struct {
 } DC3WireState_t;
 
 /* ---- UART RX 环形缓冲区 (中断驱动接收, 防抢占丢字节) ----
+ * 任务侧在 uart_custom_exchange 中流式排空 (边收边搬进 rx_buf), 本 ring 只是
+ * 抖动缓冲, 只需吸收"任务被抢占"期间的来字节, 不承担缓存整帧的职责.
+ * 因此单帧长度上限 = 调用方传入的 rx_max_len, 与 UART_RX_RING_SIZE 无关.
  * 字段按对齐要求从大到小排列, 保证零内部填充, 结构体大小确定 524 字节.
  * 注意: 修改此处时必须同步更新 mbport/mbportserial.c 中的同名定义. */
-#define UART_RX_RING_SIZE           512      /* 足够容纳最大曲线帧(~190B) */
+#define UART_RX_RING_SIZE           512      /* 抖动缓冲: 吸收任务调度延迟 */
 typedef struct {
     uint8_t  buffer[UART_RX_RING_SIZE]; /* 512 B                        */
     uint32_t last_byte_tick;            /*   4 B, offset 512 (512%4=0)  */

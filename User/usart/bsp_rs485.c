@@ -228,6 +228,8 @@ static const UART_ModuleProfile_t uart_module_profiles[] = {
     /* DC3Wire: 直流3对线, 10寄存器(20B), 带报警(KGL开关量位), 非标准Modbus */
     {FLFXG_DC3WIRE_ZTM,   10, 0,    1,     0,      20,      0,       0,       0,        0,       0,       0},
     {FLFXG_DC3WIRE_ZCL,    10, 0,    1,     0,      20,      0,       0,       0,        0,       0,       0},
+    /* ---- 防雷分线柜模块（高频） ---- */
+    {FLFXG_AXLE_COUNTER_HIGH,   28, 0,    1,     0,      56,      0,       0,       0,        0,       0,       0},
     /* ---- 哨兵条目 (未匹配到类型时的回退) ---- */
     {0x00,           13, 11,   1,     0,      0,       0,       0,       0,        0,       0,       0}
 };
@@ -773,7 +775,18 @@ uint16_t uart_custom_exchange(uint8_t port_idx, const uint8_t *tx_buf, uint16_t 
     }
     uart_custom_tx[port_idx].tx_active = 0;
 
-    /* ---- 步骤 6-7: 中断驱动接收 (ring buffer + vTaskDelay, 彻底消除 ORE) ---- */
+    /* ---- 纯发送调用 (rx_buf==NULL, 如校时命令不期待应答): 直接返回 ----
+     * 修复: 原逻辑即使 rx_buf==NULL 也会进入下方"等待首字节"循环, 白等
+     *       first_byte_timeout_ms(100ms) 才超时返回, 校时期间每模块浪费100ms.
+     *       此处关闭接收窗口后立即返回, 残余应答字节由下一次交换前的
+     *       排空循环 (上方 DR 循环) 清掉. */
+    if (rx_buf == NULL) {
+        __HAL_UART_DISABLE_IT(huart, UART_IT_RXNE);
+        uart_rx_ring[port_idx].rx_active = 0;
+        return 0U;
+    }
+
+    /* ---- 步骤 6-7: 中断驱动接收 (ring buffer 流式排空 + vTaskDelay) ---- */
     /*
      * ring buffer 已由 TC 中断复位并开启 RXNEIE (见 mbportserial.c 自定义分支),
      * 此处只等待数据, 不再重复初始化 ring —— 避免任务在 vTaskDelay 醒来后重新
@@ -781,12 +794,29 @@ uint16_t uart_custom_exchange(uint8_t port_idx, const uint8_t *tx_buf, uint16_t 
      * 首字节由 first_byte_timeout_ms 兜底; 帧结束按 inter_byte_timeout_ms 字节
      * 间隔超时判定 (与 Modbus T3.5 同理). 任务全程 vTaskDelay 让出 CPU, 不会
      * 与同优先级任务互相抢占导致 ORE 丢字节.
+     *
+     * [为什么改成流式排空] 原实现是"整帧收完再从 ring 拷到 rx_buf": 接收期间
+     *   任务只等 ring->count 停止增长, 一个字节都不搬走, 因此 ring 必须能装下
+     *   "完整一帧", 单帧长度被死死限制在 UART_RX_RING_SIZE (512B). 计轴脉冲
+     *   帧(应答 = 2B头 + 寄存器块 + 脉冲块 + 2B CRC, 高频计轴 0x53 光寄存器块
+     *   就 64B, 再按 reg13 一次性回多个脉冲)轻易超过 512B, ISR 在 ring 满后
+     *   静默丢字节 (见 mbportserial.c 的 count 上限判断) → 帧尾 CRC 丢失 →
+     *   整帧 CRC 校验失败 → 上层按"模块离线"处理 → 应答里的通讯确认码根本没
+     *   读到, 水位 ACK 永远不推进 → 采集盒不清脉冲缓存 → 下一轮回同样的超长
+     *   帧 → 永久死锁.
+     * [怎么改] 每轮循环把 ring 里已到的字节立刻搬进 rx_buf 并推进 tail, 腾出
+     *   ring 空间; ring 退化为抖动缓冲, 只用于吸收任务调度延迟, 单帧长度不再
+     *   受 UART_RX_RING_SIZE 限制 (上限变为调用方给的 rx_max_len).
+     * [帧结束判定] 不能再用 ring->count 判断"是否有新字节" —— count 会被本循环
+     *   搬走而减小. 改用"累计到达字节数" = copied + ring->count, 其在搬空 ring
+     *   后保持恒定, 只有 ISR 收入新字节时才增长.
      */
     {
         UART_RxRing_t *ring = &uart_rx_ring[port_idx];
         uint32_t       start_tick;
         uint32_t       last_byte_tick;
-        uint16_t       prev_count;
+        uint16_t       arrived;      /* 上一轮采样到的"累计到达字节数" */
+        uint16_t       copied = 0U;  /* 已经搬进 rx_buf 的字节数        */
 
         /* 等待首字节 (first_byte_timeout_ms 超时) */
         start_tick = HAL_GetTick();
@@ -799,32 +829,55 @@ uint16_t uart_custom_exchange(uint8_t port_idx, const uint8_t *tx_buf, uint16_t 
             vTaskDelay(pdMS_TO_TICKS(1));
         }
 
-        /* 等待后续字节 (inter_byte_timeout_ms 字节间隔超时 = 帧结束) */
         last_byte_tick = HAL_GetTick();
-        prev_count     = ring->count;
-        while (ring->count < rx_max_len) {
-            if (ring->count != prev_count) {
-                /* 有新字节到达, 重置超时计时器 */
-                last_byte_tick = HAL_GetTick();
-                prev_count     = ring->count;
-            } else if ((HAL_GetTick() - last_byte_tick) > inter_byte_timeout_ms) {
-                /* 字节间隔超时 → 帧接收完成 */
+        arrived        = ring->count;
+
+        for (;;) {
+            /* ① 流式排空: 把 ring 中已到的字节搬进 rx_buf 并推进 tail.
+             *    tail/count 的读改写必须与 ISR 的 count++ 互斥, 否则本循环的
+             *    "读 count → 减 1 → 写回" 若被 ISR 的 "读 count → 加 1 → 写回"
+             *    打断, 会丢掉一次递增, head/tail/count 三者关系错乱.
+             *    UART 中断优先级为 2, 高于 configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY
+             *    (5), taskENTER_CRITICAL() 的 BASEPRI 屏蔽不到它, 只能用 PRIMASK
+             *    全屏蔽 (临界区仅 3 条指令, 对 19200baud 的字节间隔无影响). */
+            while ((ring->count > 0U) && (copied < rx_max_len)) {
+                uint8_t  byte_in = ring->buffer[ring->tail];
+                uint32_t primask = __get_PRIMASK();
+
+                __disable_irq();
+                ring->tail = (uint16_t)((ring->tail + 1U) % UART_RX_RING_SIZE);
+                ring->count--;
+                __set_PRIMASK(primask);
+
+                rx_buf[copied++] = byte_in;
+                last_byte_tick   = HAL_GetTick();
+            }
+
+            /* ② rx_buf 已满: 不能再收, 结束本次交换 (调用方按截断帧处理) */
+            if (copied >= rx_max_len) {
                 break;
             }
+
+            /* ③ 帧结束判定 (inter_byte_timeout_ms 字节间隔超时) */
+            {
+                uint16_t now_arrived = (uint16_t)(copied + ring->count);
+
+                if (now_arrived != arrived) {
+                    /* 有新字节到达, 重置超时计时器 */
+                    arrived        = now_arrived;
+                    last_byte_tick = HAL_GetTick();
+                } else if ((HAL_GetTick() - last_byte_tick) > inter_byte_timeout_ms) {
+                    /* 字节间隔超时 → 帧接收完成 */
+                    break;
+                }
+            }
+
             vTaskDelay(pdMS_TO_TICKS(1));
         }
 
-        rx_len = ring->count;
+        rx_len = copied;
         __HAL_UART_DISABLE_IT(huart, UART_IT_RXNE);
         ring->rx_active = 0;   /* 通知 ISR: 接收完毕 */
-
-        /* 从 ring buffer 拷贝到 rx_buf (纯发送调用 rx_buf==NULL, 不拷贝) */
-        if (rx_buf != NULL) {
-            uint16_t _i;
-            for (_i = 0; _i < rx_len; _i++) {
-                rx_buf[_i] = ring->buffer[(ring->tail + _i) % UART_RX_RING_SIZE];
-            }
-        }
     }
 
     return rx_len;

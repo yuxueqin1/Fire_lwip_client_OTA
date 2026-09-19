@@ -71,15 +71,16 @@ void WatchDog_Clear(void);
 #define  MB_REG_INPUT_NREGS						50
 
 /*======================================================================*/
-/*  ???? (PortType = 0x07) � ????                                 */
+/*  计轴采集协议 (PortType = 0x07) 相关常量                             */
+/*  实时寄存器个数由模块类型决定, 取自 uart_module_profiles[]:          */
+/*    普通计轴 0x50 = 10 寄存器 / 20 字节                               */
+/*    高频计轴 0x53 = 28 寄存器 / 56 字节                               */
+/*  故不再定义固定的 AXLE_REALTIME_REGS / AXLE_REALTIME_BYTES.          */
 /*======================================================================*/
 
-/* ???????????? */
-#define AXLE_REALTIME_REGS    10U
-#define AXLE_REALTIME_BYTES   (AXLE_REALTIME_REGS * 2U)  /* = 20 */
 #define AXLE_MAX_CHANNELS     8U    /* 计轴脉冲最大通道数 (实际 0,1,2, 留余量) */
 
-/* ??3???????????? */
+/* 直流3对线协议 (PortType = 0x08) 相关常量 */
 #define DC3WIRE_REALTIME_REGS   10U
 #define DC3WIRE_REALTIME_BYTES  (DC3WIRE_REALTIME_REGS * 2U)  /* = 20 */
 

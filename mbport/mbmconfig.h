@@ -17,7 +17,11 @@ PR_BEGIN_EXTERN_C
 #define MBM_ASCII_ENABLED                       ( 0)
 #define MBM_RTU_ENABLED                         ( 1 )
 #define MBM_TCP_ENABLED                         ( 0 )
-#define MBM_DEFAULT_RESPONSE_TIMEOUT            ( 1000)
+/* Modbus 主站应答超时.
+ * 200ms: 最小波特率 19200 下最大应答 (133寄存器×2=266B + 5B头/CRC ≈ 271B)
+ *        传输需 ≈155ms, 留 45ms 余量. 离线从机连续 3 次失败后由
+ *        uart_module_should_poll 跳过等待, 不再受此超时拖累. */
+#define MBM_DEFAULT_RESPONSE_TIMEOUT            ( 200)
 #define MBM_SERIAL_RTU_MAX_INSTANCES            ( 7 )
 #define MBM_SERIAL_ASCII_MAX_INSTANCES          ( 2 )
 #define MBM_TCP_MAX_INSTANCES                   ( 0 )

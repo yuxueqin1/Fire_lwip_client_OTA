@@ -21,6 +21,9 @@
 
 /*
  * 自定义串口 RX 环形缓冲区 (与 bsp_rs485.h 完全一致, 524 字节).
+ * head/count 只由本文件的 RXNE 中断写, tail 只由任务侧
+ * (uart_custom_exchange 的流式排空循环) 写, 两者的 count 读改写互斥由任务侧
+ * 用 PRIMASK 保证 (UART 中断优先级 2 高于 FreeRTOS 临界区屏蔽级 5).
  * 注意: 修改此处时必须同步更新 bsp_rs485.h 中的 UART_RxRing_t.
  */
 #define UART_RX_RING_SIZE           512
@@ -466,6 +469,10 @@ static void prvUARTIRQHandler( xSerialPortInternal *pxSerial )
                 {
                     uint8_t _byte = ( uint8_t )( pxSerial->huart.Instance->DR & 0xFFU );
                     UART_RxRing_t *_ring = &uart_rx_ring[_port];
+                    /* ring 由任务侧流式排空, 正常情况绝不会满; 走到 else 说明任务
+                     * 被抢占的时长超过了 ring 能吸收的字节数 (512B @19200 ≈ 270ms),
+                     * 该字节连同后续字节丢失 → 帧 CRC 失败. 属异常调度, 需查任务
+                     * 优先级/长时间阻塞点, 不要靠加大 ring 掩盖. */
                     if( _ring->count < UART_RX_RING_SIZE )
                     {
                         _ring->buffer[_ring->head] = _byte;
