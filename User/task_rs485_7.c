@@ -10,6 +10,7 @@
   *  主机模式业务逻辑:
   *    1. 计算本板报警状态 (基于6路端口的 ALARM 变量)
   *    2. FC 03 读取从机通信板报警状态 (Modbus地址1)
+  *       — 单板现场自动识别"无从机板", 不再误报 (见 poll_slave_comm_board)
   *    3. FC 02 读取IO联网模块 DI0(切断开关)/DI1(断接开关) (Modbus地址4)
   *    4. 根据报警真值表计算 蜂鸣器/报警灯/工作灯 状态
   *    5. FC 05 写入IO联网模块 DO0(工作灯)/DO1(蜂鸣器)/DO2(报警灯)
@@ -47,6 +48,17 @@
 #define RS485_7_INIT_RETRY_DELAY_MS   200U   /* 快速重试间隔 (ms)          */
 #define RS485_7_INIT_RECOVER_DELAY_MS 5000U  /* 之后慢速自恢复间隔 (ms)    */
 
+/* ---- 从机通信板在位探测 ----
+ * 单板现场(总线上只有本板, 没有从机通信板)下, FC03 永远无人应答.
+ * 原实现把"无应答"一律当作报警 → 报警灯常亮/蜂鸣器长鸣, 属于误报.
+ * 现改为自动识别:
+ *   上电后连续 RS485_7_SLAVE_DETECT_ROUNDS 轮 FC03 全部失败 → 判定"从机板不存在",
+ *   此后不再因它报警, 降到每 RS485_7_SLAVE_PROBE_INTERVAL 轮探测一次以便自动恢复.
+ * 注意: 纯 Modbus 超时无法区分"从机板没接"和"从机板坏了", 两者都判为"不存在".
+ * 一旦确认在线过, 之后掉线仍按故障报警(见 poll_slave_comm_board), 保持 fail-safe. */
+#define RS485_7_SLAVE_DETECT_ROUNDS   3U     /* 连续失败N轮 → 判定不存在   */
+#define RS485_7_SLAVE_PROBE_INTERVAL  10U    /* 不在位时每N轮探测一次      */
+
 /* ============================================================================
  *  文件级静态变量
  *  ==========================================================================*/
@@ -63,6 +75,11 @@ static uint8_t  s_work_light        = 0;    /* DO0: 工作灯         */
 static uint8_t  s_buzzer            = 0;    /* DO1: 蜂鸣器         */
 static uint8_t  s_alarm_light       = 0;    /* DO2: 报警灯         */
 
+/* —— 从机通信板在位状态 —— */
+static uint8_t  s_slave_board_present = 0;  /* 0=未确认/不存在, 1=已确认在线 */
+static uint8_t  s_slave_board_fail    = 0;  /* 探测期连续失败轮数            */
+static uint8_t  s_slave_board_probe   = 0;  /* 不在位时的降频探测计数        */
+
 /* ============================================================================
  *  全局变量定义 (供外部模块读取串口7的IO状态)
  *  ==========================================================================*/
@@ -73,6 +90,7 @@ uint8_t g_rs485_7_io_break     = 0;
 uint8_t g_rs485_7_work_light   = 0;
 uint8_t g_rs485_7_buzzer       = 0;
 uint8_t g_rs485_7_alarm_light  = 0;
+uint8_t g_rs485_7_slave_present = 0;  /* 1=已确认从机通信板在线 (用于现场诊断) */
 
 /* ============================================================================
  *  全局句柄 (用于主/从模式)
@@ -190,6 +208,7 @@ static void sync_global_variables(void)
     g_rs485_7_work_light   = s_work_light;
     g_rs485_7_buzzer       = s_buzzer;
     g_rs485_7_alarm_light  = s_alarm_light;
+    g_rs485_7_slave_present = s_slave_board_present;
 }
 
 /* ============================================================================
@@ -272,23 +291,83 @@ static eMBException slave7_input_cb(UBYTE *pubRegBuffer, USHORT usAddress,
 
 /**
  * @brief  读取从机通信板报警状态 (FC 03, 地址1)
- * @note   成功时读取寄存器值作为报警状态
- *         通信失败(超时/CRC错等)时直接置 alarm=1:
- *           从机板失联本身就是故障, 应触发报警
+ * @return 1=通信成功(已刷新 s_remote_board_alarm), 0=失败(超时/CRC错)
+ * @note   只负责通信与取值, 是否报警由调用方 poll_slave_comm_board()
+ *         按"从机板是否在位"决定
  */
-static void master_read_slave_board(void)
+static uint8_t master_read_slave_board(void)
 {
-    USHORT regs[2] = {0};
+    USHORT regs[1] = {0};
     eMBErrorCode eStatus;
 
     eStatus = eMBMReadHoldingRegisters(xMBMaster7, (UCHAR)RS485_7_SLAVE_COMM_ADDR,
                                        (USHORT)SLAVE_REG_ALARM_STATUS,
                                        (UBYTE)1, regs);
-    if (eStatus == MB_ENOERR) {
-        s_remote_board_alarm = (uint8_t)(regs[0] & 0x0001U);
-    } else {
-        /* 从机板通信失败 → 直接视为报警 */
-        s_remote_board_alarm = 1U;
+    if (eStatus != MB_ENOERR) {
+        return 0U;
+    }
+
+    s_remote_board_alarm = (uint8_t)(regs[0] & 0x0001U);
+    return 1U;
+}
+
+/**
+ * @brief  从机通信板在位探测 + 报警状态更新
+ * @note   三态状态机 (仅主机模式调用):
+ *
+ *   ① 未确认在位 (上电初始, s_slave_board_present=0):
+ *        每轮探测. 连续 RS485_7_SLAVE_DETECT_ROUNDS 轮失败 →
+ *        判定"从机板不存在", s_remote_board_alarm 强制清零, 转 ②.
+ *        探测期内不报警 —— 因为探测期只可能出现在"从一开始就没有从机板"的
+ *        现场, 此时报警属于误报; 有从机板的现场第一轮就会成功, 不会进入此分支.
+ *
+ *   ② 已判定不存在:
+ *        降到每 RS485_7_SLAVE_PROBE_INTERVAL 轮探测一次, 不报警.
+ *        一旦探到(现场补装了从机板) → 立即转 ③.
+ *
+ *   ③ 已确认在线:
+ *        每轮轮询. 掉线 → s_remote_board_alarm=1 报警 (fail-safe, 与原逻辑一致).
+ *        注意 ③ 不会再退回 ②, 即"曾经有过从机板"的现场, 从机板永久失效会持续
+ *        报警 —— 这是刻意的安全侧行为, 需复位才能重新进入 ① 重新学习.
+ */
+static void poll_slave_comm_board(void)
+{
+    if (s_slave_board_present) {
+        /* ③ 已确认在线: 每轮轮询, 掉线即报警 */
+        if (master_read_slave_board()) {
+            s_slave_board_fail = 0U;
+        } else {
+            s_remote_board_alarm = 1U;
+        }
+        return;
+    }
+
+    if (s_slave_board_fail < RS485_7_SLAVE_DETECT_ROUNDS) {
+        /* ① 探测期: 每轮探测 */
+        if (master_read_slave_board()) {
+            s_slave_board_present = 1U;
+            s_slave_board_fail    = 0U;
+            s_slave_board_probe   = 0U;
+            printf("[RS485-7] Slave comm board FOUND (addr=%u)\r\n",
+                   RS485_7_SLAVE_COMM_ADDR);
+        } else if (++s_slave_board_fail >= RS485_7_SLAVE_DETECT_ROUNDS) {
+            s_remote_board_alarm = 0U;   /* 单板现场: 不因从机板报警 */
+            printf("[RS485-7] Slave comm board NOT PRESENT, alarm disabled\r\n");
+        }
+        return;
+    }
+
+    /* ② 已判定不存在: 降频探测, 不报警 */
+    if (++s_slave_board_probe < RS485_7_SLAVE_PROBE_INTERVAL) {
+        return;
+    }
+    s_slave_board_probe = 0U;
+
+    if (master_read_slave_board()) {
+        s_slave_board_present = 1U;
+        s_slave_board_fail    = 0U;
+        printf("[RS485-7] Slave comm board FOUND (recovered, addr=%u)\r\n",
+               RS485_7_SLAVE_COMM_ADDR);
     }
 }
 
@@ -410,8 +489,9 @@ static void rs485_7_task_handler(void *pvParameters)
             /* 步骤1: 更新本板报警 */
             s_local_board_alarm = compute_local_board_alarm();
 
-            /* 步骤2: 读取从机通信板报警 (FC 03, 地址1) */
-            master_read_slave_board();
+            /* 步骤2: 从机通信板在位探测 + 报警状态更新 (FC 03, 地址1)
+             *        单板现场自动判定"从机板不存在"并停止报警 */
+            poll_slave_comm_board();
 
             /* 步骤3: 读取IO模块DI (FC 02, 地址4) */
             master_read_io_module_di();

@@ -46,6 +46,7 @@ extern uint8_t g_rs485_7_io_break;       /* 断接开关状态 (仅主机有效)
 extern uint8_t g_rs485_7_work_light;     /* 工作灯状态 (仅主机有效)     */
 extern uint8_t g_rs485_7_buzzer;         /* 蜂鸣器状态 (仅主机有效)     */
 extern uint8_t g_rs485_7_alarm_light;    /* 报警灯状态 (仅主机有效)     */
+extern uint8_t g_rs485_7_slave_present;  /* 1=已确认从机通信板在线 (现场诊断用) */
 
 /* ---- 函数声明 ---- */
 void rs485_7_task_create(void);
