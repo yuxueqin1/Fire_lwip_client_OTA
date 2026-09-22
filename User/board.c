@@ -495,8 +495,12 @@ void BSP_Init(void)
   EEPROM_Init();    /* AT24C64D I2C EEPROM init (PB5=WP, PB6=SCL, PB7=SDA) */
   /* ---- 临时: EEPROM AT24C64D 诊断测试 (通过后可删除) ---- */
 //   EEPROM_Test();
-  /* ��ʼ��UART7 (PF6-RX, PF7-TX), 115200 8-N-1, 用于 printf 调试输出 */
+  /* 调试串口: USART6, PC6=TX / PC7=RX / PC8=DE, 115200 8-N-1, 用于 printf 输出。
+   * ⚠ 它与 RS485 第5路共用同一个 USART6, 发布版必须关闭 —— 详见
+   *   bsp_debug_usart.h 里 DEBUG_UART_ENABLE 的说明。 */
+#if DEBUG_UART_ENABLE
   DEBUG_USART_Config();
+#endif
   DIP_SWITCH_Config();
   WDI_GPIO_Init();
   WatchDog_Clear();

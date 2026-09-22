@@ -11,9 +11,15 @@ rem    built twice with different link addresses. The only differences:
 rem      LwIP_A   IROM1=0x08008000 (APP1)  OTA_SLOT_SEL=1  vectors 0x8000
 rem      LwIP_B   IROM1=0x08080000 (APP2)  OTA_SLOT_SEL=2  vectors 0x80000
 rem
-rem  Output (give BOTH files to PC_Server\ota_gui.py, same folder, pick either):
-rem      ..\Output\ota\YH-F429_v1.0.0.2_A.bin
-rem      ..\Output\ota\YH-F429_v1.0.0.2_B.bin
+rem  Output for the OTA upgrade tool (give BOTH files, same folder, pick either):
+rem      ..\Output\ota\YH-F429_v1.0.0.5_A.bin
+rem      ..\Output\ota\YH-F429_v1.0.0.5_B.bin
+rem  Output for the factory/production line (ONE file, program and done):
+rem      ..\Output\ota\YH-F429_v1.0.0.5_production.hex
+rem        = Bootloader (0x08000000) + A image (0x08008000), merged by
+rem          Project\merge_hex.py. Put this A image on the PC tool's side
+rem          too, so the factory-provisioned firmware and the OTA image
+rem          are byte-identical.
 rem
 rem  The version number in the filename is read from ..\User\ota\ota_config.h,
 rem  so the filename, the version the PC tool auto-detects, and the version the
@@ -136,17 +142,70 @@ if defined VER (
   set "BINB=..\Output\ota\YH-F429_B.bin"
 )
 
+rem ---------------------------------------------------------------
+rem  5. merge Bootloader + A image into ONE production hex
+rem    A/B ping-pong needs two .bin files, but the factory only wants
+rem    one shot. Both images sit at fixed addresses (Bootloader
+rem    0x08000000, A image 0x08008000), so a plain Intel HEX merge is
+rem    enough - nothing has to be relocated.
+rem
+rem    BootInfo is deliberately NOT included: the IAP self-heals it on
+rem    first boot (magic is blank -> it writes the default slot A and
+rem    prints "boot_info missing, default slot A written"). Burning a
+rem    BootInfo here would only override that first-boot decision.
+rem
+rem    Why the bootloader hex path is not on the command line:
+rem    it contains non-ASCII characters, and this file must stay pure
+rem    ASCII. merge_hex.py carries that path as its built-in default.
+rem ---------------------------------------------------------------
+set "PROD="
+set "PY="
+for %%P in (py python python3) do (
+  if not defined PY (
+    %%P -c "import sys" >nul 2>&1
+    if not errorlevel 1 set "PY=%%P"
+  )
+)
+
+echo.
+echo ================================
+echo  Production hex
+echo ================================
+if not defined PY (
+  echo   [WARN] no python found - the production hex was NOT generated.
+  echo          The A/B .bin files above are still fine for the upgrade tool.
+  echo          To make it by hand, install Python 3 and run:
+  echo            cd Project
+  echo            python merge_hex.py -o ..\Output\ota\YH-F429_production.hex
+) else (
+  if defined VER (
+    set "PROD=..\Output\ota\YH-F429_!VER!_production.hex"
+  ) else (
+    set "PROD=..\Output\ota\YH-F429_production.hex"
+  )
+  %PY% merge_hex.py --app "..\Output\A\YH-F429_A.hex" -o "!PROD!"
+  if errorlevel 1 (
+    set "PROD="
+    echo.
+    echo   [FAILED] merge failed - NO production hex was written.
+    echo            Read the [ERROR] line above. The A/B .bin files are
+    echo            still good, so an OTA upgrade is still possible; only
+    echo            the single-file factory image is missing.
+  )
+)
+
 echo.
 echo ================================
 echo  Images
 echo ================================
 for %%F in ("!BINA!") do echo   A image: %%~nxF   size=%%~zF bytes   - to APP1
 for %%F in ("!BINB!") do echo   B image: %%~nxF   size=%%~zF bytes   - to APP2
+if defined PROD for %%F in ("!PROD!") do echo   Production: %%~nxF   size=%%~zF bytes   - factory, ONE file
 echo.
 echo   Per-image limit is 384 KB. APP2 is only 384 KB, so anything bigger
 echo   must fail here rather than halfway through an upgrade.
 echo.
-echo   PC tool: put both files in the same folder and select either one -
+echo   PC tool: put both .bin files in the same folder and select either one -
 echo   PC_Server\ota_gui.py pairs them and reads the version automatically.
 echo.
 pause

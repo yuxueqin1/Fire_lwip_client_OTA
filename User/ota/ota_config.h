@@ -169,9 +169,9 @@ typedef enum {
  *  ⚠ 每次发版只需改 FW_VERSION_BUILD
  * ================================================================== */
 #define FW_VERSION_MAJOR            1
-#define FW_VERSION_MINOR            0
+#define FW_VERSION_MINOR            1
 #define FW_VERSION_REVISION         0
-#define FW_VERSION_BUILD            5
+#define FW_VERSION_BUILD            0
 
 #define FW_VERSION    ( (FW_VERSION_MAJOR    << 24) | \
                         (FW_VERSION_MINOR    << 16) | \

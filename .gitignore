@@ -19,3 +19,9 @@ Project/YH-F429.uvprojx.bak
 __pycache__/
 *.pyc
 *.pyo
+
+# 上位机打包产物 —— build_exe.bat 生成, exe 有 12 MB, 不进仓库
+PC_Server/.venv/
+PC_Server/build/
+PC_Server/dist/
+PC_Server/*.spec

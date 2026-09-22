@@ -390,22 +390,24 @@ for name, (lo, hi, slot) in SLOTS.items():
 
 ### 7.1 编译：双击 `Project\build_ota.bat`
 
-脚本自动完成四件事，**不需要打开 Keil**：
+脚本自动完成五件事，**不需要打开 Keil**：
 
 1. 在固定候选路径里找 `UV4.exe`（已含 `D:\Program Files\Keil_v5\UV4\UV4.exe`）；
 2. 从 `User\ota\ota_config.h` 读 `FW_VERSION_*` 拼出版本号；
 3. 依次编译 `LwIP_A`、`LwIP_B`，日志写 `Project\build_LwIP_A.log` / `build_LwIP_B.log`；
-4. 把产物复制成带版本号的名字到 `Output\ota\`。
+4. 把产物复制成带版本号的名字到 `Output\ota\`；
+5. 调 `Project\merge_hex.py` 把 **Bootloader + A 镜像合成产线 hex**（详见 10.2 做法二）。
 
 正常输出：
 
 ```
 Using Keil: D:\Program Files\Keil_v5\UV4\UV4.exe
-Firmware version: v1.0.0.1   from ..\User\ota\ota_config.h
-[ OK ] target LwIP_A built, no warnings
+Firmware version: v1.0.0.5   from ..\User\ota\ota_config.h
+[ OK ] target LwIP_A built with warnings, see build_LwIP_A.log
 [ OK ] target LwIP_B built with warnings, see build_LwIP_B.log
-  A image: YH-F429_v1.0.0.1_A.bin   size=111420 bytes   - to APP1
-  B image: YH-F429_v1.0.0.1_B.bin   size=111420 bytes   - to APP2
+  A image: YH-F429_v1.0.0.5_A.bin   size=111248 bytes   - to APP1
+  B image: YH-F429_v1.0.0.5_B.bin   size=111240 bytes   - to APP2
+  Production: YH-F429_v1.0.0.5_production.hex   size=378691 bytes   - factory, ONE file
 ```
 
 `UV4` 返回码：`0`=无警告、`1`=有警告（**可以继续**，B 镜像首次全量编译出几十条警告属正常）、`≥2`=有错误（脚本判失败，不收集产物）。
@@ -720,17 +722,92 @@ IAP 固件体积 23324 字节，引导区 32 KB，还剩约 9.4 KB —— 加日
 | 4 | 烧 A 镜像：打开 APP 工程、Target 选 `LwIP_A` → 下载 → 只写 `0x08008000` 起 |
 | 5 | 上电，按 10.3 自检 |
 
-**做法二：把两个 hex 合成一个，一次烧完**
+**做法二：把两个 hex 合成一个，一次烧完（产线推荐）**
 
-把 Bootloader 的 hex 和 A 镜像的 hex 合成一个文件（Intel HEX 本身就带地址，拼接后地址互不重叠），产线一次下载即可。需要的话可以写个生成脚本。
+产线只烧**一个文件**，不用连线、不用切 Target、不用管烧到哪个地址：
+
+```
+Output\ota\YH-F429_v<版本>_production.hex
+```
+
+这个文件由 `Project\merge_hex.py` 生成，内容是 **Bootloader（`0x08000000`）+ A 镜像（`0x08008000`）**。
+`build_ota.bat` 第 5 步会**自动**跑它，所以正常发版流程下你什么都不用做。
+
+**什么时候需要手动合成**
+
+只在"hex 已经编译好了，但不想再跑一遍完整编译"时（例如别人给了你一个 A 镜像的 hex，或者你只想重新合成一次）：
+
+```bat
+cd /d <仓库根目录>\Project
+python merge_hex.py -o ..\Output\ota\YH-F429_v1.0.0.5_production.hex
+```
+
+- `-o` 是**相对当前目录**的，所以要么先 `cd` 进 `Project\`，要么给绝对路径。
+- Bootloader 和 A 镜像的路径**不用传** —— 脚本里写好了默认值，而且是**相对脚本自己**算的，在哪个目录下执行都能找到。
+- 只需要 Python 3（**只用标准库**），不需要装任何第三方包。
+
+改输出文件名以外的参数（一般用不到）：
+
+```bat
+python merge_hex.py --boot <Bootloader.hex> --app <A镜像.hex> -o <输出.hex>
+```
+
+**脚本替你挡掉了什么**
+
+| 检查 | 不过会怎样 |
+|---|---|
+| 两个镜像地址**重叠** | 报错退出。重叠意味着合并会静默改写内容，通常是 A 镜像的链接地址（`IROM1`）或 IAP 的 `APP1_ADDR` 配错了 |
+| 数据**越出分区**（越过 `0x08080000`、或顶到 BootInfo 的 `0x080E0000`） | 报错退出 |
+| 中断向量表（初始 MSP / 复位向量）不像话 | 只告警，不拦 —— 但烧下去就是块砖，看到就得查 |
+| 写出后**回读逐字节比对** | 不一致就报错。这是防"写 hex 时跨 64KB 边界漏掉几个字节"那类静默错误 —— 那种镜像烧进去能跑，但会在某个想不到的时刻出错 |
+
+**任何一项不过，脚本都不落盘** —— 宁可没有文件，也不要一个坏文件。
+
+**合成对了长什么样**
+
+```
+[1/4] 读取
+      Bootloader: ...\iap代码\...\Output\YH-F429.hex
+                 0x08000000..0x08005B43  23364 字节 (含空洞)
+     向量表: MSP=0x20009910  Reset=0x0800028D  (OK)
+      APP       : ..\Output\A\YH-F429_A.hex
+                 0x08008000..0x0802328F  111248 字节 (含空洞)
+     向量表: MSP=0x2002B338  Reset=0x0800828D  (OK)
+[2/4] 检查地址重叠
+      Bootloader 0x08000000..0x08005B43  APP 0x08008000..0x0802328F  无重叠
+[3/4] 合并
+[4/4] 写出
+      ..\Output\ota\YH-F429_v1.0.0.5_production.hex
+      回读自检 = PASS  (134612 字节逐字节一致)
+```
+
+**判定合成成功的唯一依据是 `回读自检 = PASS`**，且括号里的字节数应等于 `Bootloader 字节数 + A 镜像字节数`（上例 `23364 + 111248 = 134612`）。**看不到 `PASS` 就别拿去烧。**
+
+**⚠ 三个最容易踩的坑**
+
+1. **改完源码必须先重编，否则合成的是旧镜像。**
+   `merge_hex.py` 不会替你编译，它只是把磁盘上现成的 `Output\A\YH-F429_A.hex` 拿过来拼。
+   如果你改了源码却直接跑 `merge_hex.py`，拿到的是**上一次编译**的程序 —— 而且文件名、版本号、CRC 全都自洽，**从文件上看不出任何问题**。
+   所以顺序永远是：**改源码 → 跑 `build_ota.bat`（重编 + 自动合成）**；只有在确实不想重编时，才单独手动跑 `merge_hex.py`。
+2. **文件名的版本号来自 `ota_config.h`，不是脚本里写的。**
+   `build_ota.bat` 自动读 `FW_VERSION_*` 拼名字；手动跑 `merge_hex.py` 时版本号是**你自己在 `-o` 里敲的**，脚本不会校验它和固件里上报的版本是否一致 —— 敲错了不会有任何提示。
+3. **产线烧的这个 hex 里的 A 镜像，必须和给上位机 OTA 的 `_A.bin` 是同一份。**
+   否则出厂固件和 OTA 镜像内容不一致，A/B 版本比对会出岔子。同一轮 `build_ota.bat` 出来的两个文件天然一致；如果 A 镜像换过，两个都要换。
+
+**为什么只烧 A、不烧 B 和 BootInfo**
+
+见 10.1 的表格：B 区保持空白，第一次 OTA 才写；BootInfo 保持空白，首次上电由 IAP 自动写默认值（`boot_app=A`）并打印 `[IAP] boot_info missing, default slot A written`。
 
 **烧写文件清单**
 
 | 要烧的东西 | 文件 | 实际大小 |
 |---|---|---|
-| Bootloader | `ota升级需要的iap代码/lwip_client_Bootloader_RTOS_Final（完成版别动了）/Output/YH-F429.hex` | 23 KB |
-| A 镜像 | `Output/A/YH-F429_A.hex` | 109 KB |
+| **合成版（产线用这个，只烧一个）** | `Output/ota/YH-F429_v<版本>_production.hex` | 131 KB |
+| Bootloader（做法一分别烧时用） | `ota升级需要的iap代码/lwip_client_Bootloader_RTOS_Final（完成版别动了）/Output/YH-F429.hex` | 23 KB |
+| A 镜像（做法一分别烧时用） | `Output/A/YH-F429_A.hex` | 109 KB |
 | （参考）B 镜像 | `Output/B/YH-F429_B.hex` | 109 KB |
+
+> 表里的"实际大小"是**真正烧进 Flash 的字节数**（也就是 `_A.bin` 的大小），不是 `.hex` 文件的磁盘大小。`.hex` 自身要大 3 倍左右 —— 它是 ASCII 文本，1 个字节写成 2 个十六进制字符，再加地址和校验字段。所以 `YH-F429_production.hex` 在资源管理器里显示 370 KB、而实占 Flash 只有 131 KB，是正常的，**不是固件变大了**。
 
 > 用 `.hex` 而不是 `.bin`：hex 里带绝对地址，烧写工具不会放错位置。用 `.bin` 的话必须手工指定地址（A 镜像 → `0x08008000`）。
 
@@ -775,8 +852,17 @@ IAP 固件体积 23324 字节，引导区 32 KB，还剩约 9.4 KB —— 加日
 | 步 | 操作 |
 |---|---|
 | 1 | 改 `User/ota/ota_config.h` 里的 `FW_VERSION_BUILD`（或 MAJOR/MINOR）——**只改这一处** |
-| 2 | 双击 `Project/build_ota.bat`，得到 `Output/ota/YH-F429_v<版本>_A.bin` 和 `_B.bin` |
-| 3 | 把 **两个文件**拷到上位机同一个文件夹 |
+| 2 | 双击 `Project/build_ota.bat` —— 一次得到**三个**文件 |
+| 3 | 把 **`_A.bin` 和 `_B.bin` 两个文件**拷到上位机同一个文件夹 |
+| 4 | `_production.hex` 是给**产线**的（空片 / 整机返修才用得到）；普通的 OTA 升级用不上它 |
+
+`build_ota.bat` 第 2 步的三份产物，各给谁：
+
+| 产物 | 给谁 | 干什么用 |
+|---|---|---|
+| `YH-F429_v<版本>_A.bin` | 上位机 `OTA_Upgrade_Tool.exe` | OTA 升级（A 槽镜像） |
+| `YH-F429_v<版本>_B.bin` | 上位机 `OTA_Upgrade_Tool.exe` | OTA 升级（B 槽镜像） |
+| `YH-F429_v<版本>_production.hex` | 产线 J-Link | 出厂一次烧完（Bootloader + A 镜像，见 10.2 做法二） |
 
 ⚠ 版本号**必须比板上正在跑的版本大**，否则设备回 `REJECT_UPDATE`，什么都不发生（设计如此）。
 

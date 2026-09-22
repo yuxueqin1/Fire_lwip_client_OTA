@@ -27,6 +27,7 @@ extern uint8_t ucTemp;
   */  
 void DEBUG_USART_Config(void)
 { 
+#if DEBUG_UART_ENABLE
   
   UartHandle.Instance          = DEBUG_USART;
   
@@ -38,6 +39,7 @@ void DEBUG_USART_Config(void)
   UartHandle.Init.Mode         = UART_MODE_TX_RX;
   
   HAL_UART_Init(&UartHandle); 
+#endif
 }
 
 
@@ -58,7 +60,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef *huart)
         DEBUG_USART_TX_GPIO_CLK_ENABLE();
         DEBUG_USART_DE_GPIO_CLK_ENABLE();
 
-        /* ---- TX (PF7, AF8) ---- */
+        /* ---- TX (PC6, AF8) ---- */
         GPIO_InitStruct.Pin = DEBUG_USART_TX_PIN;
         GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
         GPIO_InitStruct.Pull = GPIO_PULLUP;
@@ -66,7 +68,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef *huart)
         GPIO_InitStruct.Alternate = DEBUG_USART_TX_AF;
         HAL_GPIO_Init(DEBUG_USART_TX_GPIO_PORT, &GPIO_InitStruct);
 
-        /* ---- RX (PF6, AF8) ---- */
+        /* ---- RX (PC7, AF8) ---- */
         GPIO_InitStruct.Pin = DEBUG_USART_RX_PIN;
         GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
         GPIO_InitStruct.Pull = GPIO_PULLUP;
@@ -74,7 +76,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef *huart)
         GPIO_InitStruct.Alternate = DEBUG_USART_RX_AF;
         HAL_GPIO_Init(DEBUG_USART_RX_GPIO_PORT, &GPIO_InitStruct);
 
-        /* ---- DE (PF8, 推挽输出, RS485 方向控制) ---- */
+        /* ---- DE (PC8, 推挽输出, RS485 方向控制) ---- */
         GPIO_InitStruct.Pin = DEBUG_USART_DE_PIN;
         GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
         GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -92,19 +94,25 @@ void HAL_UART_MspInit(UART_HandleTypeDef *huart)
 /*****************  �����ַ��� **********************/
 void Usart_SendString(uint8_t *str)
 {
+#if DEBUG_UART_ENABLE
 	unsigned int k=0;
   do 
   {
       HAL_UART_Transmit(&UartHandle,(uint8_t *)(str + k) ,1,1000);
       k++;
   } while(*(str + k)!='\0');
+#else
+	(void)str;
+#endif
   
 }
 ///�ض���c�⺯��printf������DEBUG_USART���ض�����ʹ��printf����
 int fputc(int ch, FILE *f)
 {
 	/* ����һ���ֽ����ݵ�����DEBUG_USART */
+#if DEBUG_UART_ENABLE
 	HAL_UART_Transmit(&UartHandle, (uint8_t *)&ch, 1, 1000);	
+#endif
 	
 	return (ch);
 }
@@ -113,8 +121,13 @@ int fputc(int ch, FILE *f)
 int fgetc(FILE *f)
 {
 		
+#if DEBUG_UART_ENABLE
 	int ch;
 	HAL_UART_Receive(&UartHandle, (uint8_t *)&ch, 1, 1000);	
 	return (ch);
+#else
+	(void)f;
+	return -1;			/* 调试串口关闭: 直接 EOF */
+#endif
 }
 /*********************************************END OF FILE**********************/
