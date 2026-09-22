@@ -1,0 +1,380 @@
+/**
+  *********************************************************************
+  * @file    main.c
+  * @author  fire
+  * @version V1.0
+  * @date    2019-xx-xx
+  * @brief   FreeRTOS V9.0.0 + STM32 LwIP
+  *********************************************************************
+  * @attention
+  *
+  * 实验平台:野火  STM32全系列开发板 
+  * 论坛    :http://www.firebbs.cn
+  * 淘宝    :https://fire-stm32.taobao.com
+  *
+  **********************************************************************
+  */ 
+ 
+/*
+*************************************************************************
+*                             包含的头文件
+*************************************************************************
+*/ 
+#include "main.h"
+/* FreeRTOS头文件 */
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+
+/**************************** 任务句柄 ********************************/
+/* 
+ * 任务句柄是一个指针，用于指向一个任务，当任务创建好之后，它就具有了一个任务句柄
+ * 以后我们要想操作这个任务都需要通过这个任务句柄，如果是自身的任务操作自己，那么
+ * 这个句柄可以为NULL。
+ */
+static TaskHandle_t AppTaskCreate_Handle = NULL;/* 创建任务句柄 */
+static TaskHandle_t Ota_Task_Handle = NULL;/* KEY任务句柄 */
+
+/********************************** 内核对象句柄 *********************************/
+/*
+ * 信号量，消息队列，事件标志组，软件定时器这些都属于内核的对象，要想使用这些内核
+ * 对象，必须先创建，创建成功之后会返回一个相应的句柄。实际上就是一个指针，后续我
+ * 们就可以通过这个句柄操作这些内核对象。
+ *
+ * 内核对象说白了就是一种全局的数据结构，通过这些数据结构我们可以实现任务间的通信，
+ * 任务间的事件同步等各种功能。至于这些功能的实现我们是通过调用这些内核对象的函数
+ * 来完成的
+ * 
+ */
+
+/******************************* 全局变量声明 ************************************/
+/*
+ * 当我们在写应用程序的时候，可能需要用到一些全局变量。
+ */
+#define BOOT_INFO_ADDR      0x080E0000
+#define BOOT_INFO_MAGIC     0x55AA55AA
+
+#define APP1_ADDR           0x08008000
+#define APP2_ADDR           0x08088000
+
+typedef enum
+{
+    BOOT_APP1 = 1,
+    BOOT_APP2 = 2
+
+} boot_app_t;
+
+typedef struct
+{
+    uint32_t magic;
+
+    uint32_t boot_app;
+
+    uint32_t crc;
+
+    uint32_t reserved;
+
+} boot_info_t;
+
+typedef void (*pFunction)(void);
+
+/* 延时函数 - 基于SysTick的毫秒延时 */
+static void Delay_ms(uint32_t ms)
+{
+    uint32_t i = 0;
+    /* SystemClock_Config() 设置系统时钟为180MHz */
+    /* SysTick 时钟 = 180000000 / 8 = 22500000 Hz */
+    /* 每毫秒需要22500次循环 (约22.5K) */
+    while(ms--)
+    {
+        i = 22500;
+        while(i--);
+    }
+}
+
+
+/******************************* 宏定义 ************************************/
+/*
+ * 当我们在写应用程序的时候，可能需要用到一些宏定义。
+ */
+
+
+/*
+*************************************************************************
+*                             函数声明
+*************************************************************************
+*/
+static void AppTaskCreate(void);/* 用于创建任务 */
+
+static void Ota_Task(void* pvParameters);/* Ota_Task任务实现 */
+int boot_info_write(const void *info);
+void JumpToApplication(uint32_t app_addr);
+
+/*****************************************************************
+  * @brief  主函数
+  * @param  无
+  * @retval 无
+  * @note   第一步：开发板硬件初始化 
+            第二步：创建APP应用任务
+            第三步：启动FreeRTOS，开始多任务调度
+  ****************************************************************/
+int main(void)
+{	
+  BaseType_t xReturn = pdPASS;/* 定义一个创建信息返回值，默认为pdPASS */
+  
+  /* 开发板硬件初始化 */
+  BSP_Init();
+
+  /* 创建AppTaskCreate任务 */
+  xReturn = xTaskCreate((TaskFunction_t )AppTaskCreate,  /* 任务入口函数 */
+                        (const char*    )"AppTaskCreate",/* 任务名字 */
+                        (uint16_t       )512,  /* 任务栈大小 */
+                        (void*          )NULL,/* 任务入口函数参数 */
+                        (UBaseType_t    )2, /* 任务的优先级 */
+                        (TaskHandle_t*  )&AppTaskCreate_Handle);/* 任务控制块指针 */ 
+  /* 启动任务调度 */           
+  if(pdPASS == xReturn)
+    vTaskStartScheduler();   /* 启动任务，开启调度 */
+  else
+    return -1;  
+  
+  while(1);   /* 正常不会执行到这里 */    
+}
+
+
+/***********************************************************************
+  * @ 函数名  ： AppTaskCreate
+  * @ 功能说明： 为了方便管理，所有的任务创建函数都放在这个函数里面
+  * @ 参数    ： 无  
+  * @ 返回值  ： 无
+  **********************************************************************/
+static void AppTaskCreate(void)
+{
+  BaseType_t xReturn = pdPASS;/* 定义一个创建信息返回值，默认为pdPASS */
+  
+  taskENTER_CRITICAL();           //进入临界区
+
+  /* 创建Ota_Task任务 */
+  xReturn = xTaskCreate((TaskFunction_t )Ota_Task,  /* 任务入口函数 */
+                        (const char*    )"Ota_Task",/* 任务名字 */
+                        (uint16_t       )512,  /* 任务栈大小 */
+                        (void*          )NULL,/* 任务入口函数参数 */
+                        (UBaseType_t    )1, /* 任务的优先级 */
+                        (TaskHandle_t*  )&Ota_Task_Handle);/* 任务控制块指针 */ 
+  // if(pdPASS == xReturn)
+    // printf("Create Ota_Task sucess...\n\n");
+
+  taskEXIT_CRITICAL();            //退出临界区
+
+  vTaskDelete(AppTaskCreate_Handle); //删除AppTaskCreate任务
+}
+
+
+
+static void Startup_LED_Running(void)
+{
+      LED_RUN_ON;    HAL_Delay(80);  LED_RUN_OFF;
+      LED_485_6_ON;  HAL_Delay(80);  LED_485_6_OFF;
+      LED_485_5_ON;  HAL_Delay(80);  LED_485_5_OFF;
+      LED_485_4_ON;  HAL_Delay(80);  LED_485_4_OFF;
+      LED_485_3_ON;  HAL_Delay(80);  LED_485_3_OFF;
+      LED_485_2_ON;  HAL_Delay(80);  LED_485_2_OFF;
+      LED_485_1_ON;  HAL_Delay(80);  LED_485_1_OFF;
+
+}
+
+/**********************************************************************
+  * @ 函数名  ： Ota_Task
+  * @ 功能说明： Ota_Task任务主体
+  * @ 参数    ：   
+  * @ 返回值  ： 无
+  ********************************************************************/
+static void Ota_Task(void* parameter)
+{	
+  boot_info_t new_info; 
+  boot_info_t *info = (boot_info_t *)BOOT_INFO_ADDR;
+  boot_info_t temp = *info;
+
+    if (info->magic != BOOT_INFO_MAGIC)
+    {
+      // printf("BootInfo invalid\r\n");
+  
+      /* 第一次启动 */
+      new_info.magic = BOOT_INFO_MAGIC;
+  
+      new_info.boot_app = BOOT_APP1; //默认启动APP1
+  
+      new_info.crc = 0;
+  
+      boot_info_write(&new_info);
+
+      LED_485_ALL_ON;
+      Delay_ms(1000);
+      LED_485_ALL_OFF;
+      Delay_ms(1000);
+  
+      JumpToApplication(APP1_ADDR);
+    }
+    else 
+    {
+  
+      if (info->boot_app == BOOT_APP1)
+      {
+        // printf("BootInfo valid, boot_app: %d\r\n", info->boot_app);
+        LED_RUN_ON;
+        Delay_ms(1000);
+        LED_RUN_OFF;
+        Delay_ms(1000);
+
+        JumpToApplication(APP1_ADDR);
+      }
+      else if (info->boot_app == BOOT_APP2)
+      {
+        // printf("BootInfo valid, boot_app: %d\r\n", info->boot_app);
+        LED_485_2_ON;
+        Delay_ms(3000);
+        LED_485_2_OFF;
+        Delay_ms(2000);
+
+        JumpToApplication(APP2_ADDR);
+      }
+      else
+      {
+        // printf("BootInfo invalid boot_app\r\n");
+  
+        /* 启动APP1 */
+  
+        // info->boot_app = BOOT_APP1; // 不要直接写 Flash 映射结构体  
+        // boot_info_write(info);
+
+        LED_485_3_ON;
+        Delay_ms(3000);
+        LED_485_3_OFF;
+        Delay_ms(2000);
+
+        temp.boot_app = BOOT_APP1;
+        boot_info_write(&temp);
+  
+        JumpToApplication(APP1_ADDR);
+      }
+    }
+  while (1)
+  {
+    Startup_LED_Running();
+  }
+}
+
+
+int boot_info_write(const void *info)
+{
+    FLASH_EraseInitTypeDef erase;
+    uint32_t sector_error;
+    uint32_t *p = (uint32_t *)info;
+
+    HAL_FLASH_Unlock();
+
+    erase.TypeErase = FLASH_TYPEERASE_SECTORS;
+
+    erase.Sector = FLASH_SECTOR_11;
+
+    erase.NbSectors = 1;
+
+    erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;
+
+    HAL_FLASHEx_Erase(
+        &erase,
+        &sector_error
+    );
+
+    for (int i = 0; i < sizeof(boot_info_t)/4; i++)
+    {
+        HAL_FLASH_Program(
+            FLASH_TYPEPROGRAM_WORD,
+            BOOT_INFO_ADDR + i * 4,
+            p[i]
+        );
+    }
+
+    HAL_FLASH_Lock();
+
+    return 0;
+}
+
+
+
+void JumpToApplication(uint32_t app_address)
+{
+    uint32_t app_stack;
+    uint32_t app_reset_handler;
+
+    pFunction JumpToApp;
+
+   
+
+    /* 获取APP栈顶地址 */
+    app_stack = *(__IO uint32_t*)app_address;
+
+    /* 检查栈地址是否合法 */
+    if ((app_stack < 0x20000000) ||(app_stack > 0x20030000))   //256KB SRAM
+    
+    {
+        /* 非法APP */
+        while (1);
+    }
+
+    /* 获取APP复位中断地址 */
+    app_reset_handler =
+        *(__IO uint32_t*)(app_address + 4);
+
+    /* 关闭全局中断 */
+    __disable_irq();
+
+    /* 关闭SysTick */
+    SysTick->CTRL = 0;
+    SysTick->LOAD = 0;
+    SysTick->VAL  = 0;
+
+    /* 关闭所有中断 */
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        NVIC->ICER[i] = 0xFFFFFFFF;
+        NVIC->ICPR[i] = 0xFFFFFFFF;
+    }
+
+    /* 关闭Fault异常屏蔽 */
+    __set_FAULTMASK(0);
+
+    /* HAL反初始化 */
+    HAL_DeInit();
+
+    /* 时钟恢复默认 */
+    HAL_RCC_DeInit();
+
+    /* 停止调度器Tick */
+    /* 防止FreeRTOS PendSV/SysTick残留 */
+    SCB->ICSR |= SCB_ICSR_PENDSVCLR_Msk;
+    SCB->ICSR |= SCB_ICSR_PENDSTCLR_Msk;
+
+    /* 切换到MSP */
+    __set_CONTROL(0);
+
+    /* 设置主栈指针 */
+    __set_MSP(app_stack);
+
+    /* 重定位中断向量表 */
+    SCB->VTOR = app_address;
+
+    /* 数据同步 */
+    __DSB();
+    __ISB();
+
+    /* 跳转到APP */
+    JumpToApp = (pFunction)app_reset_handler;
+
+    JumpToApp();
+
+    /* 不应该执行到这里 */
+    while (1);
+}
+
+

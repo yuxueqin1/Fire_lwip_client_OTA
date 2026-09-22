@@ -8,6 +8,9 @@ Project/JLinkLog.txt
 Project/JLinkSettings.ini
 Project/*.uvguix.*
 Project/build_output.txt
+# build_ota.bat 每次编译都会重新生成的日志, 不进仓库
+Project/build_*.log
+Project/YH-F429.uvprojx.bak
 
 # Editor
 .vscode/

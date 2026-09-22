@@ -22,7 +22,11 @@
   *  报警真值表 (来源: Doc/和串联io联网模块的通信概述参考.md):
   *    蜂鸣器(DO1)  = (alarm || break) XOR cut
   *    报警灯(DO2)  = alarm || break || cut
-  *    工作灯(DO0)  = 通信未超时(15s内有成功通信)
+  *    工作灯(DO0)  = 通信板和上位机之间的 TCP 连接正常
+  *    注: 参考文档中这一位是 time_ok —— "15s 内收到过对端状态更新".
+  *        本板的对端是上位机服务器(TCP). 现场要求: 只要 TCP 连接未断开
+  *        工作灯就点亮, 断链立即熄灭, 不叠加心跳新鲜度判决.
+  *        早期实现曾误用"与 IO 联网模块之间的通信状态", 已修正.
   ******************************************************************************
   */
 
@@ -31,6 +35,7 @@
 #include "./dip_switch/bsp_dip_switch.h"
 #include "./led/bsp_led.h"
 #include "bsp_rs485.h"
+#include "client.h"     /* client_is_connected(): 与上位机的 TCP 连接状态 */
 #include "FreeRTOS.h"
 #include "task.h"
 #include "mbm.h"    /* Modbus Master API */
@@ -59,6 +64,12 @@
 #define RS485_7_SLAVE_DETECT_ROUNDS   3U     /* 连续失败N轮 → 判定不存在   */
 #define RS485_7_SLAVE_PROBE_INTERVAL  10U    /* 不在位时每N轮探测一次      */
 
+/* ---- 工作灯(DO0): 与上位机的网络通信判据 ----
+ * 工作灯反映"通信板 ←→ 上位机"的链路状态, 不是与 IO 联网模块的通信状态.
+ * 唯一判据 = client_is_connected(), 即 TCP 连接本身是否已建立:
+ *   连接建立 → 亮; 收到 FIN/RST 或链路超时导致断开 → 立即灭.
+ * 这里不再叠加"心跳是否新鲜"的判决(见 apply_alarm_truth_table 说明). */
+
 /* ============================================================================
  *  文件级静态变量
  *  ==========================================================================*/
@@ -70,7 +81,8 @@ static uint8_t  s_local_board_alarm = 0;
 static uint8_t  s_remote_board_alarm = 0;   /* 从机通信板报警状态  */
 static uint8_t  s_io_cut_switch     = 0;    /* DI0: 切断开关       */
 static uint8_t  s_io_break_switch   = 0;    /* DI1: 断接开关       */
-static uint8_t  s_io_comm_fail_cnt  = 0;    /* IO模块通信失败累加  */
+static uint8_t  s_io_comm_fail_cnt  = 0;    /* IO模块FC02失败累加; 仅供调试打印,
+                                             * 已不参与报警判决 (工作灯改判上位机网络) */
 static uint8_t  s_work_light        = 0;    /* DO0: 工作灯         */
 static uint8_t  s_buzzer            = 0;    /* DO1: 蜂鸣器         */
 static uint8_t  s_alarm_light       = 0;    /* DO2: 报警灯         */
@@ -174,7 +186,7 @@ static uint8_t compute_local_board_alarm(void)
  * @note   真值表逻辑:
  *          蜂鸣器(DO1)  = (alarm || break) XOR cut
  *          报警灯(DO2)  = alarm || break || cut
- *          工作灯(DO0)  = 通信未超时
+ *          工作灯(DO0)  = 与上位机的 TCP 连接正常 (client_is_connected())
  */
 static void apply_alarm_truth_table(void)
 {
@@ -188,8 +200,17 @@ static void apply_alarm_truth_table(void)
     /* DO2: 报警灯 = alarm || break || cut */
     s_alarm_light = combined_alarm || s_io_break_switch || s_io_cut_switch;
 
-    /* DO0: 工作灯 = 通信未超时 */
-    s_work_light = (s_io_comm_fail_cnt < IO_COMM_TIMEOUT_CNT) ? 1U : 0U;
+    /*
+     * DO0: 工作灯 = 与上位机(服务器)之间的 TCP 连接状态, 只此一条判据.
+     *   注意: 这里曾经判的是"与 IO 联网模块的通信状态"(s_io_comm_fail_cnt),
+     *   那是错的 —— 工作灯对外表达的是本板到上位机的链路是否正常.
+     *   现场要求直接读 TCP 连接本身:
+     *     连接已建立 → 亮; 断开(FIN/RST/链路超时) → 立即灭.
+     *   不再叠加心跳新鲜度(heartbeat)判决 —— 那会让"上位机进程卡死但
+     *   socket 未断"这种边缘情况把灯判灭, 与现场"断链才灭"的预期不符;
+     *   该边缘情况由 main.c 的心跳复位机制和 client.c 的重连逻辑兜底.
+     */
+    s_work_light = client_is_connected() ? 1U : 0U;
 }
 
 /* ============================================================================

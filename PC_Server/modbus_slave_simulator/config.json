@@ -1,0 +1,20 @@
+{
+  "serial": {
+    "port": "COM5",
+    "baudrate": 19200,
+    "bytesize": 8,
+    "parity": "N",
+    "stopbits": 1,
+    "timeout": 0.005,
+    "rs485_delay_ms": 1
+  },
+  "devices": [
+  ],
+  "simulation": {
+    "alarm_probability": 0.02,
+    "sine_period_seconds": 10.0,
+    "random_walk_step": 5.0,
+    "default_curve_points_per_frame": 25,
+    "default_curve_frames_per_cycle": 8
+  }
+}

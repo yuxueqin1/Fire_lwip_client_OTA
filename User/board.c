@@ -496,7 +496,7 @@ void BSP_Init(void)
   /* ---- 临时: EEPROM AT24C64D 诊断测试 (通过后可删除) ---- */
 //   EEPROM_Test();
   /* ��ʼ��UART7 (PF6-RX, PF7-TX), 115200 8-N-1, 用于 printf 调试输出 */
-//   DEBUG_USART_Config();
+  DEBUG_USART_Config();
   DIP_SWITCH_Config();
   WDI_GPIO_Init();
   WatchDog_Clear();

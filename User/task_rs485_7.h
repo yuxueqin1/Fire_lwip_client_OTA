@@ -35,9 +35,6 @@
 #define SLAVE_REG_ALARM_STATUS    0U    /* 保持寄存器0: 报警状态 */
 #define SLAVE_REG_ALARM_RAW       1U    /* 保持寄存器1: ALARM原始值 */
 
-/* ---- 通信超时阈值 (任务周期1秒 × 15 = 15秒) ---- */
-#define IO_COMM_TIMEOUT_CNT       15U
-
 /* ---- 全局状态变量 (供其他模块读取串口7的IO状态) ---- */
 extern uint8_t g_rs485_7_local_alarm;    /* 本板报警状态 (主/从机均有效) */
 extern uint8_t g_rs485_7_remote_alarm;   /* 远程板报警状态 (仅主机有效) */

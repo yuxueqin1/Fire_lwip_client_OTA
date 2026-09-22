@@ -95,8 +95,30 @@
 /*!< Uncomment the following line if you need to relocate your vector Table in
      Internal SRAM. */
 /* #define VECT_TAB_SRAM */
-#define VECT_TAB_OFFSET 0x00 /*!< Vector Table base offset field. 
-                                   This value must be a multiple of 0x200. */
+
+/* ==================================================================
+ *  向量表偏移 —— 必须等于"本镜像链接地址 - 0x08000000"
+ *
+ *    A 镜像  IROM1 = 0x08008000 (APP1)  →  0x08008000 - 0x08000000 = 0x8000
+ *    B 镜像  IROM1 = 0x08080000 (APP2)  →  0x08080000 - 0x08000000 = 0x80000
+ *
+ *  这里不写死也不靠额外的编译选项, 而是直接由 OTA_SLOT_SEL 推导 ——
+ *  它已经由 Keil 各 Target 的 C/C++ Define 给出 (LwIP_A=1, LwIP_B=2),
+ *  和 ota_manager.c 选择目标分区用的是同一个开关。一个 Target 一个开关,
+ *  向量表偏移与链接地址不可能各自跑偏(这两者一旦不一致, 镜像会一启动就
+ *  跑飞, 而且在下载/校验阶段完全看不出来)。
+ *
+ *  若两个开关都没定义, 按 A 区处理(与 ota_manager.c 的缺省槽位一致)。
+ * ================================================================== */
+#if defined(OTA_SLOT_SEL) && (OTA_SLOT_SEL == 2)
+  #define VECT_TAB_OFFSET 0x80000
+#else
+  #define VECT_TAB_OFFSET 0x8000
+#endif
+
+// #define VECT_TAB_OFFSET 0x00
+/*!< Vector Table base offset field.
+     This value must be a multiple of 0x200. */
 /******************************************************************************/
 
 /**

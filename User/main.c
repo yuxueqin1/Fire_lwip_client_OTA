@@ -271,7 +271,7 @@ static void AppTaskCreate(void *pvParameters)
 
 
     /* ---- 初始化 OTA 客户端 ---- */
-    // ota_client_init();
+    ota_client_init();
 
     /*
      * ================================================================
