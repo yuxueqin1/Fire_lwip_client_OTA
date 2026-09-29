@@ -40,6 +40,12 @@ int32_t ota_net_connect(const char *server_ip, uint16_t server_port)
     int32_t sock;
     struct sockaddr_in server_addr;
     struct timeval tv;
+    fd_set  wfds;
+    fd_set  efds;
+    int32_t sel;
+    int     on;
+    int     so_err;
+    socklen_t so_err_len;
 
     if (server_ip == NULL || server_port == 0U) {
         return -1;
@@ -69,17 +75,85 @@ int32_t ota_net_connect(const char *server_ip, uint16_t server_port)
                " -- send() may block forever\r\n");
     }
 
+    /* ---- TCP 保活 ----
+     * 链路静悄悄断掉(拔网线/上位机网卡改地址/上位机休眠)时两端都没有
+     * FIN/RST, 本板这侧只会一直停在 ESTABLISHED, 靠 TCP 自己重传要 6~7 分钟
+     * 才发现。开了保活 ≈19s 就能让上层走回"断开重连"(参数含义见 ota_config.h)。
+     * ⚠ 这三个按秒设置的选项要求 lwipopts.h 里 LWIP_TCP_KEEPALIVE=1;
+     *   SO_KEEPALIVE 本身与它无关, 但只用默认参数(2 小时起探)等于没开。 */
+    on = 1;
+    (void)setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const void *)&on,
+                     sizeof(on));
+#if LWIP_TCP_KEEPALIVE
+    on = (int)OTA_KEEPALIVE_IDLE_S;
+    (void)setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, (const void *)&on,
+                     sizeof(on));
+    on = (int)OTA_KEEPALIVE_INTVL_S;
+    (void)setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, (const void *)&on,
+                     sizeof(on));
+    on = (int)OTA_KEEPALIVE_CNT;
+    (void)setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, (const void *)&on,
+                     sizeof(on));
+#endif /* LWIP_TCP_KEEPALIVE */
+
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family      = AF_INET;
     server_addr.sin_port        = htons(server_port);
     server_addr.sin_addr.s_addr = inet_addr(server_ip);
 
-    if (connect(sock, (struct sockaddr *)&server_addr,
-                sizeof(server_addr)) < 0) {
-        // printf("[OTA_NET] connect failed\r\n");
+    /* ---- 非阻塞 connect + select 限时 ----
+     * 阻塞版 connect() 的逻辑是"等到握手完成, 或 SYN 重试用尽": 对端不应答时
+     * 每 3s 发一个 SYN、最多 TCP_SYNMAXRTX(6) 次, 也就是**一次尝试要占住本任务
+     * 约 18s**。这期间上位机就是起来了, 板子也看不见, 只能等这次尝试超时 +
+     * 一个重连间隔 —— 现场就是"升级软件每次都要等好久才连上"。
+     *
+     * 改成: 先把 socket 设成非阻塞, connect() 立刻返回(-1/errno=EINPROGRESS),
+     * 再用 select 等"可写或出错", 最多等 OTA_CONNECT_TIMEOUT_MS。
+     *
+     * ⚠ 失败路径上不要先把非阻塞标志清掉再 close: lwIP 允许关一个"非阻塞
+     *   connect 进行中"的 socket(api_msg.c 里就是这么分流的), 清掉标志反而
+     *   会被当成"阻塞 connect 进行中"而拒绝关闭。 */
+    on = 1;
+    (void)lwip_ioctl(sock, FIONBIO, &on);
+
+    /* 返回值这里不看: 非阻塞模式下"立刻失败"和"正在连接"都返回 -1,
+     * 真正连上与否统一由下面的 select + SO_ERROR 判定。 */
+    (void)connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
+
+    FD_ZERO(&wfds);
+    FD_SET(sock, &wfds);
+    /* 除了等可写, 还要等 exceptfds: lwIP 把连接失败报成 errevent, 而
+     * errevent 只在 exceptfds 里体现(见 ota_net_recv 里的同类说明)。 */
+    FD_ZERO(&efds);
+    FD_SET(sock, &efds);
+
+    tv.tv_sec  = OTA_CONNECT_TIMEOUT_MS / 1000U;
+    tv.tv_usec = (OTA_CONNECT_TIMEOUT_MS % 1000U) * 1000U;
+
+    sel = select(sock + 1, NULL, &wfds, &efds, &tv);
+    if (sel <= 0) {
+        /* sel == 0: 到点了还没握上手(对端不在线/网卡地址没配对);
+         * sel < 0 : select 自身出错。两种都放弃这次尝试, 下一轮重来。 */
         (void)closesocket(sock);
         return -1;
     }
+
+    /* select 报"可写"不等于连上了 —— 连接失败同样会报可写(并置 errevent)。
+     * 必须再读一次 SO_ERROR 才能区分, 它同时把错误标志清掉。
+     * ⚠ 不能用 getpeername() 代替: lwIP 的 getpeername 在"只发过 SYN、还没
+     *   握手"的 pcb 上也会返回成功。 */
+    so_err     = 0;
+    so_err_len = (socklen_t)sizeof(so_err);
+    if ((getsockopt(sock, SOL_SOCKET, SO_ERROR, (void *)&so_err,
+                    &so_err_len) < 0) || (so_err != 0)) {
+        (void)closesocket(sock);
+        return -1;
+    }
+
+    /* 连上了: 恢复阻塞模式。留着非阻塞会让 send() 在发送缓冲满时返回
+     * EWOULDBLOCK, 而 ota_net_send() 把"返回负值"一律当成链路故障 —— 会误判。 */
+    on = 0;
+    (void)lwip_ioctl(sock, FIONBIO, &on);
 
     ota_net_rx_reset();
 
@@ -201,8 +275,10 @@ void ota_net_rx_reset(void)
 int32_t ota_net_recv(int32_t sock)
 {
     fd_set rfds;
+    fd_set efds;
     struct timeval tv;
     int32_t n;
+    int32_t sel;
 
     if (sock < 0) {
         return -1;
@@ -222,14 +298,36 @@ int32_t ota_net_recv(int32_t sock)
 
     /* 先用 select 探一下可读性, 顺便限定本次最多等 OTA_NET_POLL_MS。
      * 这样 recv 返回 -1 就确实是真的出错, 不必依赖 errno
-     * (lwIP + ARMCC 组合下 errno 的可用性不确定)。 */
+     * (lwIP + ARMCC 组合下 errno 的可用性不确定)。
+     *
+     * ⚠ 必须同时监视 exceptfds —— 这是"断开后长时间连不回来"的根因之一:
+     *   lwIP 把连接出问题(对端 RST / pcb 被 abort / TCP 保活判死)报成
+     *   errevent, 而 lwip_select 只在**调用方传了 exceptfds**时才为 errevent
+     *   唤醒(sockets.c 的 event_callback → select_check_waiters 里 has_errevent
+     *   那一支要求 FD_ISSET(s, scb->exceptset))。
+     *   以前这里只传 readfds, 于是连接死了也不会被唤醒: select 一直超时,
+     *   recv 永远不被调用, 本任务就永远以为"连接还在"—— 只能指望下一次
+     *   HELLO 发送失败(60s 一次, 而链路静默断掉时 send 往往照样"成功")。 */
     FD_ZERO(&rfds);
     FD_SET(sock, &rfds);
+    FD_ZERO(&efds);
+    FD_SET(sock, &efds);
     tv.tv_sec  = OTA_NET_POLL_MS / 1000U;
     tv.tv_usec = (OTA_NET_POLL_MS % 1000U) * 1000U;
 
-    if (select(sock + 1, &rfds, NULL, NULL, &tv) <= 0) {
+    sel = select(sock + 1, &rfds, NULL, &efds, &tv);
+    if (sel < 0) {
+        printf("[OTA_NET] select error\r\n");
+        return -1;
+    }
+    if (sel == 0) {
         return 0;                       /* 超时 / 本任务应让出 CPU */
+    }
+    if (FD_ISSET(sock, &efds)) {
+        /* socket 级错误: 连接已经被对端复位, 或被保活判定为死链而 abort。
+         * 直接返回 -1, 让上层断开重连 —— 不要试图 recv, 那里拿不到有用数据。 */
+        printf("[OTA_NET] socket error event -> reconnect\r\n");
+        return -1;
     }
 
     n = recv(sock, (void *)&g_rx_buf[g_rx_len],

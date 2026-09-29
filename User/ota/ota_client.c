@@ -31,7 +31,7 @@
  *
  *  失败自恢复(P7):
  *    任何环节出错都不卡死 —— 回 ERROR_UPDATE, 断开连接, 回到 IDLE,
- *    10s 后重连并重新 HELLO(仍报老版本), PC 会在下一轮重新推送,
+ *    3s 后重连并重新 HELLO(仍报老版本), PC 会在下一轮重新推送,
  *    因为当前运行分区全程未被破坏, 重试永远是从干净状态开始。
  *
  *  三层"卡死"防护(从轻到重, 都不需要人工上板):
@@ -42,6 +42,14 @@
  *    第3层 —— 任务层看门狗: 任务真卡死了(卡在 printf / Flash / 被饿死),
  *             由 App_TaskStart 判超时并停喂 SP706S → 板子硬件复位(硬恢复)。
  *             ota_task_wdt_* 系列就是这一层的上报接口。
+ *
+ *  另外三条是"连得慢 / 断开后连不回来"的正面答复(详见 ota_config.h 与 P11):
+ *    - 单次 connect 有 OTA_CONNECT_TIMEOUT_MS 上限(非阻塞 + select 限时),
+ *      不会出现"一次尝试占住本任务 18s、上位机起来了也看不见"。
+ *    - OTA socket 开了 TCP 保活(空闲 10s 起探 / 3s 一次 / 3 次判死):
+ *      链路静悄悄断掉(拔网线、上位机网卡改地址、上位机休眠)≈19s 就能发现。
+ *    - recv 侧同时监视 exceptfds: 连接被 RST / 被保活 abort 后立刻返回 -1,
+ *      不必等到下一次 HELLO 发送失败(那条路在链路静默时往往根本不会失败)。
  * ================================================================== */
 
 #define OTA_SERVER_IP           OTA_SERVER_IP_DEFAULT
@@ -440,8 +448,9 @@ static void ota_client_task(void *param)
 
             ota_net_rx_reset();
 
-            /* connect 是阻塞的, 对端不在线时最长几十秒(lwIP SYN/ARP 重试),
-             * 先声明 busy 窗口, 免得被任务看门狗误判成卡死。 */
+            /* connect 内部已是"非阻塞 + select 限时", 单次最多
+             * OTA_CONNECT_TIMEOUT_MS(3s); busy 窗口仍要声明 ——
+             * 那是"连 socket 层都卡住"时唯一能把板子救回来的兜底, 与超时是两回事。 */
             ota_task_wdt_busy(OTA_TASK_BUSY_CONNECT_MS);
             g_sock = ota_net_connect(OTA_SERVER_IP, OTA_SERVER_PORT);
             ota_task_wdt_kick();

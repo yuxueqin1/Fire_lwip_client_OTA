@@ -217,6 +217,24 @@ The STM32F4x7 allows computing and verifying the IP, UDP, TCP and ICMP checksums
  */
 #define LWIP_SO_SNDTIMEO                1
 
+/**
+ * LWIP_TCP_KEEPALIVE==1: 打开 TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT
+ * 这三个"按秒/按次数"设置保活参数的 socket 选项。
+ *
+ * ⚠ 只为 OTA 连接开(见 ota_config.h 的 OTA_KEEPALIVE_*), 解决的问题是
+ *   "链路静悄悄断掉后, 本板要 6~7 分钟才发现":
+ *     - 不开这个选项, SO_KEEPALIVE 只能用 lwIP 的默认参数 —— keep_idle
+ *       2 小时 + 9 次 × 75s 探测, 等于没开;
+ *     - 打开后才能给 OTA socket 单独设成"空闲 10s 起探 / 每 3s 一次 /
+ *       3 次无应答即断", 合计约 19s 就能让板子走回断开重连。
+ *
+ * 影响面: 只增加 struct tcp_pcb 里的 keep_intvl / keep_cnt 两个字段, 并让
+ *        上面三个 setsockopt 生效; 不设的 socket(含 client.c 的主链路)行为
+ *         完全不变 —— 它们根本不设 SO_KEEPALIVE。
+ *         改这个宏会改变 struct tcp_pcb 布局, 必须整工程重编。
+ */
+#define LWIP_TCP_KEEPALIVE              1
+
 /*
    ------------------------------------
    ---------- Socket options ----------

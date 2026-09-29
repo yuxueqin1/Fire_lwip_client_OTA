@@ -39,8 +39,10 @@ typedef struct {
 
 /* 连接 OTA 服务器。成功返回 socket 句柄(>=0), 失败返回 -1。
  * 接收超时 = OTA_SOCKET_TIMEOUT, 发送超时 = OTA_SOCKET_SNDTIMEO_MS。
- * ⚠ 本函数是阻塞的, 对端不存在时最长可能阻塞几十秒(lwIP SYN/ARP 重试),
- *   调用方应先用 ota_task_wdt_busy(OTA_TASK_BUSY_CONNECT_MS) 声明 busy 窗口。 */
+ * 连接本身走"非阻塞 connect + select 限时", 单次最多阻塞 OTA_CONNECT_TIMEOUT_MS,
+ * 并且会打开 TCP 保活(参数见 ota_config.h 的 OTA_KEEPALIVE_*)。
+ * ⚠ 调用方仍应先用 ota_task_wdt_busy(OTA_TASK_BUSY_CONNECT_MS) 声明 busy 窗口:
+ *   那是"真卡住了还能复位板子"的兜底, 与这里的超时是两回事。 */
 int32_t ota_net_connect(const char *server_ip, uint16_t server_port);
 
 /* 关闭连接 */
@@ -71,7 +73,9 @@ void ota_net_rx_reset(void);
  *   返回 OTA_NET_RX_FULL(-2): 缓冲剩余空间不足一整帧, 本次没读 —— 调用方
  *                             必须先取帧; 若取不出任何帧则 ota_net_rx_reset()
  *                             丢弃重同步, 绝不能就此停止读 socket
- *   返回 -1                 : socket 错误或对端断开
+ *   返回 -1                 : socket 错误 / 对端断开 / 连接已被复位
+ *                             (同时监视 exceptfds, 连接被 RST 或被 TCP 保活判死
+ *                              时能立刻返回, 不必等到下一次 send 失败)
  * 注意: 永远不会截断数据 —— 读不下就一个字节都不读。 */
 #define OTA_NET_RX_FULL     (-2)
 int32_t ota_net_recv(int32_t sock);

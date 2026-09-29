@@ -96,8 +96,49 @@ typedef struct {
 #define OTA_SERVER_PORT_DEFAULT     5002
 
 #define OTA_SOCKET_TIMEOUT          30000U      /* socket 接收超时 (ms) */
-#define OTA_RECONNECT_INTERVAL      10000U      /* 断线重连间隔 (ms) */
 #define OTA_HELLO_INTERVAL          60000U      /* HELLO 心跳间隔 (ms) */
+
+/* 两次连接尝试之间的最小间隔 (ms)。
+ *
+ * ⚠ 这个值直接决定"上位机点开升级软件后, 多久才能看到通信板": 板子是被动方,
+ *   只能等它自己下一次来敲门。原来 10s, 叠加当时的"连接最长阻塞 18s"
+ *   (见 OTA_CONNECT_TIMEOUT_MS), 实测最坏要等近 30s 才连上(见 P11)。
+ *   现在连接尝试本身有 3s 上限, 间隔同步收到 3s, 最坏 ≈6s。 */
+#define OTA_RECONNECT_INTERVAL      3000U       /* 断线重连间隔 (ms) */
+
+/* 单次 TCP connect 的时间上限 (ms)。
+ *
+ * ⚠ connect() 在 lwIP 里不是"最多等一会儿", 而是"等到握手完成或 SYN 重试用尽":
+ *   SYN_SENT 状态下 RTO 不做退避(tcp.c: state != SYN_SENT 才退避), 每 3s 重发
+ *   一次 SYN, 上限 TCP_SYNMAXRTX(默认 6) 次 —— 对端不应答时**一次连接尝试
+ *   会阻塞约 18s**(对端不存在、ARP 无应答、网卡没配成 OTA_SERVER_IP 都是这个
+ *   下场)。这 18s 里 OTA 任务什么都做不了: 上位机就算这时候起来了, 板子也要
+ *   等这次尝试彻底失败、再等一个 OTA_RECONNECT_INTERVAL 才会重新敲门。
+ *
+ * 现在改成"非阻塞 connect + select 限时"(见 ota_net_connect): 超过这个时间就
+ * 放弃本次尝试、关掉 socket 重来, 单次阻塞时间被打到 3s 以内。
+ *
+ * ⚠ 必须严格小于 OTA_TASK_BUSY_CONNECT_MS, 否则任务的 busy 窗口先到期,
+ *   会被 OTA 任务看门狗当成"卡死"而复位板子(复位码 31)。 */
+#define OTA_CONNECT_TIMEOUT_MS      3000U
+
+/* ---- TCP 保活 (需要 lwipopts.h 里 LWIP_TCP_KEEPALIVE=1 才有下面 3 个 per-socket 值) ----
+ *
+ * 解决"链路静悄悄断掉"——拔网线、上位机网卡被改地址、上位机休眠:
+ * 两端都没有 FIN/RST, 本板这侧的 socket 会一直停在 ESTABLISHED,
+ *   - select() 只报可读/可写, 不报错 → 收不到数据也永远不返回错误
+ *   - send() 只是把数据塞进发送缓冲, 照样"成功"
+ * 于是只能等 TCP 自己重传耗尽(TCP_MAXRTX=12, RTO 退避到 48s, 累计 6~7 分钟),
+ * 现场表现就是"中途断开后, 等好久也连不回来"。默认保活参数是 2 小时才起探,
+ * 等于没开。
+ *
+ * 现在的策略: 空闲 OTA_KEEPALIVE_IDLE_S 秒开始探测, 每 OTA_KEEPALIVE_INTVL_S
+ * 秒一次, 连续 OTA_KEEPALIVE_CNT 次无应答判定对端已死 → lwIP abort 该连接
+ * → 本板 select 立刻报错 → 断开重连。合计 ≈ 10 + 3×3 = 19s。
+ * 对端只是"安静"(上位机开着但没在发数据)时会正常回 ACK, 不会被误杀。 */
+#define OTA_KEEPALIVE_IDLE_S        10U
+#define OTA_KEEPALIVE_INTVL_S       3U
+#define OTA_KEEPALIVE_CNT           3U
 
 /* socket 发送超时 (ms) —— 单次 send() 最多阻塞多久。
  * ⚠ 生效前提: lwipopts.h 里 LWIP_SO_SNDTIMEO 必须为 1, 否则 setsockopt 无效、
@@ -134,7 +175,10 @@ typedef struct {
  * ================================================================== */
 #define OTA_TASK_WDT_TIMEOUT_MS     30000U      /* 正常循环的存活超时 */
 #define OTA_TASK_BUSY_FLASH_MS      10000U      /* 单次 Flash 擦/校验的 busy 窗口 */
-#define OTA_TASK_BUSY_CONNECT_MS    60000U      /* TCP connect 的 busy 窗口(含 lwIP SYN/ARP 重试) */
+/* TCP connect 的 busy 窗口。原来是 60s(lwIP 的 SYN/ARP 重试要慢慢熬), 现在
+ * connect 自带 OTA_CONNECT_TIMEOUT_MS=3s 上限, 窗口留 10s 足够(含 socket
+ * 创建/保活 setsockopt 的开销), 也仍有"真卡在 connect 里"的兜底能力。 */
+#define OTA_TASK_BUSY_CONNECT_MS    10000U
 
 #define OTA_MAX_PAYLOAD             1024U       /* 单帧最大数据长度, 与上位机一致 */
 #define OTA_FRAME_HEADER_SIZE       9U          /* 帧头: MAGIC+CMD+SEQ+LEN+OFFSET */
@@ -209,7 +253,7 @@ typedef enum {
 #define FW_VERSION_MAJOR            1
 #define FW_VERSION_MINOR            1
 #define FW_VERSION_REVISION         0
-#define FW_VERSION_BUILD            25
+#define FW_VERSION_BUILD            27
 
 #define FW_VERSION    ( (FW_VERSION_MAJOR    << 24) | \
                         (FW_VERSION_MINOR    << 16) | \
