@@ -126,6 +126,8 @@ OTA_ERROR_NAMES = {
     13: "OTA_STATE_ERROR_CRC (CRC32 校验失败)",
     14: "OTA_STATE_ERROR_FLASH (Flash 擦写失败)",
     15: "OTA_STATE_ERROR_SLOT (槽位未知: 链接地址配置错误)",
+    16: "OTA_STATE_ERROR_TIMEOUT (链路假死: 长时间收不到新数据, "
+        "设备已主动断开, 10s 后会重连并重新 HELLO, 可直接重试)",
 }
 
 # 一块 Flash 只能按 4 字节写入, 固件长度必须是 4 的倍数 (不足则补 0x00)
@@ -146,8 +148,18 @@ DEFAULT_PORT       = 5002
 DEFAULT_BIND_ADDR  = "0.0.0.0"
 DEFAULT_VERSION    = 0x01000001
 DEFAULT_CHUNK_SIZE = 1024   # 每块字节数 (== OTA_MAX_PAYLOAD)
-DEFAULT_CHUNK_DELAY = 0.0   # 块间延迟(秒)。设备侧已改为"一次 recv 连发多帧",
-                            # 不再需要人为限速; 靠 TCP 窗口自然背压即可。
+DEFAULT_CHUNK_DELAY = 0.0   # 每帧之间的发包间隔(秒)。0 = 不限速, 靠 TCP 窗口背压。
+                            #
+                            # 为什么值得调: 设备侧每收 1KB 就要在内部 Flash 做 256 次
+                            # 字编程(约 5~25ms), 实际消化速度约 80~150 KB/s; 而链路上
+                            # 能 10MB/s 地灌。不限速时设备的接收窗口必然被打到 0, 抓包
+                            # 里就是 [TCP Window Full] / TCP ZeroWindow / ZeroWindowProbe
+                            # / ZeroWindowProbeAck 串成一片。
+                            # 那是 TCP 正常背压, 不是错误; 但窗口长时间停在 0 会让
+                            # "真卡死"和"只是在等设备写 Flash"在抓包上难以区分。
+                            # 把速率压到略低于设备消化速度(1024 / 设备速率 × 1.2),
+                            # 窗口就不会被填满, 那一串报文自然消失, 总耗时几乎不变
+                            # (瓶颈始终是设备的 Flash)。
 
 # 单次循环最多入队多少帧(≈ 8KB, 与 lwIP TCP_WND=8760 同量级)。
 # 队列有界 → 内存不会涨, 同时保证管道始终填满。
@@ -419,6 +431,7 @@ class OTAClientSession:
         self.next_off = 0
         self.chunk_seq = 0
         self.end_queued = False
+        self._next_burst_at = 0.0     # 下一批 DATA 允许入队的时刻(限速用)
         self.last_progress = -1
 
     # ------------------------------------------------------------------
@@ -454,7 +467,7 @@ class OTAClientSession:
 
         # 数据推完/丢了一部分之后继续补队列
         if self.phase == PHASE_PUSHING:
-            self._enqueue_next()
+            self._paced_enqueue()
 
         if (time.time() - self.last_activity) > IDLE_TIMEOUT_S:
             self.server._post_event(
@@ -579,6 +592,44 @@ class OTAClientSession:
                 break
             else:
                 break
+
+    def _paced_enqueue(self):
+        """按 chunk_delay 限速地补发送队列(不限速时就是直接补满)。
+
+        为什么不限速会出现 ZeroWindow: 设备每收 1KB 要在内部 Flash 做 256 次
+        字编程(约 5~25ms), 消化速度约 80~150 KB/s; 链路上却能 10MB/s 地灌。
+        发送方总会把接收窗口填到最后 1 字节 —— 抓包上就是
+        [TCP Window Full](填满了设备的窗口) → 设备回 TCP ZeroWindow
+        → 本端 ZeroWindowProbe → 设备 ZeroWindowProbeAck(窗口仍是 0)。
+        这一串是 TCP 背压的正常形态, 不是错误; 但设备窗口长时间停在 0
+        会让"真卡死"和"只是在等设备写 Flash"在抓包上难以区分。
+
+        把速率压到略低于设备消化速度, 窗口就不会被填满, 上面那一串就消失,
+        总耗时几乎不变(瓶颈始终是设备的 Flash)。
+
+        限速的实现: 每补一批(最多 TX_BURST_FRAMES 帧)就按"这批帧数 ×
+        chunk_delay"推后下一次入队时刻 —— 于是平均速率 = 1 帧 / chunk_delay,
+        同时保留批量发送(不会退化成每帧一次 send)。
+        """
+        delay = getattr(self.server, "chunk_delay", 0.0)
+
+        if delay <= 0.0:
+            self._enqueue_next()
+            return
+
+        now = time.time()
+        if now < self._next_burst_at:
+            return
+
+        before = len(self.txq)
+        self._enqueue_next()
+        added = len(self.txq) - before
+
+        if added > 0:
+            self._next_burst_at = now + added * delay
+        else:
+            # 队列已经满了(没入队): 稍后再试, 别把这个 0 当成"可以立刻再补"
+            self._next_burst_at = now + delay
 
     def _report_progress(self):
         if self.fw is None or self.fw['size'] == 0:
