@@ -46,7 +46,7 @@
  *  ==========================================================================*/
 #define RS485_7_PORT_INDEX      6U     /* USART3 在 mbportserial 中的索引 */
 #define RS485_7_SLAVE_ADDR      1U     /* 本板从机模式下的 Modbus 地址    */
-#define RS485_7_TASK_PRIO       4      /* 与现有6路UART同级               */
+#define RS485_7_TASK_PRIO       5      /* 与6路UART同级, 不可调低(否则被饿死) */
 #define RS485_7_TASK_STACK      384    /* 栈大小 (words)                  */
 #define RS485_7_POLL_DELAY_MS   500    /* 主机轮询间隔 (ms)               */
 #define RS485_7_INIT_RETRY_MAX        3U     /* 初始化失败快速重试次数     */
@@ -157,7 +157,13 @@ static uint8_t compute_local_board_alarm(void)
         }
 
         link_mask     = *( (uint32_t *)&SerialDataBuf[i][7] );
-        expected_mask = ( 1UL << module_count ) - 1UL;
+        /* module_count 上面已钳到 32, 而 32 位机上 1UL<<32 是未定义行为, 单独处理 */
+        expected_mask = (module_count >= 32U) ? 0xFFFFFFFFUL
+                                              : (( 1UL << module_count ) - 1UL);
+
+        /* 注: 道岔采集盒(交流/直流转辙机, S700K)同样参与在线掩码检查.
+         * 曾因 9600bps 下偶发单帧 CRC 错被误判离线而整体屏蔽, 现恢复:
+         * 道岔盒离线时应与其它模块一样触发本板报警. */
 
         /* ---- 维度1: 模块在线/离线检查 ---- */
         if (link_mask != expected_mask) {
@@ -419,7 +425,7 @@ static void master_read_io_module_di(void)
     } else {
         /* 打印具体错误码帮助排查
          * eStatus: 0=OK, 5=EIO(CRC错), 8=ETIMEDOUT(超时-设备未回复) */
-        // printf("[RS485-7] FC02 fail: eStatus=%d (0=OK, 5=EIO, 8=TIMEOUT)\n", (int)eStatus);
+        printf("[RS485-7] FC02 fail: eStatus=%d (0=OK, 5=EIO, 8=TIMEOUT)\n", (int)eStatus);
         s_io_comm_fail_cnt++;  /* 累加超时计数 */
     }
 }
@@ -529,18 +535,23 @@ static void rs485_7_task_handler(void *pvParameters)
             /* LED闪烁指示 */
             // LED_485_Set(0, TOGGLE);
 
-            /* 调试打印 (每10轮打印一次, 避免刷屏) */
-            // {
-            //     static uint8_t dbg_cnt = 0;
-            //     if (++dbg_cnt >= 10U) {
-            //         dbg_cnt = 0;
-            //         printf("[RS485-7] L=%u R=%u cut=%u brk=%u -> buz=%u light=%u work=%u fail=%u\n",
-            //                s_local_board_alarm, s_remote_board_alarm,
-            //                s_io_cut_switch, s_io_break_switch,
-            //                s_buzzer, s_alarm_light, s_work_light,
-            //                s_io_comm_fail_cnt);
-            //     }
-            // }
+            /* 调试打印 (每10轮打印一次, 避免刷屏)
+             * [排查] 蜂鸣器/报警灯同步切换: 看这一行就能定位是谁在跳 ——
+             *   cut/brk 在跳       → IO模块 DI0/DI1 输入抖动
+             *   L 在跳             → 本板报警在跳 (link_mask 或 KGL 位)
+             *   三者都不跳但仍切换 → IO模块通信间歇失败, 是模块自身
+             *                        通信中断保持/置位在驱动输出 */
+            {
+                static uint8_t dbg_cnt = 0;
+                if (++dbg_cnt >= 10U) {
+                    dbg_cnt = 0;
+                    printf("[RS485-7] L=%u R=%u cut=%u brk=%u -> buz=%u light=%u work=%u fail=%u\r\n",
+                           s_local_board_alarm, s_remote_board_alarm,
+                           s_io_cut_switch, s_io_break_switch,
+                           s_buzzer, s_alarm_light, s_work_light,
+                           s_io_comm_fail_cnt);
+                }
+            }
 
             /* 步骤8: 任务延迟 */
             vTaskDelay(pdMS_TO_TICKS(RS485_7_POLL_DELAY_MS));

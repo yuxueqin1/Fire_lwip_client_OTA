@@ -55,6 +55,8 @@
 #include "queue.h"
 #include "client.h"
 #include "ota_client.h"
+#include "ota_wdt.h"        /* OTA 任务看门狗: ota_task_wdt_timed_out() */
+#include "ota_config.h"     /* OTA_TASK_WDT_TIMEOUT_MS (仅用于日志打印) */
 #include "bsp_rs485.h"
 #include "bsp_eeprom.h"
 #include "./dip_switch/bsp_dip_switch.h"
@@ -150,6 +152,23 @@ static eMBException eMBSRegInputCB(UBYTE *pubRegBuffer, USHORT usAddress, USHORT
 /* ---- Modbus registers ---- */
 static USHORT MBRegHoldingBuf[MB_REG_HOLDING_NREGS] = {0};
 static USHORT MBRegInputBuf[MB_REG_INPUT_NREGS]    = {0};
+
+/*======================================================================*/
+/*  uart_published_link_mask                                            */
+/*  已发布的链路掩码 = 上一轮轮询结束时写入 SerialDataBuf[port][7..10] 的完整值.*/
+/*  各轮询流程每轮开头先把 runtime->link_mask 清 0 (如 uart_process_custom_port */
+/*  的 runtime->link_mask = 0), 再逐台应答成功才置位, 因此轮询进行中它是"本轮  */
+/*  已轮询过的模块"的半成品 —— 尚未轮询到的模块位全是 0, 绝不可对外发布:       */
+/*    - 曲线上传帧/脉冲帧 (uart_axle_counter_upload_pulse,                    */
+/*      uart_dc3wire_upload_curve) 会把它发给上位机;                          */
+/*    - 串口7 compute_local_board_alarm 读的也是这个字段, 用于主机通信板报警. */
+/*  发布半成品的后果: 每轮里靠后的模块 (如 m4/m5) 被随机判为离线, 而实际通信   */
+/*  完全正常, 且不会有任何 [DC-FAIL] 打印. 所有帧构建一律用本函数取值.         */
+/*======================================================================*/
+static uint32_t uart_published_link_mask(uint8_t port_idx)
+{
+    return *((uint32_t *)&SerialDataBuf[port_idx][7]);
+}
 
 extern void TCPIP_Init(void);
 
@@ -359,6 +378,9 @@ static void App_Task_TcpSend(void *pvParameters)
 /*     - WDTUART0-5FLAG:     各串口任务清零, 此处累加. >500 → 复位         */
 /*     - WDTTCPSENDFLAG:     TCP 发送任务清零, 此处累加. >500 → 复位       */
 /*     - heartbeat:          收到心跳应答时清零, 此处累加. 超限 → 复位     */
+/*     - ota_task_wdt:       OTA 升级任务自报存活(30s 窗口), 超时 → 复位31  */
+/*                           升级过程卡死(例如卡在 send 上对端窗口关闭)     */
+/*                           且本任务仍在喂狗 → 板子永不复位, 必须单独判.   */
 /*                                                                       */
 /*  4. 喂狗 / 复位:                                                       */
 /*     - WTD_RESET == 0: 喂狗 (WatchDog_Clear)                            */
@@ -397,6 +419,26 @@ static void App_TaskStart(void *pvParameters)
         WDTTCPSENDFLAG++;
         if (WDTTCPSENDFLAG > 500U) {
             WTD_RESET = 28U;  /* TCP 发送任务超时 */
+        }
+
+        /* ---- OTA 升级任务看门狗 (复位码 31) ----
+         * OTA 任务自己按轮次上报存活(ota_task_wdt_kick/busy/progress),
+         * 长时间不上报 = 升级流程真的卡死了(卡在 send 上对端窗口关闭、
+         * 卡在 Flash 擦除、被高优先级任务饿死...)。
+         * 这里只是"发现者": 置位 WTD_RESET 后本任务就不再喂狗 → SP706S 复位。
+         *
+         * ⚠ 判超时只在 ota_task_wdt_arm() 之后生效(见 ota_wdt.h):
+         *   OTA 任务因堆不足没创建起来时, 板子不该陷入复位死循环。
+         *
+         * ⚠ 只在"首次"判超时时打印(此时 WTD_RESET 还是 0): 不喂狗到复位
+         *   只有约 1.6s, 期间本循环还会跑 3 次, 不加判断会连打 3 条日志。 */
+        if (ota_task_wdt_timed_out() != 0U) {
+            if (WTD_RESET == 0U) {
+                printf("[WDT] OTA task stuck > %lums, stop feeding"
+                       " -> SP706S reset (code 31)\r\n",
+                       (unsigned long)OTA_TASK_WDT_TIMEOUT_MS);
+            }
+            WTD_RESET = 31U;  /* OTA 升级任务卡死 */
         }
 
 
@@ -662,9 +704,9 @@ static void uart_task_handler(void *pvParameters)
         /* 打点: 整轮耗时异常 (>1.5s) 时打印, 用于定位阻塞点 */
         round_ms = HAL_GetTick() - round_start;
         if (round_ms > 1500UL) {
-            printf("[ROUND] port=%u poll=%lums round=%lums\r\n",
-                   (unsigned)port_idx, (unsigned long)poll_ms,
-                   (unsigned long)round_ms);
+            // printf("[ROUND] port=%u poll=%lums round=%lums\r\n",
+            //        (unsigned)port_idx, (unsigned long)poll_ms,
+            //        (unsigned long)round_ms);
         }
     }
 }
@@ -868,6 +910,7 @@ static void uart_process_custom_port(UART_PortRuntime_t *runtime)
     const UART_ModuleProfile_t *profile;
     uint16_t                   rx_len;
     uint16_t                   dc_offset = 0;
+    uint16_t                   flush_before;
 
     if (runtime == NULL) {
         return;
@@ -880,6 +923,7 @@ static void uart_process_custom_port(UART_PortRuntime_t *runtime)
 
     runtime->link_mask = 0;
     runtime->data_len = 0;
+    flush_before = uart_custom_flush_cnt[runtime->port_idx];
 
     for (m = 0; m < module_count; m++) {
         profile = uart_get_module_profile(
@@ -919,6 +963,26 @@ static void uart_process_custom_port(UART_PortRuntime_t *runtime)
     }
 
     *((uint32_t *)&SerialDataBuf[runtime->port_idx][7]) = runtime->link_mask;
+
+    /* 诊断: 本轮"发送窗口内有字节到达"的次数 (被 TC 中断冲掉的残字节).
+     * 非 0 表示总线上还有别人在发 (上一台的迟到应答 / 回声 / 噪声), 即旧实现
+     * 会把残字节当应答首字节、整帧前移一字节导致 CRC 失败的那些时刻.
+     * 现在已被冲掉, 不再污染应答; 若这里频繁出现, 说明总线时序还有问题. */
+    {
+        uint16_t flushed = (uint16_t)(uart_custom_flush_cnt[runtime->port_idx]
+                                      - flush_before);
+        if (flushed != 0U) {
+            printf("[DC-FLUSH] port=%u n=%u\r\n",
+                   (unsigned)(runtime->port_idx + 1U), (unsigned)flushed);
+        }
+    }
+
+    /* 每轮汇总: link 位图(1=在线) + 本端口模块数. 配合上面的 [DC-FAIL] 地址,
+     * 一眼看出哪几台缺位、缺位是否随机. */
+    printf("[DC-ROUND] port=%u link=%08X n=%u\r\n",
+           (unsigned)(runtime->port_idx + 1U),
+           (unsigned)runtime->link_mask,
+           (unsigned)module_count);
 }
 
 
@@ -953,12 +1017,28 @@ static uint16_t uart_custom_module_exchange(uint8_t port_idx, uint8_t module_idx
     tx_buf[6] = (uint8_t)(tx_crc & 0xFFU);
     tx_buf[7] = (uint8_t)((tx_crc >> 8) & 0xFFU);
 
-    /* 发送 + 接收, 直接写入 SerialDataBuf */
+    /* 发送 + 接收, 直接写入 SerialDataBuf
+     * 字节间隔超时 10→50ms: 与计轴/DC3WIRE 路径对齐 (计轴处注释写明"丢包问题在
+     *   字节间隔", 一直是 50ms; DC3WIRE 是 20ms). 采集盒采样周期就是 40ms/点,
+     *   帧内某一段等一个采样节拍、或去处理另一路 485-2 的 1DQJ 开关量
+     *   (手册: 20ms/帧) 时, 段间空档完全可能超过 10ms → 主站在帧中间就判"帧
+     *   结束" → 半截帧 → CRC 失败/长度<4 → 该从机当轮离线. 帧尾判定要等满
+     *   该超时, 故每台多花 ~40ms (13 台 ≈ +0.5s/轮).
+     * 首字节超时 600ms: 盒子手册标称动态响应 ≤250ms, 留 2 倍余量. */
     rx_len = uart_custom_exchange(port_idx, tx_buf, 8,
                                   resp,
                                   (uint16_t)(UART_SERIAL_BUF_SIZE - 11U),
-                                  40, 10);  /* 首字节超时 80→40ms: 离线从机更快暴露, 1s内轮询完13台 */
+                                  600, 100);    //test:50->100
     if (rx_len < 4U) {
+        printf("[DC-FAIL] port=%u addr=%u 无应答 rx_len=%u",
+               (unsigned)(port_idx + 1U),
+               (unsigned)BoardCfgTab[port_idx].SlaveModuelAddress[module_idx],
+               (unsigned)rx_len);
+        if (rx_len > 0U) {
+            printf(" head=%02X %02X %02X",
+                   (unsigned)resp[0], (unsigned)resp[1], (unsigned)resp[2]);
+        }
+        printf("\r\n");
         return 0;
     }
 
@@ -968,6 +1048,15 @@ static uint16_t uart_custom_module_exchange(uint8_t port_idx, uint8_t module_idx
                 | (uint16_t)resp[rx_len - 2U];
 
     if (rx_crc_calc != rx_crc_recv) {
+        /* head=前4字节: 若 resp[0]!=addr 而 resp[1]==addr, 即"残字节混入、整帧
+         * 前移一位"的铁证; len 值对照期望 151(实时)/351(曲线), 明显偏小则是
+         * 帧被字节间隔超时误切. */
+        printf("[DC-FAIL] port=%u addr=%u CRC ERROR len=%u head=%02X %02X %02X %02X calc=%04X recv=%04X\r\n",
+               (unsigned)(port_idx + 1U),
+               (unsigned)BoardCfgTab[port_idx].SlaveModuelAddress[module_idx],
+               (unsigned)rx_len,
+               (unsigned)resp[0], (unsigned)resp[1], (unsigned)resp[2], (unsigned)resp[3],
+               (unsigned)rx_crc_calc, (unsigned)rx_crc_recv);
         return 0;
     }
 
@@ -1034,12 +1123,16 @@ static void uart_custom_module_online(UART_PortRuntime_t *runtime,
     runtime->data_len += profile->realtime_bytes;
 
     /*
-     * 在曲线帧分发之前更新 SerialDataBuf 中的链路掩码.
-     * uart_handle_curve_frame_dispatch 在收到 0xFF 结束帧时会立即通过
-     * client_add_to_tcp_send_buf 上传完整曲线数据, 此时 ser_buf[7-10]
-     * 必须反映当前在线状态, 否则上位机会看到 link_mask=0x00000000.
+     * 注意: 此处**不要**把 runtime->link_mask 回写到 SerialDataBuf[7-10].
+     * uart_process_custom_port 每轮开始先把 runtime->link_mask 清 0, 再逐台
+     * 置位, 所以走到这里时它是"本轮已轮询过的模块"的半成品 —— 尚未轮询到的
+     * 模块位全是 0. 一旦在此回写: 曲线上传 (uart_handle_curve_end_frame 直接把
+     * ser_buf[0] 推 TCP) 和串口7的主机通信板在线检查都会读到这个半成品, 表现
+     * 为每轮里靠后的模块 (如 m4/m5) 随机报离线, 而实际通信完全正常, 且不会
+     * 有任何 [DC-FAIL] (因为压根没失败).
+     * 让 SerialDataBuf[7-10] 保持为"上一轮结束时的完整掩码"即可 —— 循环末尾会
+     * 写入本轮的完整掩码.
      */
-    *((uint32_t *)&ser_buf[7]) = runtime->link_mask;
 
     /* 曲线帧分发 (使用完整 SerialDataBuf 中的绝对偏移) */
     uart_handle_curve_frame_dispatch(runtime->port_idx, module_idx,
@@ -1655,7 +1748,8 @@ static void uart_axle_counter_online(UART_PortRuntime_t *runtime,
 
             uart_axle_counter_upload_pulse(runtime->port_idx, module_idx,
                                            &resp[pulse_off], pulse_len,
-                                           0x01U, runtime->link_mask);
+                                           0x01U,
+                                           uart_published_link_mask(runtime->port_idx));
         }
     }
 
@@ -1900,6 +1994,9 @@ static void uart_dc3wire_upload_curve(uint8_t port_idx, uint8_t module_idx,
         frame[3] = (module_type == FLFXG_DC3WIRE_ZTM) ? 0x0BU : 0x0AU;
         frame[4] = BoardCfgTab[port_idx].FenjiNum;
         *((uint16_t *)&frame[5]) = (uint16_t)(pkt_offset + 4U);
+        /* link_mask 必须是 uart_published_link_mask() 取的"上一轮完整掩码",
+         * 不能是轮询中途的 runtime->link_mask 半成品 —— 帧区就在
+         * SerialDataBuf[port][0], 写进去的同时也就成了对外发布的掩码. */
         *((uint32_t *)&frame[7]) = link_mask;
 
         f_len = (uint16_t)(pkt_offset + 11U);
@@ -1958,7 +2055,8 @@ static void uart_dc3wire_online(UART_PortRuntime_t *runtime,
         }
 
         uart_dc3wire_upload_curve(runtime->port_idx, module_idx,
-                                  resp, runtime->link_mask);
+                                  resp,
+                                  uart_published_link_mask(runtime->port_idx));
     } else {
         /* 无曲线: 清除 curve_seq, 下次请求恢复 00 00 */
         dc3wire_state[runtime->port_idx].curve_seq[module_idx] = 0x0000;
