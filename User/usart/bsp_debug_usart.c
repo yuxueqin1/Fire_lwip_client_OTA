@@ -27,7 +27,7 @@ extern uint8_t ucTemp;
   */  
 void DEBUG_USART_Config(void)
 { 
-#if DEBUG_UART_ENABLE
+
   
   UartHandle.Instance          = DEBUG_USART;
   
@@ -39,7 +39,7 @@ void DEBUG_USART_Config(void)
   UartHandle.Init.Mode         = UART_MODE_TX_RX;
   
   HAL_UART_Init(&UartHandle); 
-#endif
+
 }
 
 
