@@ -20,24 +20,34 @@
 #define IDX_INVALID                 ( 255 )
 
 /*
- * 自定义串口 RX 环形缓冲区 (与 bsp_rs485.h 完全一致, 524 字节).
- * head/count 只由本文件的 RXNE 中断写, tail 只由任务侧
- * (uart_custom_exchange 的流式排空循环) 写, 两者的 count 读改写互斥由任务侧
- * 用 PRIMASK 保证 (UART 中断优先级 2 高于 FreeRTOS 临界区屏蔽级 5).
+ * 自定义串口 RX 环形缓冲区 (与 bsp_rs485.h 完全一致, 518 字节).
+ * 严格 SPSC: 本文件的 RXNE 中断只写 buffer/head, 任务侧
+ * (uart_custom_exchange 的流式排空循环) 只写 tail.
+ * 两个字段各只有一个写者, 占用用 head-tail 算 → 不需要任何临界区.
+ * (原实现用 head/tail/count 三元组, 任务侧 count-- 的"读"被编译器提到 CPSID
+ *  之前, ISR 的 count++ 会被任务回写的老值覆盖, 见 bsp_rs485.h 里的说明.)
  * 注意: 修改此处时必须同步更新 bsp_rs485.h 中的 UART_RxRing_t.
  */
 #define UART_RX_RING_SIZE           512
+#define UART_RX_RING_MASK           (UART_RX_RING_SIZE - 1U)
 typedef struct {
     uint8_t  buffer[UART_RX_RING_SIZE];  /* 512 B                        */
-    uint32_t last_byte_tick;             /*   4 B, offset 512 (512%4=0)  */
-    uint16_t head;                       /*   2 B, offset 516            */
-    uint16_t tail;                       /*   2 B, offset 518            */
-    uint16_t count;                      /*   2 B, offset 520            */
-    uint8_t  rx_active;                  /*   1 B, offset 522            */
-    uint8_t  _pad;                       /*   1 B, 对齐到 524            */
+    volatile uint16_t head;              /*   2 B, offset 512  ISR 只写 / 任务只读 */
+    volatile uint16_t tail;              /*   2 B, offset 514  任务只写 / ISR 只读 */
+    volatile uint8_t  rx_active;         /*   1 B, offset 516            */
+    uint8_t  _pad;                       /*   1 B, 对齐到 518            */
 } UART_RxRing_t;
 extern UART_RxRing_t       uart_rx_ring[6];
 extern uint8_t             UART_Custom[6];
+/* 诊断计数器: 发送窗口内到达、被 TC 中断冲掉的残字节次数 (见下方 TC 分支) */
+extern volatile uint16_t   uart_custom_flush_cnt[6];
+/* 诊断计数器 (见 bsp_rs485.c 的 [DC-SHORT] 打印):
+ *   dc_rx_store_cnt: ISR 实际存进 ring 的字节数
+ *   dc_rx_ore_cnt  : ISR 入口快照里 ORE 置位次数 (= 硬件因溢出丢掉 1 字节)
+ *   dc_rx_steal_cnt: 错误标志块读 DR 时 RXNE 仍置位次数 (= 原本会被吃掉的字节) */
+extern volatile uint16_t   dc_rx_store_cnt[6];
+extern volatile uint16_t   dc_rx_ore_cnt[6];
+extern volatile uint16_t   dc_rx_steal_cnt[6];
 
 /*
  * 自定义串口 TX 状态 (与 bsp_rs485.h 中的 UART_CustomTxState_t 完全一致).
@@ -398,6 +408,13 @@ static void prvUARTIRQHandler( xSerialPortInternal *pxSerial )
             sr  = pxSerial->huart.Instance->SR;
             cr1 = pxSerial->huart.Instance->CR1;
 
+            /* 诊断: ORE 置位 = 上一字节还在 DR 里时又到一个字节, 硬件把**新到的**
+             * 那个丢了 (STM32 溢出语义: DR 保留旧字节). 逐次统计, 任务侧清零看差值. */
+            if( sr & USART_SR_ORE )
+            {
+                dc_rx_ore_cnt[_port]++;
+            }
+
             /* ── TXE: 中断驱动发送请求帧 (与 Modbus prvUARTTxISR 同思路) ──
              * 请求帧字节由 ISR 按波特率连续移出, 与任务调度无关, 免疫抢占拆帧.
              *
@@ -440,7 +457,7 @@ static void prvUARTIRQHandler( xSerialPortInternal *pxSerial )
              * ring 复位与 RXNE 使能放在 ISR 而非任务, 目的有二:
              *   1) 与拉低 DE 零间隙衔接, 快速应答不丢首字节;
              *   2) 任务侧不再重复初始化 ring, 避免与 ISR 竞争清掉已收字节.
-             * 之后任务只等待 ring->count 增长. */
+             * 之后任务按 ring 的 head/tail 差判断有没有新字节. */
             if( ( sr & USART_SR_TC ) && ( cr1 & USART_CR1_TCIE ) )
             {
                 __HAL_UART_DISABLE_IT( &pxSerial->huart, UART_IT_TC );
@@ -448,12 +465,40 @@ static void prvUARTIRQHandler( xSerialPortInternal *pxSerial )
                 HAL_GPIO_WritePin( uart_custom_tx[_port].de_port,
                                    uart_custom_tx[_port].de_pin, GPIO_PIN_RESET );
 
+                /* ── 先冲掉"发送期间"落进 DR 的残字节, 再开接收窗口 ──
+                 * 发送期间 rx_active==0, 到达的字节不进 ring, 但会留在 DR 并置 RXNE.
+                 * 末字节发送期间 (9600 下约 1ms) 到达的字节最致命: 此后不再有 TXE
+                 * 中断去读 DR, 它会一直挂到 TC; 而下面的 RXNE 分支用的是 ISR 入口的
+                 * sr 快照, 会把这个残字节当成应答的"首字节"存进刚复位的 ring →
+                 * 整帧前移一字节 → 末两字节不再是 CRC → 校验必然失败 → 该从机被判
+                 * 离线. 现场表现: 随机 1~2 台掉线, 与首字节超时/静默窗口都无关
+                 * (调这两个参数没有任何改善).
+                 * 此刻盒子不可能已经应答 (它要先收完整帧再启动发送, 至少数百 us),
+                 * 故冲掉的必是自发自收的回声 / 上一台的迟到应答 / 总线噪声.
+                 * 读 SR 再读 DR 同时清掉 RXNE/ORE/FE/NE. */
+                if( pxSerial->huart.Instance->SR & ( USART_SR_RXNE | USART_SR_ORE ) )
+                {
+                    uart_custom_flush_cnt[_port]++;   /* 诊断: TX 窗口内曾有字节到达 */
+                    tmp = pxSerial->huart.Instance->SR;
+                    tmp = pxSerial->huart.Instance->DR;
+                    ( void )tmp;
+                }
+                /* sr 是 ISR 入口的快照, 上面读 DR 只清了硬件标志. 若不清快照,
+                 * 下面 RXNE 分支仍会据此再读一次"已经空了"的 DR, 把残留值当作
+                 * 应答首字节存进 ring —— 与本修复目的相反. 清掉收方向标志后,
+                 * 之后到达的字节会重新置 RXNE 并触发一次新的中断 (RXNEIE 已开),
+                 * 用新的 sr 正常入 ring. 此刻 DE 刚拉低 ~2us, 而盒子最快也要
+                 * 收完末字节再移出完整一帧首字节 (≥950us) 才可能让本机 RXNE 置位,
+                 * 有 500 倍余量, 不会误丢真正的首字节. */
+                sr &= ( ULONG )( ~( USART_SR_RXNE | USART_SR_ORE |
+                                    USART_SR_FE   | USART_SR_NE  |
+                                    USART_SR_PE ) );
+
                 /* 直接进入接收窗口: 复位 ring 并开启 RXNE */
                 {
                     UART_RxRing_t *_ring = &uart_rx_ring[_port];
                     _ring->head   = 0;
                     _ring->tail   = 0;
-                    _ring->count  = 0;
                     _ring->rx_active = 1;
                 }
                 __HAL_UART_ENABLE_IT( &pxSerial->huart, UART_IT_RXNE );
@@ -469,16 +514,16 @@ static void prvUARTIRQHandler( xSerialPortInternal *pxSerial )
                 {
                     uint8_t _byte = ( uint8_t )( pxSerial->huart.Instance->DR & 0xFFU );
                     UART_RxRing_t *_ring = &uart_rx_ring[_port];
-                    /* ring 由任务侧流式排空, 正常情况绝不会满; 走到 else 说明任务
-                     * 被抢占的时长超过了 ring 能吸收的字节数 (512B @19200 ≈ 270ms),
+                    /* 满判据: 留一个空槽 —— (head+1)==tail 即满 (容量 511 字节).
+                     * ring 由任务侧流式排空, 正常情况绝不会满; 走到 else 说明任务
+                     * 被抢占的时长超过了 ring 能吸收的字节数 (511B @19200 ≈ 266ms),
                      * 该字节连同后续字节丢失 → 帧 CRC 失败. 属异常调度, 需查任务
                      * 优先级/长时间阻塞点, 不要靠加大 ring 掩盖. */
-                    if( _ring->count < UART_RX_RING_SIZE )
+                    if( ( uint16_t )( ( _ring->head + 1U ) & UART_RX_RING_MASK ) != _ring->tail )
                     {
-                        _ring->buffer[_ring->head] = _byte;
-                        _ring->head = ( _ring->head + 1 ) % UART_RX_RING_SIZE;
-                        _ring->count++;
-                        _ring->last_byte_tick = HAL_GetTick();
+                        _ring->buffer[_ring->head] = _byte; /* 先写数据, 后发布 head */
+                        _ring->head = ( uint16_t )( ( _ring->head + 1U ) & UART_RX_RING_MASK );
+                        dc_rx_store_cnt[_port]++;    /* 诊断: 本字节已入 ring */
                     }
                 }
             }
@@ -491,12 +536,36 @@ static void prvUARTIRQHandler( xSerialPortInternal *pxSerial )
                 }
             }
 
-            /* 错误标志: 读 SR+DR 清除 (无论 rx_active 状态) */
+            /* 错误标志: 读 SR+DR 清除 (无论 rx_active 状态)
+             * [2026-09-28 诊断] 原实现"无脑读 DR"有个隐患: 若此刻恰好又到一个
+             *   字节 (RXNE 仍置位), 这一读会把它**吃掉**且不留痕迹 —— 正好能解释
+             *   "应答恒定少最后 1 字节、切帧后再等 300ms 也没有". 现场调试助手在
+             *   同一条总线上抓到盒子回的完整 143B 帧 (CRC 自洽), 故末字节确在线上,
+             *   丢在主站侧. 本处先在**重新读的 SR** 上判断是否有待取字节:
+             *     有 → 说明刚到一个真字节: 统计 dc_rx_steal_cnt 并**存进 ring**
+             *          (修复, 不再丢弃; 帧尾那 50ms 内任务仍在排空 ring, 会取走);
+             *     无 → 保持原样, 读 SR+DR 清错误标志.
+             * 读 SR→读 DR 同时清 ORE/FE/NE/PE, 与 RXNE (上面已读走的那次同序列). */
             if( sr & ( USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE ) )
             {
-                tmp = pxSerial->huart.Instance->SR;
-                tmp = pxSerial->huart.Instance->DR;
-                ( void )tmp;
+                if( ( pxSerial->huart.Instance->SR & USART_SR_RXNE )
+                    && uart_rx_ring[_port].rx_active
+                    && ( ( uint16_t )( ( uart_rx_ring[_port].head + 1U ) & UART_RX_RING_MASK )
+                         != uart_rx_ring[_port].tail ) )
+                {
+                    UART_RxRing_t *_r = &uart_rx_ring[_port];
+
+                    dc_rx_steal_cnt[_port]++;
+                    _r->buffer[_r->head] = ( uint8_t )( pxSerial->huart.Instance->DR & 0xFFU );
+                    _r->head = ( uint16_t )( ( _r->head + 1U ) & UART_RX_RING_MASK );
+                    dc_rx_store_cnt[_port]++;
+                }
+                else
+                {
+                    tmp = pxSerial->huart.Instance->SR;
+                    tmp = pxSerial->huart.Instance->DR;
+                    ( void )tmp;
+                }
             }
 
             return;  /* 已处理, 不执行下方 FreeModbus 逻辑 */

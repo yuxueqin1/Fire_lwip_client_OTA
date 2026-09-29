@@ -74,6 +74,23 @@ uint8_t           TaskAdjustNum[UART_PORT_COUNT] = {0};
 /* ---- 系统时间 (上位机校时命令下发, Unix 时间戳格式) ---- */
 uint32_t          Systemtime = 0;
 
+/* ---- 诊断计数器: 发送窗口内到达、被 TC 中断冲掉的残字节次数 ----
+ * 由 mbport/mbportserial.c 的 TC 分支自增, 任务侧只读.
+ * 非 0 说明"发送期间总线还有别人在发字节" (上一台迟到应答 / 回声 / 噪声),
+ * 即旧实现会把残字节当应答首字节、导致整帧前移一字节而 CRC 失败的场景. */
+volatile uint16_t uart_custom_flush_cnt[UART_PORT_COUNT] = {0};
+
+/* ---- 诊断计数器: 接收侧丢字节定位 (2026-09-28, 由 mbportserial.c 的 ISR 自增) ----
+ * 现场已证实: 盒子回的 143B 帧在线上完整且 CRC 自洽, 主站只拿到 142B 且切帧后
+ * 再等 300ms 也无字节到达 → 末字节丢在主站侧. 这三个计数器把"丢在哪一环"分开:
+ *   dc_rx_store_cnt: ISR 存进 ring 的字节数 (与任务侧 copied 对比)
+ *   dc_rx_ore_cnt  : ORE 置位次数 → 硬件溢出丢字节 (ISR 被阻塞 > 1 字节时间)
+ *   dc_rx_steal_cnt: 错误标志块读 DR 时 RXNE 仍置位 → 该字节原本会被吃掉 (已改为存回)
+ * 任务侧在每帧开始/结束取差值打印, 定位后连同 [DC-SHORT] 一起删除. */
+volatile uint16_t dc_rx_store_cnt[UART_PORT_COUNT] = {0};
+volatile uint16_t dc_rx_ore_cnt[UART_PORT_COUNT]   = {0};
+volatile uint16_t dc_rx_steal_cnt[UART_PORT_COUNT] = {0};
+
 /* ---- 总报警标志 (6 路端口各占 1 bit) ---- */
 uint8_t           ALARM = 0;
 
@@ -707,16 +724,40 @@ uint16_t uart_custom_exchange(uint8_t port_idx, const uint8_t *tx_buf, uint16_t 
         return 0U;
     }
 
-    /* ---- 彻底清空 UART RX: 排空所有残留字节, 连带清除所有错误标志 ---- */
-    /* 循环读取 DR 直到 RXNE=0: 每次读 DR 都会同时清除 RXNE/ORE/FE/NE.
-     * HAL 自带的 CLEAR_FEFLAG/CLEAR_NEFLAG 宏只读 SR 不读 DR,
-     * 无法真正清除 FE/NE (STM32F4 手册要求 SR+DR 读序列), 故直接循环排空. */
+    /* ---- 等待总线静默 + 排空所有残留字节, 连带清除所有错误标志 ----
+     * [为什么必须等静默] 从机被放弃 (首字节超时) 后, 它的应答仍会在几十~几百 ms
+     *   后到达. 若此时本机已向下一台从机发出请求, 两条帧在半双工总线上重叠,
+     *   双方的 CRC 全部失败 → 表现为"随机几台采集盒同时掉线, 下一秒又恢复",
+     *   掉线地址不固定. 只排空 DR 是不够的: 排空只清掉"已经到了的"字节, 挡不住
+     *   "还没到的"迟到应答. 必须先确认总线真的安静了再发下一帧.
+     * [怎么判] 边排空边记录"最后一次收到字节的时刻", 只有连续静默
+     *   UART_BUS_QUIET_MS 才认为总线空闲; 静默期间收到的迟到字节全部丢弃.
+     *   每次读 DR 会同时清除 RXNE/ORE/FE/NE (HAL 的 CLEAR_FEFLAG/CLEAR_NEFLAG
+     *   宏只读 SR 不读 DR, 清不掉 FE/NE, 故直接读 DR).
+     * [为什么不污染 ring] 进入本函数时 RXNEIE 已被上一次交换关闭且 rx_active=0,
+     *   字节只落 DR 不进 ring buffer, 故此处轮询 DR 是安全的.
+     * [代价] 总线本来就空闲时, 每次交换多花 ~UART_BUS_QUIET_MS (5ms);
+     *   6 台 ≈ 30ms/轮, 相对 1s 轮询预算可忽略 (字节间隔超时 100ms→10ms 已省下
+     *   540ms). 也不能把窗口压到 1~2ms: 任务侧是 1ms tick 粒度采样, 判定窗口
+     *   必须明显大于调度抖动, 否则会把"采样没赶上"误判成"总线已静默".
+     * [兜底] 总线被拉死或持续噪声时, 累计等待超过 UART_BUS_QUIET_MAX_MS 强制
+     *   放行: 宁可带着碰撞风险试一次, 也不能在此死等把整个端口拖停.
+     * [残余风险] 若某台从机的应答晚到超过 UART_BUS_QUIET_MAX_MS (极端慢), 仍会
+     *   与本次发送碰撞. 该情形只能靠首字节超时给足余量 (见调用处) 来避免. */
     {
-        uint32_t _drain_timeout = 100000U;
-        while (__HAL_UART_GET_FLAG(huart, UART_FLAG_RXNE) && _drain_timeout > 0U) {
-            (void)huart->Instance->DR;
-            _drain_timeout--;
-        }
+        uint32_t quiet_start = HAL_GetTick();
+        uint32_t last_rx     = quiet_start;
+
+        do {
+            if (__HAL_UART_GET_FLAG(huart, UART_FLAG_RXNE)) {
+                (void)huart->Instance->DR;    /* 丢弃迟到字节, 顺带清错误标志 */
+                last_rx = HAL_GetTick();
+            }
+            if ((HAL_GetTick() - last_rx) >= UART_BUS_QUIET_MS) {
+                break;                        /* 已连续静默 → 总线空闲 */
+            }
+            vTaskDelay(pdMS_TO_TICKS(1));     /* 让出 CPU, 不忙等饿死同级任务 */
+        } while ((HAL_GetTick() - quiet_start) < UART_BUS_QUIET_MAX_MS);
     }
     /* 排空后再走一遍标准清理 (处理极端情况: DR 空但 SR 还有残余标志) */
     __HAL_UART_CLEAR_OREFLAG(huart);
@@ -780,11 +821,11 @@ uint16_t uart_custom_exchange(uint8_t port_idx, const uint8_t *tx_buf, uint16_t 
      *       first_byte_timeout_ms(100ms) 才超时返回, 校时期间每模块浪费100ms.
      *       此处关闭接收窗口后立即返回, 残余应答字节由下一次交换前的
      *       排空循环 (上方 DR 循环) 清掉. */
-    if (rx_buf == NULL) {
-        __HAL_UART_DISABLE_IT(huart, UART_IT_RXNE);
-        uart_rx_ring[port_idx].rx_active = 0;
-        return 0U;
-    }
+    // if (rx_buf == NULL) {
+    //     __HAL_UART_DISABLE_IT(huart, UART_IT_RXNE);
+    //     uart_rx_ring[port_idx].rx_active = 0;
+    //     return 0U;
+    // }
 
     /* ---- 步骤 6-7: 中断驱动接收 (ring buffer 流式排空 + vTaskDelay) ---- */
     /*
@@ -807,9 +848,9 @@ uint16_t uart_custom_exchange(uint8_t port_idx, const uint8_t *tx_buf, uint16_t 
      * [怎么改] 每轮循环把 ring 里已到的字节立刻搬进 rx_buf 并推进 tail, 腾出
      *   ring 空间; ring 退化为抖动缓冲, 只用于吸收任务调度延迟, 单帧长度不再
      *   受 UART_RX_RING_SIZE 限制 (上限变为调用方给的 rx_max_len).
-     * [帧结束判定] 不能再用 ring->count 判断"是否有新字节" —— count 会被本循环
-     *   搬走而减小. 改用"累计到达字节数" = copied + ring->count, 其在搬空 ring
-     *   后保持恒定, 只有 ISR 收入新字节时才增长.
+     * [帧结束判定] 不能再用"ring 非空"判断有没有新字节 —— 本循环会把字节搬走.
+     *   改用"累计到达字节数" = copied + ring 当前占用, 搬空 ring 后保持恒定,
+     *   只有 ISR 收入新字节时才增长; 帧尾仍按字节间隔超时判定 (见下方 ③).
      */
     {
         UART_RxRing_t *ring = &uart_rx_ring[port_idx];
@@ -817,10 +858,14 @@ uint16_t uart_custom_exchange(uint8_t port_idx, const uint8_t *tx_buf, uint16_t 
         uint32_t       last_byte_tick;
         uint16_t       arrived;      /* 上一轮采样到的"累计到达字节数" */
         uint16_t       copied = 0U;  /* 已经搬进 rx_buf 的字节数        */
+        /* 本帧 ISR 侧计数基线 (帧长异常打印差值, 见下方 [DC-SHORT]) */
+        uint16_t       dc_store0 = dc_rx_store_cnt[port_idx];
+        uint16_t       dc_ore0   = dc_rx_ore_cnt[port_idx];
+        uint16_t       dc_steal0 = dc_rx_steal_cnt[port_idx];
 
         /* 等待首字节 (first_byte_timeout_ms 超时) */
         start_tick = HAL_GetTick();
-        while (ring->count == 0U) {
+        while (UART_RX_RING_USED(ring) == 0U) {
             if ((HAL_GetTick() - start_tick) > first_byte_timeout_ms) {
                 __HAL_UART_DISABLE_IT(huart, UART_IT_RXNE);
                 ring->rx_active = 0;
@@ -830,27 +875,24 @@ uint16_t uart_custom_exchange(uint8_t port_idx, const uint8_t *tx_buf, uint16_t 
         }
 
         last_byte_tick = HAL_GetTick();
-        arrived        = ring->count;
+        arrived        = UART_RX_RING_USED(ring);
 
         for (;;) {
+            uint16_t used = UART_RX_RING_USED(ring);
+
             /* ① 流式排空: 把 ring 中已到的字节搬进 rx_buf 并推进 tail.
-             *    tail/count 的读改写必须与 ISR 的 count++ 互斥, 否则本循环的
-             *    "读 count → 减 1 → 写回" 若被 ISR 的 "读 count → 加 1 → 写回"
-             *    打断, 会丢掉一次递增, head/tail/count 三者关系错乱.
-             *    UART 中断优先级为 2, 高于 configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY
-             *    (5), taskENTER_CRITICAL() 的 BASEPRI 屏蔽不到它, 只能用 PRIMASK
-             *    全屏蔽 (临界区仅 3 条指令, 对 19200baud 的字节间隔无影响). */
-            while ((ring->count > 0U) && (copied < rx_max_len)) {
-                uint8_t  byte_in = ring->buffer[ring->tail];
-                uint32_t primask = __get_PRIMASK();
-
-                __disable_irq();
-                ring->tail = (uint16_t)((ring->tail + 1U) % UART_RX_RING_SIZE);
-                ring->count--;
-                __set_PRIMASK(primask);
-
-                rx_buf[copied++] = byte_in;
+             *    ring 是严格 SPSC (ISR 只写 buffer/head, 本循环只写 tail),
+             *    两个上下文没有共享变量的读改写, 所以**这里不需要任何临界区**.
+             *    原实现要读改写 count, 靠 __disable_irq() 互斥; 但 count 的"读"
+             *    被编译器提到了 CPSID 之前, 临界区只包住"写" —— ISR 在那几条指令
+             *    间隙里存进字节, 它那次 count++ 就被回写的老值覆盖, count 少 1,
+             *    帧尾字节永远取不出来 (现场 [DC-TAIL] h=143 t=142 cnt=0 即此).
+             *    used 是本轮开始时的快照, 排空过程中 ISR 再存进来的字节由下一轮取走. */
+            while ((used != 0U) && (copied < rx_max_len)) {
+                rx_buf[copied++] = ring->buffer[ring->tail];
+                ring->tail       = (uint16_t)((ring->tail + 1U) & UART_RX_RING_MASK);
                 last_byte_tick   = HAL_GetTick();
+                used--;
             }
 
             /* ② rx_buf 已满: 不能再收, 结束本次交换 (调用方按截断帧处理) */
@@ -858,9 +900,17 @@ uint16_t uart_custom_exchange(uint8_t port_idx, const uint8_t *tx_buf, uint16_t 
                 break;
             }
 
-            /* ③ 帧结束判定 (inter_byte_timeout_ms 字节间隔超时) */
+            /* ③ 帧结束判定: 字节间隔超时 (inter_byte_timeout_ms)
+             *    [为什么不用应答头里的字节数提前收帧] 这些采集盒的帧型里, 只有
+             *    0x8A 交流道岔帧的第 3 字节是字节数; 计轴(0x50/0x53)、直流三对线
+             *    (0x51/0x52) 的应答是 [addr][03] + 数据, 第 3 字节就是**数据**
+             *    (main.c 里标注 "无 byte_count"). 拿数据当长度算 → 收满就会提前
+             *    收帧把长帧截断, 虽然要 CRC 巧合才真截断, 但按帧率折算一年也有
+             *    若干次, 不能接受. 故一律以字节间隔超时为准.
+             *    [想再快] 请把调用处的 inter_byte_timeout_ms 从 100ms 调到 ~20ms
+             *    (19200 下字节间隔仅 0.52ms, 20ms 有 38 倍余量), 不要去信长度字节. */
             {
-                uint16_t now_arrived = (uint16_t)(copied + ring->count);
+                uint16_t now_arrived = (uint16_t)(copied + UART_RX_RING_USED(ring));
 
                 if (now_arrived != arrived) {
                     /* 有新字节到达, 重置超时计时器 */
@@ -872,7 +922,71 @@ uint16_t uart_custom_exchange(uint8_t port_idx, const uint8_t *tx_buf, uint16_t 
                 }
             }
 
+            /* ④ 暂无新字节/未到超时 → 让出 CPU, 下一轮再排空 */
             vTaskDelay(pdMS_TO_TICKS(1));
+        }
+
+        /* ---- 帧长异常哨兵: 交流道岔 0x8A 应答应为 143B, 少了就是又丢字节了 ----
+         * 背景 (2026-09-28 现场): 调试助手与主站挂同一条 485 总线, 抓到的应答在线
+         *   上是完整 143B 且 CRC 逐帧自洽, 主站却只收到 142B —— 丢在主站侧. 根因是
+         *   ring 的 count 读改写有竞态 (见 bsp_rs485.h 里 UART_RxRing_t 的说明),
+         *   已改为 SPSC 无 count 结构.
+         * **修好后这里应该永不打印.** 一旦又打出来, 这行给出全部现场证据:
+         *   len      : 本次实际收帧长度 (期望 143 = 3 + 0x8A + 2)
+         *   store/ore/steal: ISR 入 ring 次数 / 硬件 ORE 次数 / 错误标志块抢存次数
+         *   used/h/t : 收帧瞬间 ring 占用与读写指针 (SPSC 下正常恒有 h-t == used)
+         *   sr/cr1/de: 收帧瞬间 UART 状态与 DE 引脚电平 (de=1 说明没切回接收)
+         * 下面的兜底让现场数据先能用, 定位后连兜底一起删. */
+        if ((copied >= 4U) && (copied < rx_max_len)
+            && (rx_buf[1] == 0x03U) && (rx_buf[2] == 0x8AU)) {
+            const uint16_t dc_need = (uint16_t)(3U + 0x8AU + 2U);   /* 143 */
+
+            if (copied != dc_need) {
+                static uint8_t s_tail_rep[UART_PORT_COUNT] = { 0 };
+
+                if (s_tail_rep[port_idx] == 0U) {
+                    s_tail_rep[port_idx] = 1U;
+                    printf("[DC-SHORT] port=%u len=%u/%u store=%u ore=%u steal=%u"
+                           " ring(used=%u h=%u t=%u) sr=%04X cr1=%04X de=%u\r\n",
+                           (unsigned)(port_idx + 1U), (unsigned)copied,
+                           (unsigned)dc_need,
+                           (unsigned)(uint16_t)(dc_rx_store_cnt[port_idx] - dc_store0),
+                           (unsigned)(uint16_t)(dc_rx_ore_cnt[port_idx] - dc_ore0),
+                           (unsigned)(uint16_t)(dc_rx_steal_cnt[port_idx] - dc_steal0),
+                           (unsigned)UART_RX_RING_USED(ring),
+                           (unsigned)ring->head, (unsigned)ring->tail,
+                           (unsigned)huart->Instance->SR,
+                           (unsigned)huart->Instance->CR1,
+                           (unsigned)HAL_GPIO_ReadPin(cfg->de_port, cfg->de_pin));
+                }
+
+                /* 兜底: 只缺末字节且 CRC 低字节吻合 → 补出高字节, 上层原有 16 位
+                 * CRC 校验照常通过 (此路兜底后校验强度只剩 8 位, 故必须尽快定位) */
+                if ((copied == (uint16_t)(dc_need - 1U)) && (copied < rx_max_len)) {
+                    uint16_t crc = uart_crc16(rx_buf, (uint16_t)(copied - 1U));
+
+                    if ((uint8_t)(crc & 0x00FFU) == rx_buf[copied - 1U]) {
+                        static uint8_t s_tail_fix_rep[UART_PORT_COUNT] = { 0 };
+
+                        rx_buf[copied] = (uint8_t)((crc >> 8) & 0x00FFU);   /* 补出 CRCH */
+                        copied++;
+
+                        if (s_tail_fix_rep[port_idx] == 0U) {
+                            s_tail_fix_rep[port_idx] = 1U;
+                            printf("[DC-FIX] port=%u cnt=%u CRC-low fallback applied\r\n",
+                                   (unsigned)(port_idx + 1U), (unsigned)rx_buf[2]);
+                        }
+                    }
+                }
+            }
+        }
+
+        /* ---- 帧尾兜底: UART 里若还压着没被 ISR 收走的字节, 直接补进 rx_buf ----
+         * 正常情况 RXNE 中断会在收到字节的当下存进 ring, 这里还能读到 RXNE, 说明
+         * 那个字节被漏收了 (ISR 被屏蔽/被错误标志块吃掉) —— 不补就是"末字节消失"
+         * 的直接原因。读 SR→读 DR 同时清掉 RXNE/ORE/FE/NE. */
+        if ((copied < rx_max_len) && ((huart->Instance->SR & USART_SR_RXNE) != 0U)) {
+            rx_buf[copied++] = (uint8_t)(huart->Instance->DR & 0xFFU);
         }
 
         rx_len = copied;
@@ -921,8 +1035,16 @@ uint8_t uart_custom_send_adjust_time(uint8_t port_idx, uint8_t com_port,
     cmd[11] = (uint8_t)(crc & 0xFFU);              /* CRC 低字节          */
     cmd[12] = (uint8_t)((crc >> 8) & 0xFFU);       /* CRC 高字节          */
 
-    /* 发送校时命令 (不需要接收应答, rx_buf=NULL) */
-    (void)uart_custom_exchange(port_idx, cmd, 13, NULL, 0, 100, 0);
+    /* 发送校时命令, 并把盒子的应答读掉.
+     * 盒子手册 4.1: 0x10 命令有返回帧 —— [addr,10,00,00,00,02,CRCL,CRCH] 共 8 字节.
+     * 原来传 rx_buf=NULL: 发完立即返回, 盒子几~几十 ms 后到达的应答正好撞进紧接着
+     * 发出的本模块 0x03 请求 (静默窗口只有几 ms, 挡不住"还没到"的应答) → 请求被
+     * 撞坏 → 从机不回帧 → 该地址当轮离线.
+     * 现场表现: 一按上位机"发送校时", 就随机掉几台 (13 台 × 6 端口 = 78 次撞车机会). */
+    {
+        uint8_t ack[16];   /* 收下并丢弃 (帧尾用 30ms 字节间隔判定) */
+        (void)uart_custom_exchange(port_idx, cmd, 13, ack, sizeof(ack), 200, 30);
+    }
     WDTUARTFLAG[port_idx] = 0;  /* 喂狗 */
     return 1;
 }

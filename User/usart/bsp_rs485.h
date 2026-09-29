@@ -33,6 +33,17 @@ typedef struct {
 #define UART_PORT_DC3WIRE           8    /* 0x08 — 直流3对线(防雷分线柜)端口 */
 #define UART_DEFAULT_DELAY_MS       440
 #define UART_POLL_PERIOD_MS         1000  /* 每端口目标轮询周期: 补齐到 1 秒 */
+
+/* ---- 发送前的总线静默判定 (见 uart_custom_exchange) ----
+ * 防止上一台从机的"迟到应答"撞进下一次请求的接收窗口, 导致两台盒子
+ * 同时 CRC 失败 (现场表现为随机几台掉线、下一秒恢复).
+ *   UART_BUS_QUIET_MS     : 连续静默多久才认为总线空闲. 57600 下 Modbus RTU
+ *                           帧内字节间隔要求 < 0.3ms, 取 5ms 已留 15 倍余量;
+ *                           不可压到 1~2ms, 任务侧采样粒度就是 1ms.
+ *   UART_BUS_QUIET_MAX_MS : 兜底上限. 总线被拉死/持续噪声时强制放行,
+ *                           避免整个端口在此死等停摆. */
+#define UART_BUS_QUIET_MS           5U
+#define UART_BUS_QUIET_MAX_MS       400U
 #define UART_MODULE_MAX_COUNT       13
 #define UART_MODULE_DEFAULT_REGS    13
 #define UART_HOLDING_REG_STRIDE     500
@@ -144,21 +155,41 @@ typedef struct {
     uint16_t curve_seq[UART_MODULE_MAX_COUNT];  /* 上次收到的 AllCurveFrame (ACK机制) */
 } DC3WireState_t;
 
-/* ---- UART RX 环形缓冲区 (中断驱动接收, 防抢占丢字节) ----
+/* ---- UART RX 环形缓冲区 (SPSC: 单生产者 / 单消费者, 无共享读改写) ----
  * 任务侧在 uart_custom_exchange 中流式排空 (边收边搬进 rx_buf), 本 ring 只是
  * 抖动缓冲, 只需吸收"任务被抢占"期间的来字节, 不承担缓存整帧的职责.
  * 因此单帧长度上限 = 调用方传入的 rx_max_len, 与 UART_RX_RING_SIZE 无关.
- * 字段按对齐要求从大到小排列, 保证零内部填充, 结构体大小确定 524 字节.
+ *
+ * [2026-09-28 为什么删掉 count 字段] 原实现是 head/tail/count 三元组: 任务排空时
+ *   要"读 count → 减 1 → 写回", 与 ISR 的 count++ 共用同一个变量, 靠任务侧
+ *   __disable_irq() 临界区互斥. 实测 (RC5 -O0, 反汇编 0x801dfac 读 / 0x801df94
+ *   减 / 0x801df96 写, 现场 [DC-TAIL] 日志) 该临界区只包住了"写": count 的读被
+ *   编译器提到 CPSID 之前(直接复用循环条件那次 LDRH). ISR 若在这几条指令的间隙
+ *   里存进一个字节, 它那次 count++ 就被任务回写的老值覆盖 → count 比真实占用
+ *   少 1 → 最新的一个字节永远取不出来 → 帧尾 CRCH 丢失, [DC-FIX] 低字节兜底才
+ *   把帧救回来. 现场表现为"每帧少最后 1 字节, 且 h-t=1 而 cnt=0".
+ * [现在怎么保证正确] 严格 SPSC: ISR 只写 buffer/head, 任务只写 tail;
+ *   可读占用 = head - tail; ISR 满判据 = (head+1) != tail (留一个空槽).
+ *   两个上下文没有任何共享变量的读改写 → 不需要临界区, 这类丢更新从结构上
+ *   不可能再发生 (不是"窗口更小", 是没有窗口).
+ * head/tail 加 volatile: 迫使两个上下文每次都从内存取, 编译器不得缓存/复用旧值
+ *   (上面那个 bug 就是编译器复用旧值造成的, 不能只靠 -O0 不优化来兜).
+ * 字段按对齐要求从大到小排列, 保证零内部填充, 结构体大小确定 518 字节.
  * 注意: 修改此处时必须同步更新 mbport/mbportserial.c 中的同名定义. */
-#define UART_RX_RING_SIZE           512      /* 抖动缓冲: 吸收任务调度延迟 */
+#define UART_RX_RING_SIZE           512      /* 抖动缓冲: 吸收任务调度延迟, 必须是 2 的幂 */
+#if (UART_RX_RING_SIZE & (UART_RX_RING_SIZE - 1)) != 0
+#error "UART_RX_RING_SIZE 必须是 2 的幂 (占用/指针回绕用掩码计算)"
+#endif
+#define UART_RX_RING_MASK           (UART_RX_RING_SIZE - 1U)
+/* 当前可读字节数 = (head - tail) mod 512. 先升到 uint32 再相减, head<tail
+ * (指针回绕过 0) 时按无符号回绕取掩码, 结果依然正确. */
+#define UART_RX_RING_USED(r)  ((uint16_t)((((uint32_t)((r)->head)) - ((uint32_t)((r)->tail))) & UART_RX_RING_MASK))
 typedef struct {
     uint8_t  buffer[UART_RX_RING_SIZE]; /* 512 B                        */
-    uint32_t last_byte_tick;            /*   4 B, offset 512 (512%4=0)  */
-    uint16_t head;                      /*   2 B, offset 516            */
-    uint16_t tail;                      /*   2 B, offset 518            */
-    uint16_t count;                     /*   2 B, offset 520            */
-    uint8_t  rx_active;                 /*   1 B, offset 522            */
-    uint8_t  _pad;                      /*   1 B, 对齐到 524            */
+    volatile uint16_t head;             /*   2 B, offset 512  ISR 只写 / 任务只读 */
+    volatile uint16_t tail;             /*   2 B, offset 514  任务只写 / ISR 只读 */
+    volatile uint8_t  rx_active;        /*   1 B, offset 516            */
+    uint8_t  _pad;                      /*   1 B, 对齐到 518            */
 } UART_RxRing_t;
 
 /* ---- 自定义串口 TX 状态 (中断驱动发送, 免疫任务抢占丢帧) ----
@@ -225,6 +256,7 @@ extern uint8_t               portDLQX[UART_PORT_COUNT];           /* Per-port cu
 extern AxleCounterState_t     axle_counter_state[UART_PORT_COUNT];  /* Axle counter comm_confirm state    */
 extern DC3WireState_t         dc3wire_state[UART_PORT_COUNT];        /* DC 3-wire curve_seq state          */
 extern UART_RxRing_t          uart_rx_ring[UART_PORT_COUNT];          /* Interrupt-driven RX ring buffers    */
+extern volatile uint16_t      uart_custom_flush_cnt[UART_PORT_COUNT];  /* TX 窗口内残字节冲掉次数 (诊断)       */
 extern UART_CustomTxState_t   uart_custom_tx[UART_PORT_COUNT];        /* Interrupt-driven TX state           */
 extern uint8_t                g_debug_axle_enable;                     /* 计轴调试打印开关: 1=开, 0=关         */
 extern uint8_t                g_debug_dc3w_enable;                     /* 直流三对线调试打印开关: 1=开, 0=关         */
