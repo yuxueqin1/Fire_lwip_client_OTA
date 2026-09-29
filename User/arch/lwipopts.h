@@ -193,6 +193,30 @@ The STM32F4x7 allows computing and verifying the IP, UDP, TCP and ICMP checksums
 #define LWIP_NETCONN                    1
 #define LWIP_SO_RCVTIMEO                1
 
+/**
+ * LWIP_SO_SNDTIMEO==1: 让 setsockopt(SO_SNDTIMEO) 真正生效。
+ * ⚠ OTA 升级"卡死"的核心配置项, 不要关。
+ *
+ * 关掉时(lwIP 默认 0)lwIP 把 SO_SNDTIMEO 编译掉, setsockopt 静默失败,
+ * 于是阻塞 socket 的 send() 没有超时 —— 而 lwIP 2.1.2 在"发送缓冲满且对端
+ * 接收窗口为 0"时, 会把这条写请求挂起(lwip_netconn_do_writemore 里的
+ * NETCONN_WRITE 状态), 只有对端 ACK 腾出空间才唤醒。对端若不读(窗口 0),
+ * 这条 send() 就**永久阻塞**:
+ *     OTA 任务卡在 send() → 再也不 recv → 本板接收窗口也降到 0
+ *     → 双方互相探测, 本板持续回 TCP ZeroWindowProbeAck, 永不恢复
+ *     (重启上位机程序也没用: 板子根本没跑回重连逻辑)
+ *
+ * 打开后 lwip_netconn_do_writemore 会在 conn->send_timeout 到期时返回
+ * 部分写或 ERR_WOULDBLOCK(lwip_send 返回 -1), ota_net_send() 的超时重试
+ * 逻辑才有意义, OTA 任务最坏也能在几十秒内退出 send 并重连。
+ *
+ * 影响面: 只对显式 setsockopt(SO_SNDTIMEO) 的 socket 生效(本项目仅 OTA
+ * 连接), 且 send_timeout==0 的连接行为不变(client.c 的 netconn 直连不受
+ * 影响); 关闭流程的等待改由时间判定, 超时值仍回退到
+ * LWIP_TCP_CLOSE_TIMEOUT_MS_DEFAULT, 语义等价。
+ */
+#define LWIP_SO_SNDTIMEO                1
+
 /*
    ------------------------------------
    ---------- Socket options ----------

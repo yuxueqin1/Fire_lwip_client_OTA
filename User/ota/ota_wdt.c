@@ -1,4 +1,5 @@
 #include "ota_wdt.h"
+#include "ota_config.h"     /* OTA_TASK_WDT_TIMEOUT_MS 等超时常数 */
 #include "stm32f4xx_hal.h"
 #include <stdio.h>
 
@@ -229,6 +230,11 @@ void ota_wdt_feed(void)
     /* 硬件喂狗生效期间这里也照常翻转: 多一个边沿只会更安全,
      * 而且万一 DMA 中途出问题, 软件喂狗仍然在兜底。 */
     WatchDog_Clear();
+
+    /* 这里只可能是 OTA 任务在 Flash 擦除/校验过程中调用(见 ota_flash 的
+     * feed_cb), 所以顺带上报一次"长操作还在推进" —— 一个扇区一个扇区地
+     * 干活就不算卡死, 但整个窗口内一次都没喂上就会判超时。 */
+    ota_task_wdt_progress();
 }
 
 uint8_t ota_wdt_hw_start(void)
@@ -283,4 +289,71 @@ void ota_wdt_hw_stop(void)
 uint8_t ota_wdt_hw_is_active(void)
 {
     return g_hw_active;
+}
+
+
+/* ==================================================================
+ *  OTA 任务看门狗 (见 ota_wdt.h 的时序说明)
+ *
+ *  只有一个"截止时刻"需要比较, 三种上报方式都只是把它往后推:
+ *      kick()   : 截止 = now + 正常窗口(30s)
+ *      busy(ms) : 截止 = now + ms        ← 进长操作前
+ *      progress(): 截止 = now + 当前窗口  ← 长操作里报进度
+ *
+ *  时基用 HAL_GetTick()(1ms, SysTick 累加): 与 FreeRTOS 调度无关,
+ *  所以"OTA 任务被更高优先级任务饿死"这种情况也能被查出来。
+ *  比较用有符号差值, 32 位 ms 计数回绕(约 49.7 天)时仍然正确。
+ * ================================================================== */
+static volatile uint32_t g_ota_task_deadline_ms = 0U;   /* 允许的最晚上报时刻 */
+static volatile uint32_t g_ota_task_window_ms   = 0U;   /* 当前窗口长度(progress 按它顺延) */
+static volatile uint8_t  g_ota_task_armed       = 0U;   /* 0 = 任务还没起来, 不判超时 */
+
+/* 内部: 把截止时刻设为 now + ms */
+static void ota_task_wdt_set_window(uint32_t ms)
+{
+    g_ota_task_window_ms   = ms;
+    g_ota_task_deadline_ms = HAL_GetTick() + ms;
+}
+
+void ota_task_wdt_arm(void)
+{
+    g_ota_task_armed = 1U;
+    ota_task_wdt_set_window(OTA_TASK_WDT_TIMEOUT_MS);
+
+    printf("[WDT] ota task wdt armed (timeout %lums)\r\n",
+           (unsigned long)OTA_TASK_WDT_TIMEOUT_MS);
+}
+
+void ota_task_wdt_kick(void)
+{
+    if (g_ota_task_armed == 0U) {
+        return;
+    }
+    ota_task_wdt_set_window(OTA_TASK_WDT_TIMEOUT_MS);
+}
+
+void ota_task_wdt_busy(uint32_t max_ms)
+{
+    if (g_ota_task_armed == 0U) {
+        return;
+    }
+    ota_task_wdt_set_window(max_ms);
+}
+
+void ota_task_wdt_progress(void)
+{
+    if (g_ota_task_armed == 0U) {
+        return;
+    }
+    /* 按当前窗口顺延: 擦除期间窗口 = OTA_TASK_BUSY_FLASH_MS */
+    g_ota_task_deadline_ms = HAL_GetTick() + g_ota_task_window_ms;
+}
+
+uint8_t ota_task_wdt_timed_out(void)
+{
+    if (g_ota_task_armed == 0U) {
+        return 0U;
+    }
+    /* (int32_t 差值 >= 0) ⇒ now 已过截止时刻; 回绕安全 */
+    return ((int32_t)(HAL_GetTick() - g_ota_task_deadline_ms) >= 0) ? 1U : 0U;
 }

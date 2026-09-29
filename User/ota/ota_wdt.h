@@ -32,7 +32,9 @@
 void ota_wdt_init(void);
 
 /* 一次软件喂狗 —— 就是板级的 WatchDog_Clear()(翻转 PF10)。
- * 传给 ota_flash_erase_range()/ota_flash_crc32() 的 feed_cb 用这个。 */
+ * 传给 ota_flash_erase_range()/ota_flash_crc32() 的 feed_cb 用这个。
+ * 顺带 ota_task_wdt_progress(): 能把狗喂上说明 OTA 任务还在推进,
+ * 于是 OTA 任务看门狗的截止时刻也往后顺延。 */
 void ota_wdt_feed(void);
 
 /* 启用/停用 TIM7+DMA 硬件自动喂狗。
@@ -42,5 +44,47 @@ void    ota_wdt_hw_stop(void);
 
 /* 硬件喂狗当前是否生效 */
 uint8_t ota_wdt_hw_is_active(void);
+
+
+/* ==================================================================
+ *  OTA 任务看门狗 —— "升级任务卡死太久 → 重启通信板"
+ *
+ *  与上面 SP706S 喂狗是两条独立的链路:
+ *    上面那条解决"CPU 被 Flash 总线 stall, 喂不上狗";
+ *    这条解决"OTA 任务卡死, 但 App_TaskStart 还在照常喂狗 → 板子永不复位"。
+ *
+ *  时序(全部用 HAL_GetTick() 的 ms 时基, 与 FreeRTOS tick 无关):
+ *
+ *    OTA 任务                          App_TaskStart(每 500ms)
+ *    ----------                        -----------------------
+ *    ota_task_wdt_arm()   ── 之后才判超时
+ *    ota_task_wdt_kick()  ── 每轮循环上报"我活着"
+ *                                       ota_task_wdt_timed_out()?
+ *                                         0 → 照常喂狗
+ *                                         1 → 不喂狗 → SP706S 复位板子
+ *    ota_task_wdt_busy(长操作窗口) ── 进 Flash 擦除/connect 前声明
+ *    ota_task_wdt_progress()       ── 长操作内部报进度(每次喂狗时顺带)
+ *
+ *  ⚠ arm() 之前一律不判超时: OTA 任务没被创建(例如 xTaskCreate 因堆不足
+ *    失败)时不能把板子拖进"复位→重启→再复位"的死循环。
+ * ================================================================== */
+
+/* OTA 任务启动时调用一次(第一条语句), 此后才开始判超时 */
+void ota_task_wdt_arm(void);
+
+/* OTA 任务每轮循环调用: 上报存活, 并把截止时间恢复到正常窗口 */
+void ota_task_wdt_kick(void);
+
+/* 进入"预计最长 max_ms 不返回"的操作前调用(Flash 擦除/校验、TCP connect)。
+ * 窗口内不判超时; 超过 max_ms 仍不返回则判卡死。 */
+void ota_task_wdt_busy(uint32_t max_ms);
+
+/* 长操作内部报进度: 把截止时间按当前窗口往后推。
+ * 每次喂狗(ota_wdt_feed)时顺带调用 —— 只要 Flash 还在一个扇区一个扇区地
+ * 干活, 就不算卡死。 */
+void ota_task_wdt_progress(void);
+
+/* 给 main.c 的 App_TaskStart 判超时用: 1 = OTA 任务卡死, 应停止喂狗等复位 */
+uint8_t ota_task_wdt_timed_out(void);
 
 #endif /* __OTA_WDT_H */

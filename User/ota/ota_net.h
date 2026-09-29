@@ -38,7 +38,9 @@ typedef struct {
 /* ---- 连接管理 ---- */
 
 /* 连接 OTA 服务器。成功返回 socket 句柄(>=0), 失败返回 -1。
- * 收发超时由内部统一设置为 OTA_SOCKET_TIMEOUT。 */
+ * 接收超时 = OTA_SOCKET_TIMEOUT, 发送超时 = OTA_SOCKET_SNDTIMEO_MS。
+ * ⚠ 本函数是阻塞的, 对端不存在时最长可能阻塞几十秒(lwIP SYN/ARP 重试),
+ *   调用方应先用 ota_task_wdt_busy(OTA_TASK_BUSY_CONNECT_MS) 声明 busy 窗口。 */
 int32_t ota_net_connect(const char *server_ip, uint16_t server_port);
 
 /* 关闭连接 */
@@ -47,9 +49,13 @@ void ota_net_disconnect(int32_t sock);
 
 /* ---- 发送 ---- */
 
-/* 组装并完整发送一帧。
+/* 组装并完整发送一帧(内部会重试部分写, 直到发完或超时)。
  * data 可以为 NULL(当 len == 0)。len 必须 <= OTA_MAX_PAYLOAD。
- * 返回实际发送字节数, 失败返回 -1。 */
+ * 返回实际发送字节数, 失败返回 -1。
+ *
+ * ⚠ 不会永久阻塞: 单次 send() 最多 OTA_SOCKET_SNDTIMEO_MS(需 lwipopts.h 里
+ *   LWIP_SO_SNDTIMEO=1), 整帧最多 OTA_SEND_TOTAL_TIMEOUT_MS。
+ *   对端接收窗口关闭时 → 返回 -1, 由上层断开重连, 而不是把任务挂死。 */
 int32_t ota_net_send(int32_t sock, uint8_t cmd, uint8_t seq,
                      uint32_t offset, const uint8_t *data, uint16_t len);
 
@@ -60,10 +66,14 @@ int32_t ota_net_send(int32_t sock, uint8_t cmd, uint8_t seq,
 void ota_net_rx_reset(void);
 
 /* 执行一次 recv() 并把数据追加到内部接收缓冲。
- *   返回 >0 : 本次新增字节数
- *   返回  0 : 本次没读到(超时/缓冲已满, 需先取走已成帧的数据)
- *   返回 -1 : socket 错误或对端断开
- * 注意: 缓冲剩余空间不足一整帧时直接返回 0, 不会截断数据。 */
+ *   返回 >0                 : 本次新增字节数
+ *   返回  0                 : 本次没读到(超时), 属正常
+ *   返回 OTA_NET_RX_FULL(-2): 缓冲剩余空间不足一整帧, 本次没读 —— 调用方
+ *                             必须先取帧; 若取不出任何帧则 ota_net_rx_reset()
+ *                             丢弃重同步, 绝不能就此停止读 socket
+ *   返回 -1                 : socket 错误或对端断开
+ * 注意: 永远不会截断数据 —— 读不下就一个字节都不读。 */
+#define OTA_NET_RX_FULL     (-2)
 int32_t ota_net_recv(int32_t sock);
 
 /* 从接收缓冲里取出一整帧。

@@ -95,9 +95,46 @@ typedef struct {
 #define OTA_SERVER_IP_DEFAULT       "192.168.1.99"  /* 升级时把上位机网卡配成该地址 */
 #define OTA_SERVER_PORT_DEFAULT     5002
 
-#define OTA_SOCKET_TIMEOUT          30000U      /* socket 收发超时 (ms) */
+#define OTA_SOCKET_TIMEOUT          30000U      /* socket 接收超时 (ms) */
 #define OTA_RECONNECT_INTERVAL      10000U      /* 断线重连间隔 (ms) */
 #define OTA_HELLO_INTERVAL          60000U      /* HELLO 心跳间隔 (ms) */
+
+/* socket 发送超时 (ms) —— 单次 send() 最多阻塞多久。
+ * ⚠ 生效前提: lwipopts.h 里 LWIP_SO_SNDTIMEO 必须为 1, 否则 setsockopt 无效、
+ *   send() 无超时可永久阻塞(见 LWIP_SO_SNDTIMEO 处的说明)。
+ * 一帧最大 1035 B, 正常链路 <1ms 发完; 能用满这个时间的只有"对端窗口关闭"。 */
+#define OTA_SOCKET_SNDTIMEO_MS      5000U
+
+/* 单帧"完整发出"的总时限 (ms)。send() 可能只发出去一部分, 这里限住总时间,
+ * 超时即判定链路不可用 → 上层断开重连(软恢复, 不重启板子)。 */
+#define OTA_SEND_TOTAL_TIMEOUT_MS   8000U
+
+/* 部分发送后重试的间隔 (ms) */
+#define OTA_SEND_RETRY_DELAY_MS     20U
+
+/* 下载"无进展"超时 (ms): DOWNLOADING 期间超过这么久没有收到任何新字节,
+ * 说明会话已死(对端异常/协议错位), 主动断开重连, 属于软恢复。
+ * 正常下载每帧(1KB)都会推进进度, 用不到这个值。 */
+#define OTA_DOWNLOAD_STALL_MS       30000U
+
+/* ==================================================================
+ *  OTA 任务看门狗 —— "升级卡死多久就重启板子"
+ *
+ *  本板复位链路: main.c 的 App_TaskStart(最高优先级) 每 500 ms 检查各任务
+ *  标志, 全部正常才 WatchDog_Clear() 喂 SP706S; 任一任务判超时 → 不喂狗
+ *  → SP706S 1.6 s 内硬件复位(WTD_RESET 记录复位码)。
+ *
+ *  ⚠ OTA 任务原先不在那张表里, 所以它一旦卡死(阻塞在 send/printf/Flash 里),
+ *    板子永远不会复位 —— 现场表现正是"升级一直卡住, 重启上位机也没用"。
+ *
+ *  现在 OTA 任务每轮循环上报一次存活, 并区分两种情况:
+ *    - 正常跑: 超过 OTA_TASK_WDT_TIMEOUT_MS 没上报        → 判卡死 → 复位
+ *    - 长操作中(Flash 擦除/校验、TCP connect): 进入前声明 busy 窗口, 窗口内
+ *      不判超时; 但超过窗口本身也判卡死(卡在长操作里同样能救回来)
+ * ================================================================== */
+#define OTA_TASK_WDT_TIMEOUT_MS     30000U      /* 正常循环的存活超时 */
+#define OTA_TASK_BUSY_FLASH_MS      10000U      /* 单次 Flash 擦/校验的 busy 窗口 */
+#define OTA_TASK_BUSY_CONNECT_MS    60000U      /* TCP connect 的 busy 窗口(含 lwIP SYN/ARP 重试) */
 
 #define OTA_MAX_PAYLOAD             1024U       /* 单帧最大数据长度, 与上位机一致 */
 #define OTA_FRAME_HEADER_SIZE       9U          /* 帧头: MAGIC+CMD+SEQ+LEN+OFFSET */
@@ -135,6 +172,7 @@ typedef enum {
     OTA_STATE_ERROR_CRC,            /* CRC32 校验失败 */
     OTA_STATE_ERROR_FLASH,          /* Flash 擦写失败 */
     OTA_STATE_ERROR_SLOT,           /* 槽位未知(链接地址配置错误) */
+    OTA_STATE_ERROR_TIMEOUT,        /* 下载长时间无进展(链路假死), 主动断开重连 */
     OTA_STATE_ERROR_MAX
 } ota_state_t;
 
@@ -171,7 +209,7 @@ typedef enum {
 #define FW_VERSION_MAJOR            1
 #define FW_VERSION_MINOR            1
 #define FW_VERSION_REVISION         0
-#define FW_VERSION_BUILD            0
+#define FW_VERSION_BUILD            23
 
 #define FW_VERSION    ( (FW_VERSION_MAJOR    << 24) | \
                         (FW_VERSION_MINOR    << 16) | \

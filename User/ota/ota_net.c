@@ -1,6 +1,9 @@
 #include "ota_net.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "stm32f4xx_hal.h"      /* HAL_GetTick(): 发送总时限/重试间隔的时基 */
 #include <string.h>
 #include <stdio.h>
 
@@ -42,7 +45,7 @@ int32_t ota_net_connect(const char *server_ip, uint16_t server_port)
         return -1;
     }
 
-    printf("[OTA_NET] connecting %s:%u ...\r\n", server_ip, (unsigned)server_port);
+    // printf("[OTA_NET] connecting %s:%u ...\r\n", server_ip, (unsigned)server_port);
 
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
@@ -54,8 +57,17 @@ int32_t ota_net_connect(const char *server_ip, uint16_t server_port)
     tv.tv_usec = (OTA_SOCKET_TIMEOUT % 1000U) * 1000U;
     (void)setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const void *)&tv,
                      sizeof(tv));
-    (void)setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const void *)&tv,
-                     sizeof(tv));
+
+    /* 发送超时必须单独设, 而且必须能生效 —— 见 lwipopts.h 里
+     * LWIP_SO_SNDTIMEO 的说明: 配错了这里会静默失败, send() 就能永久阻塞,
+     * 这曾经是"升级卡死、重启上位机也不恢复"的根因。设完回读确认。 */
+    tv.tv_sec  = OTA_SOCKET_SNDTIMEO_MS / 1000U;
+    tv.tv_usec = (OTA_SOCKET_SNDTIMEO_MS % 1000U) * 1000U;
+    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const void *)&tv,
+                   sizeof(tv)) < 0) {
+        printf("[OTA_NET] warn: SO_SNDTIMEO unsupported (LWIP_SO_SNDTIMEO=0?)"
+               " -- send() may block forever\r\n");
+    }
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family      = AF_INET;
@@ -64,7 +76,7 @@ int32_t ota_net_connect(const char *server_ip, uint16_t server_port)
 
     if (connect(sock, (struct sockaddr *)&server_addr,
                 sizeof(server_addr)) < 0) {
-        printf("[OTA_NET] connect failed\r\n");
+        // printf("[OTA_NET] connect failed\r\n");
         (void)closesocket(sock);
         return -1;
     }
@@ -90,10 +102,16 @@ int32_t ota_net_send(int32_t sock, uint8_t cmd, uint8_t seq,
                      uint32_t offset, const uint8_t *data, uint16_t len)
 {
     /* 缓冲大小按最大帧来定 —— 老实现固定 2048, 数据 1024+9+2 时
-     * 实际是 "11 字节越界写"(踩栈), 已修正。 */
-    uint8_t  buffer[OTA_FRAME_MAX_SIZE];
+     * 实际是 "11 字节越界写"(踩栈), 已修正。
+     *
+     * ⚠ 必须是 static 而不是栈上: OTA 任务栈只有 4096 B, 而
+     *   configCHECK_FOR_STACK_OVERFLOW = 0(溢出不会报警, 只会静静踩坏
+     *   别的任务的数据结构)。1035 B 放栈上会吃掉 1/4 的栈, 而本函数
+     *   只有 OTA 任务会调用, 做成 static 没有并发问题。 */
+    static uint8_t buffer[OTA_FRAME_MAX_SIZE];
     uint32_t pos = 0U;
     uint32_t total = 0U;
+    uint32_t send_start_ms;
     uint8_t  checksum = 0U;
     uint32_t i;
 
@@ -130,17 +148,42 @@ int32_t ota_net_send(int32_t sock, uint8_t cmd, uint8_t seq,
     buffer[pos++] = checksum;
     buffer[pos++] = OTA_FRAME_END;
 
-    /* 完整发送: TCP 发送是流式的, 可能只发出去一部分 */
+    /* 完整发送: TCP 发送是流式的, 可能只发出去一部分。
+     *
+     * ⚠ 这里必须有"总时限", 不能无条件重试到发完为止:
+     *   对端接收窗口关闭(对端应用不读)时, 单次 send() 会一直等到
+     *   OTA_SOCKET_SNDTIMEO_MS 才返回, 若无总时限就会无限重试下去,
+     *   OTA 任务就卡在这条 send 上 —— 而任务卡住不 recv, 本板接收窗口
+     *   也会降到 0, 双方互等, 现场表现为本板一直回 TCP ZeroWindowProbeAck
+     *   且永远不恢复。现在最坏 OTA_SEND_TOTAL_TIMEOUT_MS 就放弃, 交给上层
+     *   断开重连, 板子始终能自己走回来。 */
+    send_start_ms = HAL_GetTick();
+
     while (total < pos) {
         int32_t n = send(sock, (const void *)(buffer + total),
                          (int)(pos - total), 0);
 
-        if (n <= 0) {
+        if (n > 0) {
+            total += (uint32_t)n;
+            continue;
+        }
+
+        if (n < 0) {
             printf("[OTA_NET] send failed (%lu/%lu sent)\r\n",
                    (unsigned long)total, (unsigned long)pos);
             return -1;
         }
-        total += (uint32_t)n;
+
+        /* n == 0: 发送缓冲/对端窗口暂时满, 一点都没发出去 */
+        if ((uint32_t)(HAL_GetTick() - send_start_ms) >=
+            OTA_SEND_TOTAL_TIMEOUT_MS) {
+            printf("[OTA_NET] send timeout (%lu/%lu sent in %lums), "
+                   "peer window closed?\r\n",
+                   (unsigned long)total, (unsigned long)pos,
+                   (unsigned long)OTA_SEND_TOTAL_TIMEOUT_MS);
+            return -1;
+        }
+        vTaskDelay(pdMS_TO_TICKS(OTA_SEND_RETRY_DELAY_MS));
     }
 
     return (int32_t)total;
@@ -166,9 +209,15 @@ int32_t ota_net_recv(int32_t sock)
     }
 
     /* 剩余空间不足一整帧就先不读, 避免把半帧挤掉。
-     * 调用方应当先把已成帧的数据取走再回来。 */
+     * 调用方应当先把已成帧的数据取走再回来。
+     *
+     * ⚠ 这里返回 OTA_NET_RX_FULL 而不是 0(以前返回 0): 0 是"没数据",
+     *   与"读不下"混在一起时, 上层既不知道要清缓冲, 也可能陷入
+     *   "取不出帧 → 又不读 socket"的空转 —— 而不读 socket 就会让本板
+     *   接收窗口归零, 对端开始 probing(现场看到的就是 ZeroWindowProbeAck)。
+     *   显式区分后, 上层取不出帧就丢弃重同步, 保证 socket 一直被读走。 */
     if ((OTA_RX_BUF_SIZE - g_rx_len) < OTA_FRAME_MAX_SIZE) {
-        return 0;
+        return OTA_NET_RX_FULL;
     }
 
     /* 先用 select 探一下可读性, 顺便限定本次最多等 OTA_NET_POLL_MS。

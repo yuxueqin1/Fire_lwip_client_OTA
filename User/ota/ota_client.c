@@ -1,6 +1,7 @@
 #include "ota_client.h"
 #include "ota_manager.h"
 #include "ota_net.h"
+#include "ota_wdt.h"
 #include "ota_config.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -32,6 +33,15 @@
  *    任何环节出错都不卡死 —— 回 ERROR_UPDATE, 断开连接, 回到 IDLE,
  *    10s 后重连并重新 HELLO(仍报老版本), PC 会在下一轮重新推送,
  *    因为当前运行分区全程未被破坏, 重试永远是从干净状态开始。
+ *
+ *  三层"卡死"防护(从轻到重, 都不需要人工上板):
+ *    第1层 —— 网络层不永久阻塞: send()/recv() 都有超时(见 ota_net.c),
+ *             对端窗口关闭时发不出去就报错重连, 不会把任务挂死在 send 上。
+ *    第2层 —— 会话层不无限等待: DOWNLOADING 期间 OTA_DOWNLOAD_STALL_MS 没有
+ *             任何新字节就判定链路假死, 主动断开重连(软恢复)。
+ *    第3层 —— 任务层看门狗: 任务真卡死了(卡在 printf / Flash / 被饿死),
+ *             由 App_TaskStart 判超时并停喂 SP706S → 板子硬件复位(硬恢复)。
+ *             ota_task_wdt_* 系列就是这一层的上报接口。
  * ================================================================== */
 
 #define OTA_SERVER_IP           OTA_SERVER_IP_DEFAULT
@@ -51,6 +61,10 @@ static uint8_t       g_seq   = 0U;
 static ota_session_t g_sess  = SESS_IDLE;
 static uint8_t       g_reboot = 0U;
 static uint8_t       g_need_reconnect = 0U;
+
+/* ---- 下载进度监测(第2层防护): 用于判断"会话是否已经假死" ---- */
+static uint32_t      g_last_progress_ms    = 0U;  /* 上次字节数变化的时刻 */
+static uint32_t      g_last_progress_bytes = 0U;  /* 上次看到的已收字节数 */
 
 
 /* ==================================================================
@@ -170,7 +184,15 @@ static void client_handle_push(const ota_frame_t *f)
             return;
         }
 
-        if (ota_start_download() < 0) {
+        /* 擦除期间 CPU 被 Flash 总线 stall, 会连续几秒不返回 ——
+         * 先给任务看门狗声明 busy 窗口, 免得被误判成卡死。
+         * (擦除内部每擦完一个扇区会喂狗 + 报进度, 截止时刻会持续顺延;
+         *  真卡在某个扇区里超过 OTA_TASK_BUSY_FLASH_MS 仍然会判超时。) */
+        ota_task_wdt_busy(OTA_TASK_BUSY_FLASH_MS);
+        rc = ota_start_download();
+        ota_task_wdt_kick();
+
+        if (rc < 0) {
             client_report_error(OTA_STATE_START_DOWNLOAD_FAILED);
             return;
         }
@@ -183,7 +205,10 @@ static void client_handle_push(const ota_frame_t *f)
             return;
         }
 
-        g_sess = SESS_DOWNLOADING;
+        /* 进度监测起点: 下一刻起若 OTA_DOWNLOAD_STALL_MS 收不到新字节就重连 */
+        g_sess               = SESS_DOWNLOADING;
+        g_last_progress_ms    = HAL_GetTick();
+        g_last_progress_bytes = ota_get_manager()->downloaded_size;
     } else if (rc == 0) {
         printf("[OTA_CLIENT] no upgrade needed, reply REJECT\r\n");
         (void)client_send(OTA_CMD_REJECT_UPDATE, 0U, NULL, 0U);
@@ -196,8 +221,18 @@ static void client_handle_push(const ota_frame_t *f)
 static void client_handle_data(const ota_frame_t *f)
 {
     if (g_sess != SESS_DOWNLOADING) {
-        printf("[OTA_CLIENT] DATA in non-download state, dropped (offset=%lu)\r\n",
-               (unsigned long)f->offset);
+        /* ⚠ 这条日志必须限流: 上位机一旦开始灌数据就是每帧一条, 而
+         *   printf 走的是阻塞串口(每字节最长 1s), 满速打印会让本任务
+         *   远远跟不上收包速度 → TCP 接收窗口归零 → 上位机 probing,
+         *   看起来就像"板子卡死"。打印本身只该是诊断, 不该拖慢收包。 */
+        static uint32_t drop_cnt = 0U;
+
+        drop_cnt++;
+        if (drop_cnt <= 3U || (drop_cnt % 256U) == 0U) {
+            printf("[OTA_CLIENT] DATA in non-download state, dropped "
+                   "(offset=%lu, total %lu)\r\n",
+                   (unsigned long)f->offset, (unsigned long)drop_cnt);
+        }
         return;
     }
 
@@ -215,11 +250,15 @@ static void client_handle_end(void)
         return;
     }
 
+    /* 校验要扫几十~几百 KB Flash(同样会占住 Flash 总线), 声明 busy 窗口 */
+    ota_task_wdt_busy(OTA_TASK_BUSY_FLASH_MS);
     if (ota_finish_download() < 0) {
+        ota_task_wdt_kick();
         client_report_error(OTA_STATE_ERROR_CRC);
         g_sess = SESS_IDLE;
         return;
     }
+    ota_task_wdt_kick();
 
     /* 校验通过, 先回 ACK 让上位机确认"数据已经安全落地" */
     if (client_send_ack(OTA_STATE_SUCCESS) < 0) {
@@ -286,6 +325,9 @@ static uint8_t client_session(void)
     uint32_t    i;
 
     for (;;) {
+        /* ---- 0. 上报"OTA 任务活着"(第3层防护的依据) ---- */
+        ota_task_wdt_kick();
+
         /* ---- 1. 先把缓冲里已成帧的全部处理掉(一次 recv 可能带回好几帧) ---- */
         for (i = 0U; i < OTA_MAX_FRAMES_PER_LOOP; i++) {
             if (ota_net_next_frame(&f) != 1) {
@@ -308,8 +350,42 @@ static uint8_t client_session(void)
             continue;
         }
 
+        /* ---- 1.5 下载进度监测(第2层防护) ----
+         * 还在 DOWNLOADING 却长时间收不到任何新字节 ⇒ 这条会话已经假死
+         * (对端异常退出、协议错位、链路半死)。主动断开重连, 让上位机
+         * 下一轮重新推送 —— 不重启板子就能自恢复, 是比硬件复位更轻的手段。 */
+        if (g_sess == SESS_DOWNLOADING) {
+            uint32_t now  = HAL_GetTick();
+            uint32_t done = ota_get_manager()->downloaded_size;
+
+            if (done != g_last_progress_bytes) {
+                g_last_progress_bytes = done;
+                g_last_progress_ms    = now;
+            } else if ((uint32_t)(now - g_last_progress_ms) >=
+                       OTA_DOWNLOAD_STALL_MS) {
+                printf("[OTA_CLIENT] no progress for %lums (%lu/%lu), "
+                       "session stalled -> reconnect\r\n",
+                       (unsigned long)OTA_DOWNLOAD_STALL_MS,
+                       (unsigned long)done,
+                       (unsigned long)ota_get_manager()->total_size);
+                ota_abort(OTA_STATE_ERROR_TIMEOUT);
+                client_report_error(OTA_STATE_ERROR_TIMEOUT);
+                g_need_reconnect = 0U;      /* 已显式处理, 直接结束本次连接 */
+                return 0U;
+            }
+        }
+
         /* ---- 2. 缓冲空了: 读网络(内部最多等 200ms) ---- */
         rc = ota_net_recv(g_sock);
+        if (rc == OTA_NET_RX_FULL) {
+            /* 缓冲里凑不出整帧, 又腾不出空间给下一帧(半帧 + 垃圾把缓冲占满)。
+             * 丢弃重同步即可 —— 但绝不能就此不读 socket: 不读 → 本板接收
+             * 窗口归零 → 上位机 probing(ZeroWindowProbeAck), 界面看着像卡死。
+             * 丢一点数据由协议兜底: DATA 帧带 offset, 最终 CRC 对不上会重来。 */
+            printf("[OTA_CLIENT] rx buffer full without a frame, resync\r\n");
+            ota_net_rx_reset();
+            continue;
+        }
         if (rc < 0) {
             printf("[OTA_CLIENT] disconnected\r\n");
             return 0U;
@@ -341,11 +417,18 @@ static void ota_client_task(void *param)
 
     (void)param;
 
+    /* 第一条语句就交给任务看门狗接管: 从这里起, 只要本任务 OTA_TASK_WDT_TIMEOUT_MS
+     * 不上报存活, App_TaskStart 就会停喂狗 → SP706S 复位板子。
+     * 放在 printf / ota_manager_init 之前, 让"启动阶段就卡住"也能被救回来。 */
+    ota_task_wdt_arm();
+
     printf("[OTA_CLIENT] task started\r\n");
 
     ota_manager_init();
 
     for (;;) {
+        ota_task_wdt_kick();
+
         if (g_sock < 0) {
             uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
@@ -357,7 +440,12 @@ static void ota_client_task(void *param)
 
             ota_net_rx_reset();
 
+            /* connect 是阻塞的, 对端不在线时最长几十秒(lwIP SYN/ARP 重试),
+             * 先声明 busy 窗口, 免得被任务看门狗误判成卡死。 */
+            ota_task_wdt_busy(OTA_TASK_BUSY_CONNECT_MS);
             g_sock = ota_net_connect(OTA_SERVER_IP, OTA_SERVER_PORT);
+            ota_task_wdt_kick();
+
             if (g_sock < 0) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
