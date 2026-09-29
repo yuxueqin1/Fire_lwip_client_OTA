@@ -143,7 +143,13 @@ void HAL_ETH_MspDeInit(ETH_HandleTypeDef* ethHandle)
 /*  bsp_get_unique_mac()                                                */
 /*  从 STM32 每芯片唯一的 96-bit UID 派生本地管理单播 MAC.               */
 /*  格式: 02-00-XX-XX-XX-XX  (0x02 = 本地管理位 + 单播位)               */
-/*  同一个柜子的两块板是两颗不同芯片 → UID 不同 → MAC 必然不同.          */
+/*                                                                      */
+/*  ⚠ 只能用 uid[0] —— 也就是 UID_BASE 处的晶圆 X/Y 坐标字, 每颗芯片唯一. */
+/*    uid[1]/uid[2] 是 wafer number + LOT_NUM, 属于批次信息, 同一批采购的  */
+/*    板子完全相同. 曾用 uid[1]/uid[2] 派生 → 两块板 MAC 一模一样, 交换机 */
+/*    CAM 表在两个口之间来回翻转: 上位机心跳重传、板子回 Dup ACK、连接被   */
+/*    RST(err=-14) 反复重连. 不要再改回 uid[1]/uid[2].                    */
+/*  同一个柜子的两块板是两颗不同芯片 → X/Y 坐标不同 → MAC 必然不同.          */
 /*======================================================================*/
 static void bsp_get_unique_mac(uint8_t mac[6])
 {
@@ -151,10 +157,10 @@ static void bsp_get_unique_mac(uint8_t mac[6])
 
     mac[0] = 0x02U;                                  /* 本地管理 + 单播  */
     mac[1] = 0x00U;                                  /* 段位, 与上位机约定 */
-    mac[2] = (uint8_t)((uid[2]        ) & 0xFFU);    /* UID[95:64] 低字节 */
-    mac[3] = (uint8_t)((uid[2] >> 8U  ) & 0xFFU);
-    mac[4] = (uint8_t)((uid[1]        ) & 0xFFU);    /* UID[63:32] 低字节 */
-    mac[5] = (uint8_t)((uid[1] >> 8U  ) & 0xFFU);
+    mac[2] = (uint8_t)((uid[0]        ) & 0xFFU);    /* X/Y 坐标: 每颗芯片唯一 */
+    mac[3] = (uint8_t)((uid[0] >>  8U ) & 0xFFU);
+    mac[4] = (uint8_t)((uid[0] >> 16U ) & 0xFFU);
+    mac[5] = (uint8_t)((uid[0] >> 24U ) & 0xFFU);
 }
 
 HAL_StatusTypeDef Bsp_Eth_Init(void)
