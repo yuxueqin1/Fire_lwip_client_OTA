@@ -43,6 +43,26 @@
 #include <stdint.h>
 
 /*======================================================================*/
+/*  调试追踪开关 —— 定位"频繁向上位机申请配置 / 反复重连"                   */
+/*                                                                      */
+/*  置 1: 打印 [TCP] 追踪                                              */
+/*        - 每次连接建立的序号 (重连次数一目了然)                         */
+/*        - tcp_connected 1→0 的发生位置 + err + reset_flag/WTD_RESET    */
+/*        - netconn_recv 的异常返回码 (ERR_CLOSED 会暴露"对端已断开但      */
+/*          本端不知情"的空转)                                           */
+/*        - 申请配置帧的入队时机 (连接建立 / 重试定时器) 与配置生效        */
+/*  置 0: 所有追踪打印消失, 不影响任何逻辑. (发布版 = 0)                  */
+/*  ⚠ 需 DEBUG_UART_ENABLE=1 (bsp_debug_usart.h), 否则 printf 静默.       */
+/*======================================================================*/
+#define TCP_TRACE_ENABLE               0
+
+#if TCP_TRACE_ENABLE
+#define TCP_TRACE(fmt, args...)        do{printf("\r\n[TCP] " fmt "\r\n", ##args);}while(0)
+#else
+#define TCP_TRACE(fmt, args...)
+#endif
+
+/*======================================================================*/
 /*  服务器地址 & 端口 (从 lwIP 配置继承)                                   */
 /*======================================================================*/
 #define TCP_SERVER_IP1                 DEST_IP_ADDR0
@@ -59,7 +79,19 @@
 #define TCP_SEND_BUF_SIZE              4096U   /* 4KB: 匹配 UART_SERIAL_BUF_SIZE */
 #define TCP_RECV_BUF_SIZE              512U
 #define TCP_SEND_RETRY_COUNT           10U     /* 单帧发送重试次数 */
-#define TCP_RECV_ERR_MAX               200U      /* 连续接收错误阈值 → 重连 */
+/*
+ * 连续接收超时 (ERR_TIMEOUT) 多少次后断开重连.
+ * 每轮 ≈ 100ms(netconn_recv 超时) + 10ms(vTaskDelay) = 110ms,
+ * 1200 次 ≈ 130s 的"上位机全程无数据"才断链.
+ *
+ * 为什么不是 200 (≈22s): 实测上位机的报文间隔在 16~57s 之间波动,
+ * 22s 的阈值正落在这个区间里, 导致链路时不时被抽签式断开 ——
+ * 每次重连都会无条件重发一次申请配置帧, 面板工作灯也会闪灭一下.
+ * 130s 留了 2 倍余量, 对端真失联时 2 分钟内仍能自愈.
+ *
+ * ⚠ 计数器类型必须够宽 (见 client_thread 里的 recv_err_cnt: uint16_t).
+ */
+#define TCP_RECV_ERR_MAX               1200U     /* 连续接收超时阈值 → 重连 (≈130s) */
 #define CONFIG_REQ_RETRY_INTERVAL      100U      /* 配置请求重试间隔 (循环次数) */
 
 /*======================================================================*/
@@ -179,6 +211,7 @@ uint8_t client_is_connected(void)
 /*======================================================================*/
 void client_disconnect(void)
 {
+    TCP_TRACE("tcp_connected 1->0 @ client_disconnect()");
     tcp_connected = 0U;
 }
 
@@ -341,6 +374,10 @@ void client_send_pending(void)
             if (copy_reset_flag != 0U) {
                 WTD_RESET = copy_reset_flag;
             }
+            TCP_TRACE("tcp_connected 1->0 @ send_pending/realtime slot%u"
+                      " len=%u err=%d reset_flag=%u WTD_RESET=%u",
+                      (unsigned)i, (unsigned)copy_len, (int)err,
+                      (unsigned)copy_reset_flag, (unsigned)WTD_RESET);
             tcp_connected = 0U;
             return;
         }
@@ -377,6 +414,10 @@ void client_send_pending(void)
             if (copy_reset_flag != 0U) {
                 WTD_RESET = copy_reset_flag;
             }
+            TCP_TRACE("tcp_connected 1->0 @ send_pending/curve fifo"
+                      " len=%u err=%d reset_flag=%u WTD_RESET=%u",
+                      (unsigned)copy_len, (int)err,
+                      (unsigned)copy_reset_flag, (unsigned)WTD_RESET);
             tcp_connected = 0U;
             return;
         }
@@ -443,7 +484,7 @@ static void client_handle_rx(const uint8_t *buf, uint16_t len)
     }
 
     /*==================================================================*/
-    /*  配置下发: [0x00, 0xA1, 0x2C, 0x01, ...config_data...]           */
+    /*  配置下发: [0x00, 0xA1, 0xC2, 0x01, ...config_data...]           */
     /*==================================================================*/
     // if ((buf[1] == NET_CMD_CONFIG_MAGIC0) &&
     //     (buf[2] == NET_CMD_CONFIG_MAGIC1) &&
@@ -521,6 +562,11 @@ static void client_handle_rx(const uint8_t *buf, uint16_t len)
          * ---- 调试阶段: 配置校验通过后直接生效 (不经过 EEPROM) ----
          * 通信板就绪后, 删除下面两行, 并将上方 #if 0 改为 #if 1.
          */
+        if (download_flag == 0U) {
+            TCP_TRACE("config accepted (len=%u) -> download_flag=1,"
+                      " stop requesting config",
+                      (unsigned)len);
+        }
         download_flag = 1U;
 
 
@@ -579,8 +625,9 @@ static void client_thread(void *thread_param)
     struct netbuf *rx_buf;
     void      *data;
     u16_t      data_len;
-    uint8_t    recv_err_cnt      = 0U;
+    uint16_t   recv_err_cnt      = 0U;   /* 必须 >= TCP_RECV_ERR_MAX 的位宽, 否则回绕 */
     uint16_t   config_req_timer  = 0U;
+    static uint32_t connect_cnt  = 0U;       /* 调试追踪: 连接建立次数 (= 重连次数+1) */
 
     (void)thread_param;
     IP4_ADDR(&ipaddr, TCP_SERVER_IP1, TCP_SERVER_IP2,
@@ -612,6 +659,9 @@ static void client_thread(void *thread_param)
         tcp_connected = 1U;
         recv_err_cnt  = 0U;
         netReset      = 1U;    /* 触发 "网络重连成功" 日志 */
+        connect_cnt++;
+        TCP_TRACE("connected #%lu (0 = first connect since power-on)",
+                  (unsigned long)connect_cnt - 1UL);
 
         /*
          * 立即发送申请配置帧 (通过控制通道槽位).
@@ -622,6 +672,7 @@ static void client_thread(void *thread_param)
                                     sizeof(request_config_frame),
                                     29U,
                                     (uint8_t)(TCP_SEND_QUEUE_COUNT - 1U));
+        TCP_TRACE("request_config queued (triggered by connect)");
 
         /* ---- 接收循环 ---- */
         config_req_timer = 0U;
@@ -651,11 +702,25 @@ static void client_thread(void *thread_param)
                  */
 
                 recv_err_cnt++;
+                /* 调试追踪: 超时计数爬到阈值即断开, 每 200 次(≈22s)打印一次进度.
+                 * 收到任何数据都会把计数清零(上方 ERR_OK 分支), 所以这里只统计
+                 * "连续无数据"的时长. */
+                if ((recv_err_cnt % 200U) == 0U) {
+                    TCP_TRACE("recv timeout count %u/%u (download_flag=%u)",
+                              (unsigned)recv_err_cnt, (unsigned)TCP_RECV_ERR_MAX,
+                              (unsigned)download_flag);
+                }
                 if (recv_err_cnt >= TCP_RECV_ERR_MAX) {
+                    TCP_TRACE("tcp_connected 1->0 @ recv ERR_TIMEOUT x%u"
+                              " (threshold %u)",
+                              (unsigned)recv_err_cnt, (unsigned)TCP_RECV_ERR_MAX);
                     tcp_connected = 0U;
                 }
             } else {
                 /* 其他接收错误 → 立即断开重连 */
+                TCP_TRACE("tcp_connected 1->0 @ recv err=%d (not ERR_TIMEOUT)"
+                          " connected=%u",
+                          (int)err, (unsigned)tcp_connected);
                 tcp_connected = 0U;
             }
 
@@ -673,6 +738,8 @@ static void client_thread(void *thread_param)
                                                 sizeof(request_config_frame),
                                                 29U,
                                                 (uint8_t)(TCP_SEND_QUEUE_COUNT - 1U));
+                    TCP_TRACE("request_config queued (retry timer, every %u loops)",
+                              (unsigned)CONFIG_REQ_RETRY_INTERVAL);
                 }
             }
             
@@ -680,6 +747,9 @@ static void client_thread(void *thread_param)
         }
 
         /* ---- 断开连接, 准备重连 ---- */
+        TCP_TRACE("recv loop exit -> close and reconnect"
+                  " (last err=%d, timeout cnt=%u)",
+                  (int)err, (unsigned)recv_err_cnt);
         netconn_close(tcp_conn);
         netconn_delete(tcp_conn);
         tcp_conn = NULL;

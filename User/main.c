@@ -377,7 +377,7 @@ static void App_Task_TcpSend(void *pvParameters)
 /*  3. 看门狗计数器:                                                      */
 /*     - WDTUART0-5FLAG:     各串口任务清零, 此处累加. >500 → 复位         */
 /*     - WDTTCPSENDFLAG:     TCP 发送任务清零, 此处累加. >500 → 复位       */
-/*     - heartbeat:          收到心跳应答时清零, 此处累加. 超限 → 复位     */
+/*     - heartbeat:          收到心跳应答时清零, 此处累加. 60s → 复位 27   */
 /*     - ota_task_wdt:       OTA 升级任务自报存活(30s 窗口), 超时 → 复位31  */
 /*                           升级过程卡死(例如卡在 send 上对端窗口关闭)     */
 /*                           且本任务仍在喂狗 → 板子永不复位, 必须单独判.   */
@@ -389,10 +389,44 @@ static void App_Task_TcpSend(void *pvParameters)
 /*                                                                       */
 /*  5. 日志检查: checkSendLog()                                           */
 /*======================================================================*/
+
+/*======================================================================*/
+/*  调试追踪开关 —— 看门狗触发日志                                         */
+/*                                                                       */
+/*  置 1: 打印 [WDT] 追踪                                              */
+/*        - 哪个计数器先超限 (串口 21-26 / 心跳 27 / TCP发送 28 / OTA 31) */
+/*        - 停止喂狗时的最终复位码                                        */
+/*  置 0: 所有看门狗打印消失, 不影响任何逻辑. (发布版 = 0)                 */
+/*  ⚠ 需 DEBUG_UART_ENABLE=1 (bsp_debug_usart.h), 否则 printf 静默.       */
+/*======================================================================*/
+#define WDT_TRACE_ENABLE               0
+
+#if WDT_TRACE_ENABLE
+#define WDT_TRACE(fmt, args...)        do{printf("\r\n[WDT] " fmt "\r\n", ##args);}while(0)
+#else
+#define WDT_TRACE(fmt, args...)
+#endif
+
+/*======================================================================*/
+/*  看门狗检测周期与阈值 (单位: ms)                                        */
+/*                                                                       */
+/*  ⚠ WDT_TASK_PERIOD_MS 必须与本任务末尾的 vTaskDelay 保持一致,          */
+/*    否则阈值会被整体等比放大 (历史问题: 常数按 10ms 一轮定, 循环改成    */
+/*    500ms 后 3000 次 = 25min, 而注释仍写着 30s).                        */
+/*======================================================================*/
+#define WDT_TASK_PERIOD_MS              500U      /* = 末尾 vTaskDelay     */
+#define WDT_HEARTBEAT_TIMEOUT_MS        60000U    /* 心跳应答超时 → 复位 27 */
+
 static void App_TaskStart(void *pvParameters)
 {
-    uint16_t number = 3000U; /* 心跳超时阈值 (×10ms)      */
+    /* 60s / 500ms = 120 次; 上位机心跳 5s 一次, 即连续 12 次无应答才复位 */
+    uint16_t number = (uint16_t)(WDT_HEARTBEAT_TIMEOUT_MS / WDT_TASK_PERIOD_MS);
     uint8_t  i;
+
+    /* ---- 调试追踪: 各触发源只打印一次 (本循环 500ms 一轮, 不打印会连刷) ---- */
+    uint8_t  wdt_log_port = 0U;   /* 串口任务超时 21-26 */
+    uint8_t  wdt_log_hb   = 0U;   /* 心跳超时     27    */
+    uint8_t  wdt_log_tcp  = 0U;   /* TCP 发送超时 28    */
 
     (void)pvParameters;
 
@@ -406,18 +440,37 @@ static void App_TaskStart(void *pvParameters)
             WDTUARTFLAG[i]++;
             if (WDTUARTFLAG[i] > 500U) {
                 /* 端口 i 的串口任务超时未喂狗 → 触发复位 */
+                if (wdt_log_port == 0U) {
+                    WDT_TRACE("UART task stuck: port=%u (counter=%u > 500)"
+                              " -> reset code %u",
+                              (unsigned)(i + 1U), (unsigned)WDTUARTFLAG[i],
+                              (unsigned)(21U + i));
+                    wdt_log_port = 1U;
+                }
                 WTD_RESET = (uint8_t)(21U + i);  /* 复位码 21-26 */
             }
         }
 
         /* ---- 心跳超时检测 ---- */
         if (heartbeat > number) {
+            if (wdt_log_hb == 0U) {
+                WDT_TRACE("heartbeat timeout: heartbeat=%u > %u"
+                          " (no reply from host) -> reset code 27",
+                          (unsigned)heartbeat, (unsigned)number);
+                wdt_log_hb = 1U;
+            }
             WTD_RESET = 27U;  /* 心跳超时: 上位机长时间无应答 */
         }
 
         /* ---- 累加 TCP 发送 WDT 计数器 ---- */
         WDTTCPSENDFLAG++;
         if (WDTTCPSENDFLAG > 500U) {
+            if (wdt_log_tcp == 0U) {
+                WDT_TRACE("TCP send task stuck: WDTTCPSENDFLAG=%u > 500"
+                          " -> reset code 28",
+                          (unsigned)WDTTCPSENDFLAG);
+                wdt_log_tcp = 1U;
+            }
             WTD_RESET = 28U;  /* TCP 发送任务超时 */
         }
 
@@ -454,6 +507,10 @@ static void App_TaskStart(void *pvParameters)
              */
             LED_485_5_TOGGLE;
             if (logWTD_RESET == 0U) {
+                /* 调试追踪: 只打印一次 (不喂狗到复位只有约 1.6s, 本循环约 3 轮) */
+                WDT_TRACE("stop feeding watchdog, WTD_RESET=%u,"
+                          " waiting for SP706S reset",
+                          (unsigned)WTD_RESET);
                 logWTD_RESET = 1U;
             }
         }
@@ -461,7 +518,7 @@ static void App_TaskStart(void *pvParameters)
         /* ---- 检查并发送日志 ---- */
         // checkSendLog();  //test：关闭日志
 
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(WDT_TASK_PERIOD_MS));
     }
 }
 
@@ -1030,7 +1087,7 @@ static uint16_t uart_custom_module_exchange(uint8_t port_idx, uint8_t module_idx
                                   (uint16_t)(UART_SERIAL_BUF_SIZE - 11U),
                                   600, 100);    //test:50->100
     if (rx_len < 4U) {
-        printf("[DC-FAIL] port=%u addr=%u 无应答 rx_len=%u",
+        printf("[DC-FAIL] port=%u addr=%u no response rx_len=%u",
                (unsigned)(port_idx + 1U),
                (unsigned)BoardCfgTab[port_idx].SlaveModuelAddress[module_idx],
                (unsigned)rx_len);
