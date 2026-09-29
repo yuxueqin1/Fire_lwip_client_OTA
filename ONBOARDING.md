@@ -550,10 +550,29 @@ Fire_lwip_client_OTA/
 | 1 | 配置变更复位 |
 | 2 | 上位机软复位 |
 | 21-26 | USART1-6 任务超时 |
-| 27 | 申请配置帧发送失败 |
+| 27 | 心跳超时（上位机无应答） |
 | 28 | TCP 发送任务超时 |
-| 29 | 心跳超时（上位机无应答） |
+| 29 | 申请配置帧发送失败 |
 | 30 | 日志帧发送失败 |
+| 31 | OTA 升级任务卡死（`ota_task_wdt` 超 30s 未上报存活，见 §8.5） |
+
+### 8.5 OTA 升级任务看门狗（复位码 31）
+
+`App_TaskStart` 的复位码 21-30 都是"某个任务忘了清零自己的 WDT 计数器"。
+OTA 任务不在这套机制里，因为它**天然的长时间不返回**（Flash 擦除几秒、
+TCP connect 几十秒）。所以它另走一条链路：
+
+| 接口 | 位置 | 作用 |
+|------|------|------|
+| `ota_task_wdt_arm()` | `ota_client_task()` 第一条语句 | 从这里起才开始判超时 |
+| `ota_task_wdt_kick()` | 任务主循环 / `client_session()` 每轮 | 上报存活，窗口恢复 30s |
+| `ota_task_wdt_busy(ms)` | 进 Flash 擦除/校验、TCP connect 前 | 声明"预计最长 ms 不返回" |
+| `ota_task_wdt_progress()` | `ota_wdt_feed()` 内部顺带调用 | 长操作里每喂一次狗就顺延截止时刻 |
+| `ota_task_wdt_timed_out()` | `App_TaskStart`（每 500ms 查一次） | 1 = 卡死 → `WTD_RESET=31` → 停喂狗 |
+
+时基用 `HAL_GetTick()`（与调度器无关），所以"任务被高优先级任务饿死"
+这种情况也能查出来。`arm()` 之前一律不判超时，避免 OTA 任务因堆不足
+创建失败时把板子拖进复位死循环。
 
 ---
 
@@ -594,33 +613,54 @@ python -m PC_Server.modbus_slave_simulator -c PC_Server/modbus_slave_simulator/c
 
 ## 10. OTA 固件升级
 
-### 10.1 当前状态：**开发中（代码已就绪，`ota_client_init()` 被注释）**
+### 10.1 当前状态：**已上板跑通**（A/B 双分区，见 commit 371429a）
+
+`ota_client_init()` 已在 `main.c` 中调用，OTA 任务常驻（优先级 4，栈 4096B）。
+
+三层"卡死"防护（从轻到重，都不需要人工上板）：
+
+| 层 | 位置 | 手段 |
+|----|------|------|
+| 1 | `ota_net.c` | `send()`/`recv()` 都不永久阻塞：单次 send ≤5s、整帧 ≤8s，对端窗口关闭时返回 -1 让上层重连 |
+| 2 | `ota_client.c` | DOWNLOADING 期间 30s 收不到新字节 ⇒ 判定链路假死 ⇒ 主动断开重连（软恢复） |
+| 3 | `ota_wdt.c` + `main.c` | 任务真卡死 ⇒ `App_TaskStart` 判超时、停喂 SP706S ⇒ 硬件复位（复位码 31，见 §8.5） |
+
+> ⚠ 第 1 层依赖 [lwipopts.h](User/arch/lwipopts.h) 里的 `LWIP_SO_SNDTIMEO=1`。
+> 它为 0 时 `setsockopt(SO_SNDTIMEO)` 静默失败、`send()` 能永久阻塞，
+> 现场表现就是本板一直回 `TCP ZeroWindowProbeAck` 且重启上位机也不恢复。
 
 ### 10.2 设计思路
 
 OTA 模块采用**服务器主动推送**模式：
 
 ```
-OTA Server (ota_server.py)                    OTA Client (ota_client.c)
+OTA 上位机 (PC_Server/ota_gui.py)              OTA Client (ota_client.c)
          │                                              │
-         │  ── PUSH_UPDATE (版本号) ──→                  │
+         │  ←── HELLO (版本 + 当前/目标槽位) ──            │
+         │  ── PUSH_UPDATE (版本/大小/CRC32) ──→         │
          │  ←── CONFIRM_UPDATE (确认升级) ──              │
-         │  ── START_DOWNLOAD (大小/CRC32) ──→           │
-         │  ── DATA (分片, 分段发送) ──→                 │
-         │  ←── ACK/NAK (逐段确认) ──                    │
-         │  ── END (最终校验) ──→                        │
-         │  ←── ACK (升级完成) ──                        │
+         │                              (设备擦除目标分区 1~5s)
+         │  ←── ACK (OTA_STATE_DOWNLOADING) ──           │
+         │  ── DATA xN (offset 递增) ──→                 │
+         │  ── END ──→                                   │
+         │  ←── ACK (OTA_STATE_SUCCESS) ──               │
          │                                              │
-         │                                   → 写入内部 Flash
+         │                                   → 写 BootInfo
          │                                   → 重启进入新固件
 ```
 
+> 注意 `PUSH_UPDATE` 里就带了 大小 + CRC32，`START_DOWNLOAD` 只是
+> 服务器的一次性通知；设备在回 `ACK(DOWNLOADING)` **之前**先擦完分区，
+> 上位机必须先等到这个 ACK 再开始灌 DATA（`ota_gui.py` 已如此）。
+
 **关键文件：**
-- [ota_client.c](User/ota/ota_client.c)：客户端主逻辑
+- [ota_client.c](User/ota/ota_client.c)：客户端主逻辑（会话状态机）
+- [ota_manager.c](User/ota/ota_manager.c)：升级状态 + 版本/槽位判断
 - [ota_flash.c](User/ota/ota_flash.c)：内部 Flash 分区 + 擦写
-- [ota_net.c](User/ota/ota_net.c)：OTA 专用 TCP 通道
+- [ota_net.c](User/ota/ota_net.c)：OTA 专用 TCP 通道（帧收发）
+- [ota_wdt.c](User/ota/ota_wdt.c)：SP706S 喂狗 + 任务看门狗
 - [ota_crc32.c](User/ota/ota_crc32.c)：固件完整性校验
-- [ota_server.py](ota_server.py)：Python 参考 OTA 服务器
+- [PC_Server/ota_gui.py](PC_Server/ota_gui.py)：上位机 OTA 升级工具
 
 ---
 

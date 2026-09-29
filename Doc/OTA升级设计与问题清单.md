@@ -218,6 +218,8 @@ typedef struct {
 | P9-3 | ⚪ | 服务器地址硬编码 192.168.1.99:5002 | ✅ 确认为有意设计，不改 |
 | P9-4 | 🟡 | 服务器发完 END 立即关连接，无应用层确认闭环 | ✅ 已修 |
 | P9-5 | 🟠 | Bootloader 不校验目标分区固件完整性，半截固件直接跳入 → 变砖无回滚 | ✅ 已修 |
+| P10-1 | 🔴 | `LWIP_SO_SNDTIMEO` 未开 → `setsockopt(SO_SNDTIMEO)` 静默失效 → 对端窗口关闭时 `send()` 永久阻塞 → OTA 任务卡死不再 recv → 本板接收窗口归零，双方互等，现场表现为本板持续回 `TCP ZeroWindowProbeAck` 且**重启上位机也不恢复** | ✅ 已修 |
+| P10-2 | 🔴 | OTA 任务不在 `App_TaskStart` 的看门狗表里 → 它卡死时板子照常喂 SP706S，永不复位 | ✅ 已修（复位码 31） |
 
 ### 各问题详细说明
 
@@ -307,6 +309,58 @@ memcpy(frame->data, buffer + 9, frame->len);
 
 **修复方案**：`boot_info` 增加 `size` / `version` 字段，IAP 跳转前按 CRC32 校验目标分区，失败则回退另一分区。
 
+#### P10-1 — 对端窗口关闭时 `send()` 永久阻塞（ZeroWindowProbeAck 的真凶）
+
+现场现象：用 `ota_gui.py` 升级时，通信板持续向上位机发 **TCP ZeroWindowProbeAck**，
+升级流程永久挂住，**连重启上位机程序都救不回来**。
+
+链路推理（`lwip/lwip-2.1.2`）：
+
+1. `ota_net_connect()` 设了 `SO_SNDTIMEO`，但本工程 `lwipopts.h` 里 **`LWIP_SO_SNDTIMEO` 没定义（=0）**
+   ⇒ `setsockopt()` 里的 `case SO_SNDTIMEO` 被条件编译掉，**静默失败**（返回成功、实际什么都没设）。
+2. 于是整帧发送的 `while (total < pos) send(...)` 里，单次 `send()` 没有超时。
+3. 对端接收窗口为 0（对端应用不读）时，lwIP 的 `netconn_write` 停留在 `NETCONN_WRITE` 状态
+   （`api_msg.c` 的 `lwip_netconn_do_writemore()` 要等 `TCP_SND_BUF` 腾出来才继续），**不会返回**。
+4. OTA 任务卡在这条 `send()` 上 ⇒ 它再也不调 `recv()` ⇒ **本板的接收窗口也归零**。
+5. 双方互等：本板对"对端窗口=0"发 ZeroWindowProbe，对端对"本板窗口=0"也发 probe
+   ⇒ 界面上看到的就是本板一直回 `ZeroWindowProbeAck`，且**永远不收敛**。
+6. 重启 `ota_gui.py` 也没用：本板这一侧的连接状态还停在 `NETCONN_WRITE`，
+   新连接进来时旧 socket 仍占着任务，OTA 任务根本没回到 accept/connect 循环。
+
+**为什么以前没暴露**：只在"对端应用短暂不读"（PC 端 GUI 卡一下、磁盘写日志、
+`IDLE_TIMEOUT` 之前那段）时才触发，触发一次就永久卡住，属于低频必死。
+
+**修复方案（两层，见下表第 1 / 3 层）**：
+- `lwipopts.h` 打开 `LWIP_SO_SNDTIMEO = 1`，并在 `ota_net_connect()` 里对
+  `setsockopt(SO_SNDTIMEO)` 的返回值做检查（失败打印告警）。
+- `ota_net_send()` 增加**整帧总时限** `OTA_SEND_TOTAL_TIMEOUT_MS`(8 s)：
+  到点即返回 -1，不再无限重试 → 上层断开重连 → 板子始终能自己走回来。
+
+#### P10-2 — OTA 任务没有看门狗
+
+`App_TaskStart`（`main.c`）靠"各任务别忘了清自己的 WDT 计数器"兜底，
+复位码 21-30 全是这套机制。**OTA 任务不在其中** —— 因为它天然会长时间不返回
+（Flash 擦除数秒、`connect` 几十秒），套不进"每 500 ms 清零"的模型。
+
+⇒ 它一旦卡死（P10-1 的 `send()`、卡在阻塞 `printf`、被高优先级任务饿死），
+板子照常喂 SP706S，**永不复位**。这就是"重启上位机也不行"的最后一块拼图。
+
+**修复方案**：新增 `ota_task_wdt_*`（`User/ota/ota_wdt.c`），用 `HAL_GetTick()`
+（与调度器无关）判活：
+
+| 层 | 手段 | 恢复方式 |
+|---|---|---|
+| 1 | `send()`/`recv()` 都有超时，绝不永久阻塞 | 软：返回 -1 → 断开重连 |
+| 2 | `DOWNLOADING` 期间 30 s 无新字节 ⇒ 会话假死 | 软：主动断开重连，不重启板子 |
+| 3 | OTA 任务 30 s 不上报存活 ⇒ `WTD_RESET = 31` ⇒ 停喂狗 | 硬：SP706S 复位板子 |
+
+长操作（Flash 擦/校验、TCP connect）用 `ota_task_wdt_busy(ms)` 声明窗口，
+窗口内不判超时；内部每次喂狗（`ota_wdt_feed()`）顺带 `ota_task_wdt_progress()`
+顺延截止时刻，所以"一个扇区一个扇区地擦"不算卡死，真卡在某个扇区里仍会判超时。
+
+`ota_task_wdt_arm()` 之前一律不判超时：OTA 任务若因堆不足没创建起来，
+板子不该陷入"复位 → 重启 → 再复位"的死循环。
+
 ---
 
 ## 5. 修复进度
@@ -327,6 +381,7 @@ memcpy(frame->data, buffer + 9, frame->len);
 | 11 | **上板实测**（PC 配 192.168.1.99，跑 `ota_gui.py`） | ⏳ 待用户执行，步骤见第 7 章 |
 | 12 | **上板实测首轮暴露**：烧 bootloader + A 镜像后 APP 卡死（LED_485_1 常亮 / LED_RUN 不闪 / 串口零输出）。根因：IAP `JumpToApplication()` 用 `__disable_irq()` 关了全局中断，跳转前**只恢复了 FAULTMASK、漏了 PRIMASK**；PRIMASK 不被跳转清零，APP 的 SysTick 中断进不来，`HAL_Delay()` 死等 `uwTick` | ✅ 已修复，跳转前补 `__enable_irq()`；反汇编确认 `CPSID i` … `CPSIE i` / `BLX` 顺序正确。详见 §8.4 |
 | 13 | **上板实测二轮暴露**：OTA 传输走到 100%、字节数完全正确，但 `CRC32: got 0xEA122474, expected 0xFD10E5F5` → 校验失败。根因：`ota_net_next_frame()` 在 **return 之前**就 `memmove` 压缩了接收缓冲，而 `out->data` 指着缓冲内部、载荷区正好落在被覆盖的前缀里 —— 调用方读到的是**下一帧的数据** | ✅ 已修复，载荷先拷进独立的 `g_frame_data[1024]` 暂存区；反汇编确认 `out->data` 存的是 `g_frame_data` 地址。详见 §8.5 |
+| 14 | **上板实测三轮暴露**：升级卡住，通信板持续回 `TCP ZeroWindowProbeAck` 且重启上位机也不恢复。根因：`LWIP_SO_SNDTIMEO=0` ⇒ `send()` 无超时 ⇒ OTA 任务永久卡在 `send()`，双方窗口同时归零互等；且 OTA 任务不在看门狗表里，板子永不复位 | ✅ 已修：开 `LWIP_SO_SNDTIMEO` + 发送总时限 8 s + 会话停滞 30 s 软重连 + OTA 任务看门狗（复位码 31）。详见 P10-1 / P10-2 |
 
 ### 5.1 本阶段新增 / 修改的文件
 
