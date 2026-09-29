@@ -163,7 +163,9 @@ typedef struct {
 
 `ota_client_task`（`ota_client.c:116`）：
 1. `ota_manager_init()` → 读 boot_info，确定 `g_current_app_addr` / `g_download_addr`
-2. 每 10 s 尝试连接 **192.168.1.99:5002**（该地址固定；升级时只需把上位机网卡配成 192.168.1.99 即可连通）
+2. 每 3 s 尝试连接 **192.168.1.99:5002**（该地址固定；升级时只需把上位机网卡配成 192.168.1.99 即可连通）。
+   单次尝试最多 3 s —— 非阻塞 `connect` + `select` 限时（见 P11），超时就放弃、下一轮重来，
+   所以上位机什么时候起来，板子最坏 ≈6 s 就能连上
 3. 连上后立即发 `HELLO`，载荷 = 当前固件版本 + 当前所在分区
 4. 之后每 60 s 补发 `HELLO` 兼作心跳
 5. 循环收帧并分发处理
@@ -361,6 +363,55 @@ memcpy(frame->data, buffer + 9, frame->len);
 `ota_task_wdt_arm()` 之前一律不判超时：OTA 任务若因堆不足没创建起来，
 板子不该陷入"复位 → 重启 → 再复位"的死循环。
 
+#### P11 — "升级软件每次都要等好久才连上 / 中途断开后等好久也连不回来"
+
+**现场现象**：上位机点开 OTA 工具后，要等十几~几十秒才看到通信板；下载中途断开
+（尤其拔网线 / 上位机网卡改地址 / 上位机休眠）后，等几分钟也不重连，只能重启板子。
+
+三条互相独立的根因，都在"连接 / 断线判定"这条路径上：
+
+**① 一次失败的 `connect` 要占住 OTA 任务 ≈18 s。**
+lwIP 的阻塞 `connect()` 不是"最多等一会儿"，而是"等到握手完成或 SYN 重试用尽"：
+`SYN_SENT` 状态下 RTO **不做退避**（`tcp.c:1286` 的 `if (pcb->state != SYN_SENT)` 才退避），
+SYN 每 3 s 重发一次、上限 `TCP_SYNMAXRTX`(默认 6) —— 对端不应答时一次尝试 ≈18 s
+（目标 IP 不存在 / ARP 无应答 / 上位机网卡还没改成 192.168.1.99，都是这个下场）。
+再叠加原来的重连间隔 10 s：板子每 ≈30 s 才来敲一次门，且敲门期间上位机起来了也白搭。
+
+**② 重连间隔 10 s 太长** —— 板子是被动方，上位机只能等它下一次来敲门。
+
+**③ 连接断了，本板这一侧根本不知道**（"断开后再也连不回来"的主因，分两层）：
+- `ota_net_recv()` 只把 `readfds` 交给 `select()`。lwIP 把连接出错（对端 RST /
+  pcb 被 abort / 保活判死）报成 **errevent**，而 `lwip_select` 只在
+  **调用方传了 `exceptfds`** 时才为 errevent 唤醒（`sockets.c`：
+  `event_callback()` → `select_check_waiters()` 里 has_errevent 那一支要求
+  `FD_ISSET(s, scb->exceptset)`）。于是连接死了也不会被唤醒：`select` 一直超时、
+  `recv` 永远不被调用，任务一直以为"连接还在"。
+- 链路**静悄悄**断掉时（拔网线、上位机网卡被改地址、上位机休眠），两端都没有
+  FIN/RST，socket 一直停在 ESTABLISHED：`send()` 只是把数据塞进发送缓冲、照样
+  返回"成功"，只能等 TCP 把重传熬完（`TCP_MAXRTX=12`、RTO 退避到 48 s，
+  累计 **6~7 分钟**）。而 `LWIP_TCP_KEEPALIVE=0` 时保活只能用 lwIP 默认参数
+  （`keep_idle` 2 小时 + 9×75 s 探测），等于没开。
+
+**修复**：
+
+| # | 改动 | 效果 |
+|---|---|---|
+| 1 | `connect` 改"非阻塞 + `select` 限时"，上限 `OTA_CONNECT_TIMEOUT_MS` = 3 s | 单次尝试占住任务的时间 18 s → ≤3 s |
+| 2 | `OTA_RECONNECT_INTERVAL` 10 s → 3 s | 上位机起来后最坏 ≈6 s 连上（原来 ≈30 s） |
+| 3 | `recv` 的 `select` 增加 `exceptfds` | 连接被 RST / 被 abort 后**立刻**发现并重连 |
+| 4 | `lwipopts.h` 开 `LWIP_TCP_KEEPALIVE=1`；OTA socket 设保活 10 s / 3 s / 3 次 | 静默断链 ≈19 s 被判死（原来 6~7 分钟），`tcp_slowtmr` 直接 abort 该连接 |
+| 5 | `OTA_TASK_BUSY_CONNECT_MS` 60 s → 10 s | 与 3 s 的连接上限匹配（必须 ≥ 它，否则被看门狗当成卡死复位 31） |
+
+⚠ 三个坑，改这块时别踩：
+- 失败路径上**先清非阻塞标志再 `close` 会被 lwIP 拒绝关闭**（`lwip_netconn_do_delconn`
+  把"`state == NETCONN_CONNECT` 且没有非阻塞标志"当成"阻塞 connect 进行中"），
+  所以超时要**在还带着非阻塞标志的时候关**。
+- `select` 报可写 ≠ 连上了：连接失败同样报可写，必须再用 `getsockopt(SO_ERROR)`
+  判一次（它顺带清错误标志）。**不能用 `getpeername()` 代替** —— lwIP 在
+  "只发过 SYN、还没握手"的 pcb 上也会返回成功。
+- 连上后要**恢复阻塞模式**：留着非阻塞，`send()` 在发送缓冲满时返回 EWOULDBLOCK，
+  而 `ota_net_send()` 把"返回负值"一律当链路故障 —— 会误判重连。
+
 ---
 
 ## 5. 修复进度
@@ -382,6 +433,7 @@ memcpy(frame->data, buffer + 9, frame->len);
 | 12 | **上板实测首轮暴露**：烧 bootloader + A 镜像后 APP 卡死（LED_485_1 常亮 / LED_RUN 不闪 / 串口零输出）。根因：IAP `JumpToApplication()` 用 `__disable_irq()` 关了全局中断，跳转前**只恢复了 FAULTMASK、漏了 PRIMASK**；PRIMASK 不被跳转清零，APP 的 SysTick 中断进不来，`HAL_Delay()` 死等 `uwTick` | ✅ 已修复，跳转前补 `__enable_irq()`；反汇编确认 `CPSID i` … `CPSIE i` / `BLX` 顺序正确。详见 §8.4 |
 | 13 | **上板实测二轮暴露**：OTA 传输走到 100%、字节数完全正确，但 `CRC32: got 0xEA122474, expected 0xFD10E5F5` → 校验失败。根因：`ota_net_next_frame()` 在 **return 之前**就 `memmove` 压缩了接收缓冲，而 `out->data` 指着缓冲内部、载荷区正好落在被覆盖的前缀里 —— 调用方读到的是**下一帧的数据** | ✅ 已修复，载荷先拷进独立的 `g_frame_data[1024]` 暂存区；反汇编确认 `out->data` 存的是 `g_frame_data` 地址。详见 §8.5 |
 | 14 | **上板实测三轮暴露**：升级卡住，通信板持续回 `TCP ZeroWindowProbeAck` 且重启上位机也不恢复。根因：`LWIP_SO_SNDTIMEO=0` ⇒ `send()` 无超时 ⇒ OTA 任务永久卡在 `send()`，双方窗口同时归零互等；且 OTA 任务不在看门狗表里，板子永不复位 | ✅ 已修：开 `LWIP_SO_SNDTIMEO` + 发送总时限 8 s + 会话停滞 30 s 软重连 + OTA 任务看门狗（复位码 31）。详见 P10-1 / P10-2 |
+| 15 | **现场反馈**：升级软件每次都要等好久才能连上通信板；中途突然断开后等好久也没有重连上。根因三条：① 阻塞 `connect()` 在 `SYN_SENT` 不退避（`tcp.c:1286`），对端不应答时一次尝试占住 OTA 任务 ≈18 s（6×3 s），再叠加 10 s 重连间隔 ⇒ 每 ≈30 s 才敲一次门；② `ota_net_recv()` 的 `select` 没传 `exceptfds`，而 `lwip_select` 只把 errevent 报给 exceptfds ⇒ 连接被 RST/abort 后不唤醒，任务一直以为连接还在；③ `LWIP_TCP_KEEPALIVE=0` ⇒ 保活的 lwIP 默认值是 2 小时 idle，静默断链只能等 TCP 重传熬完（`TCP_MAXRTX=12` + RTO 退避）⇒ 6~7 分钟才发现 | ✅ 已修：非阻塞 `connect` + `select` 限时 3 s（`OTA_CONNECT_TIMEOUT_MS`）+ 重连间隔 10 s→3 s + `recv` 同时监视 `exceptfds` + 开 `LWIP_TCP_KEEPALIVE` 并设保活 10 s/3 s×3 次（≈19 s 判死）+ busy 窗口 60 s→10 s。详见 P11 |
 
 ### 5.1 本阶段新增 / 修改的文件
 

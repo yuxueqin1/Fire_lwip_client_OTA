@@ -629,6 +629,21 @@ python -m PC_Server.modbus_slave_simulator -c PC_Server/modbus_slave_simulator/c
 > 它为 0 时 `setsockopt(SO_SNDTIMEO)` 静默失败、`send()` 能永久阻塞，
 > 现场表现就是本板一直回 `TCP ZeroWindowProbeAck` 且重启上位机也不恢复。
 
+**连接 / 断链判定**（v1.1.0.26 起，见 Doc 的 P11）—— 本板是 TCP **客户端**，
+上位机是被动等它敲门的服务端，所以"多久才连上"完全由本板决定：
+
+| 手段 | 参数 | 说明 |
+|------|------|------|
+| 连接限时 | `OTA_CONNECT_TIMEOUT_MS` = 3 s | 非阻塞 `connect` + `select`，超时即弃。**不要改回阻塞**：lwIP 的 `SYN_SENT` 不退避，对端不应答时一次尝试要 ≈18 s |
+| 重连间隔 | `OTA_RECONNECT_INTERVAL` = 3 s | 上位机起来后最坏 ≈6 s 连上 |
+| 断链即时感知 | `recv` 的 `select` 同时监视 `exceptfds` | lwIP 的 errevent（RST / pcb abort）**只报给 exceptfds**，只 select readfds 永远等不到 |
+| 静默断链探测 | 保活 10 s / 3 s × 3 次 ≈19 s | 拔网线、上位机改 IP / 休眠时没有 FIN/RST，靠 TCP 重传要 6~7 分钟；需 `LWIP_TCP_KEEPALIVE=1` |
+
+> ⚠ 改连接代码时的三个坑（细节见 Doc P11）：超时后要**在还带非阻塞标志时** `close`
+> （否则 lwIP 拒绝关闭）；`select` 报可写 ≠ 连上，必须再用 `getsockopt(SO_ERROR)`
+> 判一次（不能拿 `getpeername()` 代替）；连上后要**恢复阻塞模式**，
+> 否则 `send()` 会返回 EWOULDBLOCK 被当成链路故障。
+
 ### 10.2 设计思路
 
 OTA 模块采用**服务器主动推送**模式：
@@ -735,6 +750,8 @@ PC (board_server.py :5001)  ←→  以太网  ←→  通信板 (STM32F429)
 | 心跳超时复位 | 自动心跳开关未启用 | 勾选"自动心跳" |
 | 从机全离线后死锁 | 旧版 FreeModbus 未关闭句柄 | 已修复 (commit 60931e4) |
 | 两块板子同时在线时反复重连 | 两块板 MAC 相同（旧固件从 UID 批次字段派生） | 比对开机打印的 `eth MAC`；新固件改从 uid[0] 派生 |
+| OTA 升级软件要等好久才连上通信板 | 旧固件阻塞 `connect` 在 `SYN_SENT` 不退避 ⇒ 一次尝试占住任务 ≈18 s，叠加 10 s 重连间隔 | 升级到 v1.1.0.26+（连接限时 3 s + 重连间隔 3 s）。也可先看串口是否在刷 `[OTA_NET] connected` / 重连日志 |
+| OTA 中途断开后长时间不重连 | 旧固件三处叠加：`recv` 只 select readfds（收不到 errevent）、保活没编进去（静默断链 6~7 分钟才发现）、非 DOWNLOADING 阶段无停滞检测 | 升级到 v1.1.0.26+（`exceptfds` + 保活 10s/3s×3 ≈19 s 判死 + 3 s 重连）。临时办法：上位机改回 192.168.1.99 后等约 1 分钟，或重启通信板 |
 
 ---
 
