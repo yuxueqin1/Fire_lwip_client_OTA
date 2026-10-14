@@ -74,6 +74,44 @@ static uint8_t       g_need_reconnect = 0U;
 static uint32_t      g_last_progress_ms    = 0U;  /* 上次字节数变化的时刻 */
 static uint32_t      g_last_progress_bytes = 0U;  /* 上次看到的已收字节数 */
 
+/* ==================================================================
+ *  诊断: 本任务此刻停在哪一步 (v42 临时加, 见 ota_client_stage())
+ *
+ *  用法(很重要): 进每个会阻塞的调用【之前】打标签, 调用【返回后】立刻置回
+ *  OTA_STAGE_LOOP。这样从别的任务读到的 stage 才有唯一解释:
+ *      stage == OTA_STAGE_LOOP      → 人没卡在任何调用里(排不上 CPU / 死了)
+ *      stage == 其它                → 人正卡在那个调用里面
+ *
+ *  之所以要看这个: 复位码 31 只说"OTA 任务 30s 没上报", 但"被饿死"和"真卡住"
+ *  在现场是一模一样的表现, 只有 stage 能分开。
+ *
+ *  ★ 2026-10-14 (v46): 本任务优先级已由 4 提到 5, 见 ota_client_task 创建处。
+ *    当时 6 路 UART + RS485-7 的 Modbus 轮询里 HAL_Delay() 是纯自旋(不让出),
+ *    几个 prio 5 任务几乎常驻就绪, prio 4 的本任务被永久压在下面、30s 一次都
+ *    排不上 → 复位码 31。提到 5 后与它们同台 1ms 轮转(configUSE_TIME_SLICING=1),
+ *    实测不再复位。⚠ 治标非根治: 端口任务的自旋还在。
+ * ================================================================== */
+#define OTA_STAGE_INIT          0U   /* 还没进主循环(arm/初始化) */
+#define OTA_STAGE_LOOP          1U   /* 循环顶, 不在任何阻塞调用里 */
+#define OTA_STAGE_RECONN_WAIT   2U   /* 等重连间隔 (vTaskDelay) */
+#define OTA_STAGE_CONNECT       3U   /* ota_net_connect (非阻塞+select, ≤3s) */
+#define OTA_STAGE_HELLO_SEND    4U   /* 发 HELLO (send 总时限 8s) */
+#define OTA_STAGE_SESS_KICK     5U
+#define OTA_STAGE_SESS_FRAME    6U   /* 取帧/分发 (Flash 擦写走这里) */
+#define OTA_STAGE_SESS_RECV     7U   /* ota_net_recv (select ≤200ms) */
+#define OTA_STAGE_SESS_HELLO    8U   /* 会话内周期 HELLO */
+#define OTA_STAGE_DISCONNECT    9U
+#define OTA_STAGE_REBOOT_WAIT   10U  /* 升级完成, 等重启 */
+
+static volatile uint8_t  g_ota_stage    = OTA_STAGE_INIT;
+static volatile uint32_t g_ota_loop_cnt = 0U;   /* 主循环转了几圈, 只增不减 */
+
+/* 诊断: 当前 stage / 主循环圈数 / socket 是否连着 / 会话状态 */
+uint8_t  ota_client_stage(void)    { return g_ota_stage; }
+uint32_t ota_client_loop_cnt(void) { return g_ota_loop_cnt; }
+uint8_t  ota_client_sock_open(void){ return (g_sock >= 0) ? 1U : 0U; }
+uint8_t  ota_client_sess(void)     { return (uint8_t)g_sess; }
+
 
 /* ==================================================================
  *  发送辅助 (小端, 与上位机 struct.unpack('<I') 对应)
@@ -334,9 +372,12 @@ static uint8_t client_session(void)
 
     for (;;) {
         /* ---- 0. 上报"OTA 任务活着"(第3层防护的依据) ---- */
+        g_ota_stage = OTA_STAGE_SESS_KICK;
         ota_task_wdt_kick();
+        g_ota_stage = OTA_STAGE_LOOP;
 
         /* ---- 1. 先把缓冲里已成帧的全部处理掉(一次 recv 可能带回好几帧) ---- */
+        g_ota_stage = OTA_STAGE_SESS_FRAME;
         for (i = 0U; i < OTA_MAX_FRAMES_PER_LOOP; i++) {
             if (ota_net_next_frame(&f) != 1) {
                 break;
@@ -351,6 +392,7 @@ static uint8_t client_session(void)
                 return 0U;
             }
         }
+        g_ota_stage = OTA_STAGE_LOOP;
 
         if (i >= OTA_MAX_FRAMES_PER_LOOP) {
             /* 到上限还有剩余, 让出一次 CPU 再继续, 别把低优先级任务饿死 */
@@ -384,7 +426,9 @@ static uint8_t client_session(void)
         }
 
         /* ---- 2. 缓冲空了: 读网络(内部最多等 200ms) ---- */
+        g_ota_stage = OTA_STAGE_SESS_RECV;
         rc = ota_net_recv(g_sock);
+        g_ota_stage = OTA_STAGE_LOOP;
         if (rc == OTA_NET_RX_FULL) {
             /* 缓冲里凑不出整帧, 又腾不出空间给下一帧(半帧 + 垃圾把缓冲占满)。
              * 丢弃重同步即可 —— 但绝不能就此不读 socket: 不读 → 本板接收
@@ -406,10 +450,13 @@ static uint8_t client_session(void)
             if ((now - last_hello) >= OTA_HELLO_INTERVAL) {
                 last_hello = now;
 
+                g_ota_stage = OTA_STAGE_SESS_HELLO;
                 if (client_send_hello() < 0) {
                     printf("[OTA_CLIENT] HELLO failed, reconnect\r\n");
+                    g_ota_stage = OTA_STAGE_LOOP;
                     return 0U;
                 }
+                g_ota_stage = OTA_STAGE_LOOP;
             }
         }
     }
@@ -435,13 +482,17 @@ static void ota_client_task(void *param)
     ota_manager_init();
 
     for (;;) {
+        g_ota_loop_cnt++;
+        g_ota_stage = OTA_STAGE_LOOP;
         ota_task_wdt_kick();
 
         if (g_sock < 0) {
             uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
             if ((now - last_connect) < OTA_RECONNECT_INTERVAL) {
+                g_ota_stage = OTA_STAGE_RECONN_WAIT;
                 vTaskDelay(pdMS_TO_TICKS(500));
+                g_ota_stage = OTA_STAGE_LOOP;
                 continue;
             }
             last_connect = now;
@@ -452,7 +503,9 @@ static void ota_client_task(void *param)
              * OTA_CONNECT_TIMEOUT_MS(3s); busy 窗口仍要声明 ——
              * 那是"连 socket 层都卡住"时唯一能把板子救回来的兜底, 与超时是两回事。 */
             ota_task_wdt_busy(OTA_TASK_BUSY_CONNECT_MS);
+            g_ota_stage = OTA_STAGE_CONNECT;
             g_sock = ota_net_connect(OTA_SERVER_IP, OTA_SERVER_PORT);
+            g_ota_stage = OTA_STAGE_LOOP;
             ota_task_wdt_kick();
 
             if (g_sock < 0) {
@@ -464,11 +517,14 @@ static void ota_client_task(void *param)
             g_sess = SESS_IDLE;
             ota_abort(OTA_STATE_IDLE);
 
+            g_ota_stage = OTA_STAGE_HELLO_SEND;
             if (client_send_hello() < 0) {
                 ota_net_disconnect(g_sock);
                 g_sock = -1;
+                g_ota_stage = OTA_STAGE_LOOP;
                 continue;
             }
+            g_ota_stage = OTA_STAGE_LOOP;
 
             continue;   /* 立刻进入收发循环, 不再等一轮 */
         }
@@ -479,17 +535,20 @@ static void ota_client_task(void *param)
             ota_net_disconnect(g_sock);
             g_sock = -1;
 
+            g_ota_stage = OTA_STAGE_REBOOT_WAIT;
             vTaskDelay(pdMS_TO_TICKS(OTA_REBOOT_DELAY_MS));
             NVIC_SystemReset();
         }
 
+        g_ota_stage = OTA_STAGE_DISCONNECT;
         ota_net_disconnect(g_sock);
         g_sock = -1;
+        g_ota_stage = OTA_STAGE_LOOP;
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
 void ota_client_init(void)
 {
-    sys_thread_new("ota_client", ota_client_task, NULL, 4096, 4);
+    sys_thread_new("ota_client", ota_client_task, NULL, 4096, 5); //优先级4改成5
 }

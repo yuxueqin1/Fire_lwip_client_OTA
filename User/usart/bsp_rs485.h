@@ -34,6 +34,26 @@ typedef struct {
 #define UART_DEFAULT_DELAY_MS       440
 #define UART_POLL_PERIOD_MS         1000  /* 每端口目标轮询周期: 补齐到 1 秒 */
 
+/* ---- 模块离线判决门限 (四种端口类型共用, 判决见 main.c uart_module_check_offline) ----
+ *
+ * 判离线的条件是【距上次成功通信 ≥ UART_MODULE_OFFLINE_MS】, 而不是"连续失败几轮".
+ *
+ * 为什么按"时长"不按"轮数": 一轮的长度随掉线台数暴涨 —— 每台掉线模块要白等一个
+ * 应答超时 (Modbus 端口 500ms, 直流3对线 600ms), 13 台全掉线的端口一轮要 6.5s,
+ * 而只掉 1 台的端口一轮仍被补齐到 1s. 按轮数数, 同一个门限在两种端口上就是 5s
+ * 和 33s, 现场根本不可接受; 按时长判则与轮长无关.
+ *
+ * 防抖: 单次丢应答留下的静默就是 1 个轮询周期 (≈1s), 达不到这个门限 → 不报警,
+ *       现场"报警灯/蜂鸣器偶尔亮响 1~2 秒又自己好"的抖动报警由此消失; 连续两轮
+ *       都答不上 (≈2s) 才报. 现场想更快/更钝就改这个值, 但别小于一个轮询周期,
+ *       否则单次抖动又会被当成离线. */
+#define UART_MODULE_OFFLINE_MS      2000U
+
+/* 连续失败到 UART_MODULE_SKIP_ERR 次后进入"跳过轮询"态 (每 10 轮探测一次);
+ * module_error 计数饱和在 UART_MODULE_ERR_SAT, 保证跳过态不会因计数回绕而丢失. */
+#define UART_MODULE_SKIP_ERR        3U
+#define UART_MODULE_ERR_SAT         4U
+
 /* ---- 发送前的总线静默判定 (见 uart_custom_exchange) ----
  * 防止上一台从机的"迟到应答"撞进下一次请求的接收窗口, 导致两台盒子
  * 同时 CRC 失败 (现场表现为随机几台掉线、下一秒恢复).
@@ -133,9 +153,15 @@ typedef struct {
     uint8_t        port_idx;
     xMBMHandle     xMBMaster;
     uint8_t        module_error[UART_MODULE_MAX_COUNT];
-    /* 离线跳过计数: 连续3次失败(module_error>=3)后跳过等待, 0=正常,
+    /* 离线跳过计数: 连续 UART_MODULE_SKIP_ERR 次失败后跳过等待, 0=正常,
      * 1..10=跳过状态下累计周期, ≥10 时本轮探测一次 (≈10s) */
     uint8_t        skip_probe_count[UART_MODULE_MAX_COUNT];
+    /* 已判离线标志 (粘性: 置位后一直保持, 只有该模块通信成功才清).
+     * 轮初初值用它把已离线的位保持为 0 —— 这样轮询进行中(尚未轮到某些模块时)
+     * runtime->link_mask 也是完整的, 不会把上一轮已判离线的模块又显示成在线. */
+    uint8_t        module_offline[UART_MODULE_MAX_COUNT];
+    /* 上次通信成功的时刻 (HAL_GetTick), 离线判决的时间基准 */
+    uint32_t       module_last_ok_ms[UART_MODULE_MAX_COUNT];
     uint8_t        port_error;
     uint16_t       holding_base;
     uint32_t       link_mask;
@@ -257,6 +283,7 @@ extern AxleCounterState_t     axle_counter_state[UART_PORT_COUNT];  /* Axle coun
 extern DC3WireState_t         dc3wire_state[UART_PORT_COUNT];        /* DC 3-wire curve_seq state          */
 extern UART_RxRing_t          uart_rx_ring[UART_PORT_COUNT];          /* Interrupt-driven RX ring buffers    */
 extern volatile uint16_t      uart_custom_flush_cnt[UART_PORT_COUNT];  /* TX 窗口内残字节冲掉次数 (诊断)       */
+extern volatile uint8_t       uart_polled_cnt[UART_PORT_COUNT];        /* 本轮实际发起请求的模块数 (诊断)       */
 extern UART_CustomTxState_t   uart_custom_tx[UART_PORT_COUNT];        /* Interrupt-driven TX state           */
 extern uint8_t                g_debug_axle_enable;                     /* 计轴调试打印开关: 1=开, 0=关         */
 extern uint8_t                g_debug_dc3w_enable;                     /* 直流三对线调试打印开关: 1=开, 0=关         */

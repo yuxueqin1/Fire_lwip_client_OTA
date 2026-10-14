@@ -308,11 +308,15 @@ static volatile uint32_t g_ota_task_deadline_ms = 0U;   /* 允许的最晚上报
 static volatile uint32_t g_ota_task_window_ms   = 0U;   /* 当前窗口长度(progress 按它顺延) */
 static volatile uint8_t  g_ota_task_armed       = 0U;   /* 0 = 任务还没起来, 不判超时 */
 
+/* ---- 诊断用 (见 ota_task_wdt_report_cnt 的说明) ---- */
+static volatile uint32_t g_ota_task_report_cnt  = 0U;   /* 累计上报次数, 只增不减 */
+
 /* 内部: 把截止时刻设为 now + ms */
 static void ota_task_wdt_set_window(uint32_t ms)
 {
     g_ota_task_window_ms   = ms;
     g_ota_task_deadline_ms = HAL_GetTick() + ms;
+    g_ota_task_report_cnt++;        /* 诊断: 这一次上报也算 */
 }
 
 void ota_task_wdt_arm(void)
@@ -356,4 +360,40 @@ uint8_t ota_task_wdt_timed_out(void)
     }
     /* (int32_t 差值 >= 0) ⇒ now 已过截止时刻; 回绕安全 */
     return ((int32_t)(HAL_GetTick() - g_ota_task_deadline_ms) >= 0) ? 1U : 0U;
+}
+
+
+/* ==================================================================
+ *  诊断接口 —— 只读, 给 RS485-7 的 UDP 状态帧带出去
+ *
+ *  为什么需要: 复位码 31 只说"OTA 任务 30s 没上报", 但"没上报"的成因有两种,
+ *  现场光看复位码分不出来:
+ *    (a) 任务卡在某个调用里 (connect/send/recv/Flash), 人还活着但出不来;
+ *    (b) 任务被饿死 (v46 之前它是全系统最低优先级 prio 4, 而 6 路 UART +
+ *        RS485-7 的 Modbus 轮询用 HAL_Delay 自旋、几乎常驻就绪, 都是 prio 5
+ *        —— 只要它们把 CPU 占满, prio 4 就一次都排不上。v46 起本任务已提到
+ *        prio 5, 这一支的现实风险大幅降低, 但促成它的自旋并未根治).
+ *  配 ota_client_stage() 一起看就能分开: 计数器不动 + stage 停在"循环顶"
+ *  ⇒ 饿死; 计数器不动 + stage 停在某个具体调用 ⇒ 卡在那个调用里。
+ * ================================================================== */
+
+/* 累计上报次数(kick/busy/progress 都算): 两帧之间不涨 = 任务不在跑 */
+uint32_t ota_task_wdt_report_cnt(void)
+{
+    return g_ota_task_report_cnt;
+}
+
+/* 距"判卡死"还剩多少 ms: >0 还来得及, <=0 已经判超时了 */
+int32_t ota_task_wdt_left_ms(void)
+{
+    if (g_ota_task_armed == 0U) {
+        return -1;
+    }
+    return (int32_t)(g_ota_task_deadline_ms - HAL_GetTick());
+}
+
+/* 1 = OTA 任务已经接管(arm 过了), 0 = 还没 */
+uint8_t ota_task_wdt_armed(void)
+{
+    return g_ota_task_armed;
 }

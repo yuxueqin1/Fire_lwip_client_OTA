@@ -220,9 +220,24 @@ void client_disconnect(void)
 /*  将数据放入 TCP 发送队列 (覆盖式, 只保留最新帧)                          */
 /*  - buf:        数据指针                                                */
 /*  - len:        数据长度                                                */
-/*  - reset_flag: 发送失败时的看门狗复位码                                  */
+/*  - reset_flag: 发送失败时的看门狗复位码 (0 = 不复位, 只断链重连)          */
 /*  - port_flag:  槽位编号 (0-5=端口数据, TCP_SEND_QUEUE_COUNT-1=控制通道) */
 /*======================================================================*/
+/*  reset_flag 取值约定 (2026-10-13 收紧, 改之前先看这段):
+ *
+ *    【数据帧一律传 0U】—— 端口实时帧 / 计轴帧 / 直流3线帧 / 曲线帧
+ *    原来这些帧带的是 19 和 20+port*6 (=20,26,32,38,44,50), 后果是:
+ *    client_send_pending() 里只要一次 client_send_frame() 失败 (对端 RST、
+ *    连接刚被关掉时 netconn_write 直接返错), 就 WTD_RESET → 不喂狗 →
+ *    1.6s 后整机复位. 于是"上位机把连接关掉/链路抖一下"这种本该只断链重连
+ *    的软故障变成了整机复位, 而且这些码不在复位码表里, 26 还和"串口任务
+ *    卡死"撞号, 事后看复位码会误判。
+ *    现在数据帧发送失败 = 只置 tcp_connected=0, 交给 client_thread 重连。
+ *
+ *    复位码只留给"能定位到具体故障源"的帧/任务:
+ *      29 申请配置帧  30 日志帧
+ *      21-26 串口任务卡死  27 心跳超时  28 TCP 发送任务卡死  31 OTA 卡死
+ */
 void client_add_to_tcp_send_buf(const void *buf, uint16_t len,
                                  uint8_t reset_flag, uint8_t port_flag)
 {
@@ -642,8 +657,10 @@ static void client_thread(void *thread_param)
         }
 
 #if LWIP_SO_RCVTIMEO
-        /* 设置接收超时: 50ms, 避免永久阻塞 recv */
-        netconn_set_recvtimeout(tcp_conn, 100); //test:50ms改成100ms
+        /* 设置接收超时 100ms: 避免 recv 永久阻塞 —— 无数据时周期性返回, 好让
+         * 发送队列和重连逻辑有机会跑. 原为 50ms, 现场实测后放到 100ms; 这个值
+         * 是调出来的, 不要随手改回去. */
+        netconn_set_recvtimeout(tcp_conn, 100);
 #endif
 
         /* ---- 连接服务器 ---- */

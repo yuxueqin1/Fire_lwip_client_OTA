@@ -21,7 +21,8 @@
  *     tcpip_thread(7) > ETHIN(6) > 应用任务(5/6).
  *     若 ETHIN 低于串口/TcpSend, DMA 接收环来不及清空 → ACK 被丢弃
  *     (RBUS) → TCP 发送窗口永不释放 → 发送任务长期阻塞 (已踩坑, 勿改回).
- *   串口采集优先级最低, 可被网络通信随时抢占.
+ *   串口采集(5) 低于网络线程(6/7), 网络繁忙时可随时抢占; 但高于 Test1(1),
+ *     只有纯心跳任务才是全系统最低.
  *
  * 任务列表:
  *   | 任务名            | 优先级 | 栈(字) | 功能                          |
@@ -33,8 +34,13 @@
  *   | td_tcp_client     | 6      | 256    | TCP 连接管理 + 接收 (client.c) |
  *   | App_Task_TcpSend  | 6      | 256    | TCP 发送队列轮询               |
  *   | USART1..USART6    | 5      | 384    | 6 路串口数据采集               |
- *   | RS485_7           | 4      | 384    | 第7路RS485 Modbus主/从机      |
+ *   | RS485_7           | 5      | 512    | 第7路RS485 Modbus主/从机      |
+ *   | ota_client        | 5      | 1024   | OTA 升级 (v46 由 4 提到 5)     |
  *   | Test1_Task        | 1      | 128    | LED1 心跳                     |
+ *
+ *   注: prio 5 这一档全部是"常驻就绪"型任务(Modbus 轮询里的 HAL_Delay 是纯自旋),
+ *       同档靠 configUSE_TIME_SLICING=1 的 1ms 时间片轮转, 谁也压不死谁 ——
+ *       ota_client 曾经在 prio 4 被这一档饿死到触发看门狗复位(复位码 31), v46 修复。
  *   |
  *   | 注: 栈大小单位 = 字(4B). lwIP 线程栈常数按字节定义
  *   |     (TCPIP_THREAD_STACKSIZE=1536B, td_tcp_client=1024B,
@@ -110,7 +116,7 @@ static void uart_custom_module_offline(UART_PortRuntime_t *runtime, uint8_t modu
                                        uint16_t *dc_offset);
 
 /* ---- Frame flush: send buffered data to TCP ---- */
-static void uart_flush_realtime_frame(uint8_t port_idx, uint16_t len, uint8_t reset_flag);
+static void uart_flush_realtime_frame(uint8_t port_idx, uint16_t len);
 
 /* ---- Watchdog / port-error polling ---- */
 static void uart_check_port_error_and_arm(UART_PortRuntime_t *runtime);
@@ -155,19 +161,115 @@ static USHORT MBRegInputBuf[MB_REG_INPUT_NREGS]    = {0};
 
 /*======================================================================*/
 /*  uart_published_link_mask                                            */
-/*  已发布的链路掩码 = 上一轮轮询结束时写入 SerialDataBuf[port][7..10] 的完整值.*/
-/*  各轮询流程每轮开头先把 runtime->link_mask 清 0 (如 uart_process_custom_port */
-/*  的 runtime->link_mask = 0), 再逐台应答成功才置位, 因此轮询进行中它是"本轮  */
-/*  已轮询过的模块"的半成品 —— 尚未轮询到的模块位全是 0, 绝不可对外发布:       */
-/*    - 曲线上传帧/脉冲帧 (uart_axle_counter_upload_pulse,                    */
-/*      uart_dc3wire_upload_curve) 会把它发给上位机;                          */
-/*    - 串口7 compute_local_board_alarm 读的也是这个字段, 用于主机通信板报警. */
-/*  发布半成品的后果: 每轮里靠后的模块 (如 m4/m5) 被随机判为离线, 而实际通信   */
-/*  完全正常, 且不会有任何 [DC-FAIL] 打印. 所有帧构建一律用本函数取值.         */
+/*  已发布的链路掩码 = SerialDataBuf[port][7..10].                        */
+/*                                                                      */
+/*  只在【每轮轮询末尾】更新一次 (各端口处理函数结尾的那一句回写).            */
+/*    - 轮内 runtime->link_mask 会随离线判决实时变化, 但那是端口任务的内部     */
+/*      状态, 不对外发布 —— 上位机拿的模块数据帧 (uart_flush_realtime_frame / */
+/*      client_add_to_tcp_send_buf) 与本字段是同一轮、同一份, 所以上位机知道  */
+/*      模块报警的时刻就是串口7 知道并点灯/响蜂鸣器的时刻, 不存在"蜂鸣器和     */
+/*      报警灯已经响了亮了, 上位机上却还一切正常"的错位窗口.                  */
+/*    - 轮初初值 = 乐观全在线 - 已判离线的位 (uart_round_initial_link_mask), */
+/*      所以轮内它也不是"靠后的模块被随机判离线"那种半成品.                  */
+/*  因此曲线上传帧/脉冲帧 (uart_axle_counter_upload_pulse,                   */
+/*  uart_dc3wire_upload_curve) 与串口7 compute_local_board_alarm 读它都是     */
+/*  安全的 (拿到的是上一轮跑完的完整结论).                                  */
 /*======================================================================*/
 static uint32_t uart_published_link_mask(uint8_t port_idx)
 {
     return *((uint32_t *)&SerialDataBuf[port_idx][7]);
+}
+
+
+/*======================================================================*/
+/*  uart_all_online_link_mask                                           */
+/*  本端口"全部模块都在线"的掩码 = (1 << SlaveModuelNum) - 1, 与串口7        */
+/*  compute_local_board_alarm() 算的 expected_mask 是同一个口径.          */
+/*  只作为轮初初值的基数, 实际初值还要扣掉已判离线的位 (见                     */
+/*  uart_round_initial_link_mask).                                       */
+/*======================================================================*/
+static uint32_t uart_all_online_link_mask(uint8_t port_idx)
+{
+    uint8_t n = BoardCfgTab[port_idx].SlaveModuelNum;
+
+    if (n == 0U) {
+        return 0UL;                     /* 没配模块: 没有"在线"可言 */
+    }
+    if (n >= 32U) {
+        return 0xFFFFFFFFUL;
+    }
+    return (1UL << n) - 1UL;
+}
+
+
+/*======================================================================*/
+/*  uart_round_initial_link_mask                                        */
+/*  轮初初值 = 【乐观全在线】减去【已判离线】的位.                           */
+/*                                                                      */
+/*  "乐观全在线"解决上电假报警: 配置一生效 expected_mask 就已经是全 1, 而第一  */
+/*  轮要 n × 500ms/600ms 才跑完; 这段空窗里若对外发布的 SerialDataBuf[7..10] */
+/*  还是 0, 串口7 立刻判"整路离线" → 上电就报警响蜂鸣器, 可一次通信都还没做过. */
+/*                                                                      */
+/*  "减去已判离线"解决轮内的完整性: 轮询进行中尚未轮到某一台时, 它的位只能是上  */
+/*  一轮的结论 —— 已判离线的模块必须继续保持 0, 否则有人在这轮里提前发布(判每  */
+/*  台离线时立即回写, 见 uart_module_check_offline) 就会把离线模块又显示成在线. */
+/*======================================================================*/
+static uint32_t uart_round_initial_link_mask(UART_PortRuntime_t *runtime)
+{
+    uint8_t  m;
+    uint8_t  n = BoardCfgTab[runtime->port_idx].SlaveModuelNum;
+    uint32_t mask = uart_all_online_link_mask(runtime->port_idx);
+
+    if (n > UART_MODULE_MAX_COUNT) {
+        n = UART_MODULE_MAX_COUNT;
+    }
+    for (m = 0U; m < n; m++) {
+        if (runtime->module_offline[m] != 0U) {
+            mask &= ~(1UL << m);
+        }
+    }
+    return mask;
+}
+
+
+/*======================================================================*/
+/*  uart_module_check_offline                                            */
+/*  四种端口类型共用的"本轮这台没答上"处理: 累加失败计数 + 离线判决 + 发布.   */
+/*                                                                      */
+/*  判决条件只有一条: 距上次成功通信 ≥ UART_MODULE_OFFLINE_MS (2000ms).      */
+/*    - 与轮询周期无关: 1 台端口一轮 1s, 13 台全掉线的端口一轮 6.5s, 按时长  */
+/*      判两种情况都是"静默超过 2s 就报", 不会像数轮数那样被慢轮拖成 30s.   */
+/*    - 防抖: 单次丢应答只留下 ≈1 个轮询周期的静默, 够不到门限 → 不报警.     */
+/*                                                                      */
+/*  判为离线时只更新本任务内部的 runtime->link_mask, **不**回写              */
+/*  SerialDataBuf[7..10] —— 对外发布统一留到本轮结束 (各端口处理函数末尾那一句). */
+/*                                                                      */
+/*  为什么不在判决当场发布: 串口7 是每 500ms 读一次 SerialDataBuf[7..10] 来     */
+/*  驱动蜂鸣器/报警灯的, 而上位机拿的是端口任务每轮才发一次的模块数据帧.          */
+/*  判决当场发布的话, 串口7 会在上位机这一轮的数据帧还没发出去时就点灯/响蜂鸣器,   */
+/*  出现"本地已经报警、上位机上还一切正常"的错位. 现在两者都以"轮"为发布边界,     */
+/*  同一轮里一起变 —— 上位机看到离线, 串口7 同时点灯.                          */
+/*  返回 1 = 本台已判离线, 0 = 还在防抖窗口内.                             */
+/*======================================================================*/
+static uint8_t uart_module_check_offline(UART_PortRuntime_t *runtime, uint8_t module_idx)
+{
+    uint32_t idle_ms;
+
+    /* 失败计数: 唯一用途是 uart_module_should_poll() 的跳过判决, 饱和后不再累加 */
+    if (runtime->module_error[module_idx] < UART_MODULE_ERR_SAT) {
+        runtime->module_error[module_idx]++;
+    }
+
+    idle_ms = HAL_GetTick() - runtime->module_last_ok_ms[module_idx];
+    if (idle_ms < UART_MODULE_OFFLINE_MS) {
+        return 0U;                      /* 防抖窗口内: 只计数, 保持该位不变 */
+    }
+
+    runtime->module_offline[module_idx] = 1U;
+    runtime->link_mask &= ~(1UL << module_idx);
+    /* 不在此处回写 SerialDataBuf[7..10]: 对外发布留到本轮末尾, 保证上位机的
+     * 模块数据帧与串口7 的报警判决在同一轮边界上一起变 (见本函数头注释). */
+    return 1U;
 }
 
 extern void TCPIP_Init(void);
@@ -243,7 +345,7 @@ static void AppTaskCreate(void *pvParameters)
         }
     }
 
-    /* ---- App_Task_TcpSend (prio=5) ---- */
+    /* ---- App_Task_TcpSend (prio=6) ---- */
     xReturn = xTaskCreate((TaskFunction_t)App_Task_TcpSend,
                           (const char    *)"App_Task_TcpSend",
                           (uint16_t       )256,
@@ -306,12 +408,20 @@ static void AppTaskCreate(void *pvParameters)
 /*======================================================================*/
 /*  Test1_Task  —  LED1 心跳 (1Hz)                                       */
 /*======================================================================*/
+/* 诊断 (v42 临时): Test1_Task 是全系统优先级最低的任务(prio 1), 它的圈数
+ * 就是"CPU 还有没有空闲"的旁证 —— 它不涨, 说明 prio>=5 的任务把 CPU 占满了
+ * (已于 v46 前的 7 连帧里坐实: 它和 OTA 的两个计数器一起冻住, 见 task_rs485_7.c
+ * 的 OTA 诊断帧)。⚠ prio 5 的端口任务至今仍在自旋占 CPU, 所以本计数可能依旧
+ * 增长缓慢 —— 它是"根因未清"的度量, 不是故障。 */
+volatile uint32_t g_test1_cnt = 0U;
+
 static void Test1_Task(void *parameter)
 {
     (void)parameter;
     while (1) {
-        
+
         LED_RUN_TOGGLE;
+        g_test1_cnt++;
         vTaskDelay(1000);
     }
 }
@@ -487,9 +597,9 @@ static void App_TaskStart(void *pvParameters)
          *   只有约 1.6s, 期间本循环还会跑 3 次, 不加判断会连打 3 条日志。 */
         if (ota_task_wdt_timed_out() != 0U) {
             if (WTD_RESET == 0U) {
-                printf("[WDT] OTA task stuck > %lums, stop feeding"
-                       " -> SP706S reset (code 31)\r\n",
-                       (unsigned long)OTA_TASK_WDT_TIMEOUT_MS);
+                WDT_TRACE("OTA task stuck > %lums, stop feeding"
+                          " -> SP706S reset (code 31)",
+                          (unsigned long)OTA_TASK_WDT_TIMEOUT_MS);
             }
             WTD_RESET = 31U;  /* OTA 升级任务卡死 */
         }
@@ -515,8 +625,14 @@ static void App_TaskStart(void *pvParameters)
             }
         }
 
-        /* ---- 检查并发送日志 ---- */
-        // checkSendLog();  //test：关闭日志
+        /* ---- 检查并发送日志 ----
+         * 发布版关闭: 把下面这一次调用注释掉即可。checkSendLog() / SendLogToServer()
+         * 的定义, 以及各标志位的置位逻辑, 全部原样保留 —— 要恢复取消注释就行。
+         * 代价: 被置位的那些标志 (pStart / netReset / logWTD_RESET / portError[] /
+         * portDLQX[] / jiaoshi) 从此没人清, 会一直挂着。它们都是"只被 checkSendLog
+         * 消费、别处只置位不读"的位, 不影响任何其它逻辑; 唯一后果是以后重新打开
+         * 时, 会先把挂着的旧日志补发一次。 */
+        /* checkSendLog(); */
 
         vTaskDelay(pdMS_TO_TICKS(WDT_TASK_PERIOD_MS));
     }
@@ -546,6 +662,7 @@ static void App_TaskStart(void *pvParameters)
 static void uart_task_handler(void *pvParameters)
 {
     uint8_t            port_idx = (uint8_t)(uintptr_t)pvParameters;
+    uint8_t            m;
     uint32_t           baud_rate;
     UART_PortRuntime_t runtime;
 
@@ -566,6 +683,24 @@ static void uart_task_handler(void *pvParameters)
      * download_flag == 0 (配置未下载) 时也不启动.
      */
     uart_wait_until_configured(port_idx);
+
+    /* ---- 乐观初值: 配置一生效就把"已发布"的链路掩码填成全在线 ----------------
+     * 配置生效的瞬间 expected_mask 已经是全 1, 而第一轮要 n × 500ms 才跑完;
+     * 这个空窗里若 SerialDataBuf[7..10] 还是 0, 串口7 的报警判决会立刻判
+     * "整路离线" → 上电就报警/响蜂鸣器. 第一轮跑完会被真实结果覆盖.
+     * 顺带: uart_check_port_error_and_arm() 也不会再把这个空窗当成"全部从机
+     * 离线", 从而在上电时反复重新初始化串口. */
+    runtime.link_mask = uart_round_initial_link_mask(&runtime);
+    *((uint32_t *)&SerialDataBuf[port_idx][7]) = runtime.link_mask;
+
+    /* ---- 起步宽限: 所有模块的"上次成功通信时刻"先按此刻起算 ----------------
+     * memset 之后 module_last_ok_ms 全是 0, 而判决算的是 HAL_GetTick() - 它,
+     * 不减这一下的话是从开机起算的一个很大的数, 第一次答不上就会立刻判离线.
+     * 按此刻起算后, 从开始轮询到最早可能判离线之间至少还有一个
+     * UART_MODULE_OFFLINE_MS (2000ms), 首轮偶发一次没答上不会报离线. */
+    for (m = 0U; m < UART_MODULE_MAX_COUNT; m++) {
+        runtime.module_last_ok_ms[m] = HAL_GetTick();
+    }
     
 
     /* ---- 初始化串口硬件 ---- */
@@ -679,13 +814,13 @@ static void uart_task_handler(void *pvParameters)
             memcpy(&SerialDataBuf[port_idx][11], runtime.ssz_buf, runtime.data_len);
             client_add_to_tcp_send_buf(&SerialDataBuf[port_idx][0],
                                        (uint16_t)(runtime.data_len + 11U),
-                                       19U, port_idx);
+                                       0U, port_idx);   /* 数据帧不复位 */
             break;
 
         case UART_PORT_MODBUS_MASTER:
-            /* Modbus port: 使用 uart_flush_realtime_frame 统一设置帧标志 */
-            uart_flush_realtime_frame(port_idx, runtime.data_len,
-                                      20U + port_idx * 6U);
+            /* Modbus port: 使用 uart_flush_realtime_frame 统一设置帧标志
+             * (数据帧不复位, 发送失败只断链重连) */
+            uart_flush_realtime_frame(port_idx, runtime.data_len);
             break;
 
         case UART_PORT_AXLE_COUNTER:
@@ -715,7 +850,7 @@ static void uart_task_handler(void *pvParameters)
             }
             client_add_to_tcp_send_buf(&SerialDataBuf[port_idx][0],
                                        (uint16_t)(runtime.data_len + 11U),
-                                       20U + port_idx * 6U, port_idx);
+                                       0U, port_idx);   /* 数据帧不复位 */
             break;
 
         case UART_PORT_DC3WIRE:
@@ -743,7 +878,7 @@ static void uart_task_handler(void *pvParameters)
             }
             client_add_to_tcp_send_buf(&SerialDataBuf[port_idx][0],
                                        (uint16_t)(runtime.data_len + 11U),
-                                       20U + port_idx * 6U, port_idx);
+                                       0U, port_idx);   /* 数据帧不复位 */
             break;
 
         default:
@@ -772,23 +907,38 @@ static void uart_task_handler(void *pvParameters)
 /*======================================================================*/
 /*  uart_module_should_poll                                              */
 /*  从机离线跳过机制 (四种端口类型共用):                                   */
-/*  - 正常状态 (连续失败 <3 次): 每轮都发送请求轮询.                      */
-/*  - 连续 3 次轮询无响应 (module_error >= 3) 后: 进入跳过状态, 不再       */
+/*  - 正常状态 (连续失败 < UART_MODULE_SKIP_ERR): 每轮都发送请求轮询.       */
+/*  - 连续 UART_MODULE_SKIP_ERR 次轮询无响应后: 进入跳过状态, 不再         */
 /*    发送请求/等待应答超时, 仅由上层保持 SDRAM 0xFFFF 离线数据填充.       */
 /*  - 跳过状态每累计 10 个轮询周期 (每轮补齐到 UART_POLL_PERIOD_MS=1s,    */
 /*    即 ≈10s) 探测一次: 若恢复在线 (online 处理清零 module_error) 则       */
 /*    恢复正常轮询; 仍无响应则保持跳过.                                   */
 /*  - skip_probe_count 由本函数维护; 探测成功后 module_error 被清零,       */
-/*    本函数在 me<3 分支将计数复位为 0, 状态自然回到正常轮询.             */
+/*    本函数在 me<SKIP_ERR 分支将计数复位为 0, 状态自然回到正常轮询.      */
+/*                                                                      */
+/*  注意: 这里的"连续失败次数"只用来决定什么时候省下等待应答的时间,       */
+/*  【不再】用来判离线 —— 判离线看的是"多久没通信成功" (见                */
+/*  uart_module_check_offline) 与轮长无关. 两者故意解耦, 所以本函数迭代      */
+/*  计数(含跳过轮的累加)不会让离线上报变快或变慢.                          */
 /*  返回 1 = 本轮正常轮询/探测, 0 = 本轮跳过.                             */
 /*======================================================================*/
 static uint8_t uart_module_should_poll(UART_PortRuntime_t *runtime, uint8_t module_idx)
 {
     uint8_t *cnt = &runtime->skip_probe_count[module_idx];
 
-    if (runtime->module_error[module_idx] < 3U) {
+    /* ---- 诊断: 维护本轮"实际发起请求的模块数" uart_polled_cnt[port] ----
+     * 本函数是四个端口处理器轮询循环里唯一的"要不要真发请求"判决点, 每模块
+     * 每轮恰好被调用一次, 而循环一律从 module_idx==0 开始 —— 所以 m==0 就是
+     * 本轮起点, 在这里清零计数; 凡是走到下面 return 1U 的分支才真的发请求。
+     * 串口7的 UDP 状态日志用它区分"整路处于跳过态"和"问了但一台都没答". */
+    if (module_idx == 0U) {
+        uart_polled_cnt[runtime->port_idx] = 0U;
+    }
+
+    if (runtime->module_error[module_idx] < UART_MODULE_SKIP_ERR) {
         /* 正常状态: 清零探测计数, 每轮都轮询 */
         *cnt = 0U;
+        uart_polled_cnt[runtime->port_idx]++;
         return 1U;
     }
 
@@ -799,7 +949,8 @@ static uint8_t uart_module_should_poll(UART_PortRuntime_t *runtime, uint8_t modu
     }
     if (*cnt >= 10U) {
         *cnt = 0U;
-        return 1U;   /* 本轮探测 */
+        uart_polled_cnt[runtime->port_idx]++;   /* 本轮探测 */
+        return 1U;
     }
     (*cnt)++;
     return 0U;
@@ -819,6 +970,14 @@ static void uart_process_modbus_master(UART_PortRuntime_t *runtime)
     const UART_ModuleProfile_t *profile;
 
     if ((runtime == NULL) || (runtime->xMBMaster == NULL)) {
+        /* 串口初始化失败时 xMBMaster == NULL, 本端口一台也轮询不了, 于是这一轮的
+         * 结果永远不会发布 —— 而乐观初值已经把"已发布"的掩码填成了全在线, 一个
+         * 起不来的端口就会一直显示"全部在线"(上位机和串口7 都看不出来).
+         * 这里显式按"全部离线"发布出去, 让这个端口仍然报故障而不是假装正常. */
+        if (runtime != NULL) {
+            runtime->link_mask = 0UL;
+            *((uint32_t *)&SerialDataBuf[runtime->port_idx][7]) = 0UL;
+        }
         return;
     }
 
@@ -828,7 +987,8 @@ static void uart_process_modbus_master(UART_PortRuntime_t *runtime)
     }
 
     data = (CPU_INT16U *)&SerialDataBuf[runtime->port_idx][11];
-    runtime->link_mask = 0;
+    /* 乐观初值 = 全在线 - 已判离线的位 (见 uart_round_initial_link_mask) */
+    runtime->link_mask = uart_round_initial_link_mask(runtime);
 
     for (m = 0; m < module_count; m++) {
         profile = uart_get_module_profile(
@@ -883,6 +1043,8 @@ static void uart_modbus_mark_online(UART_PortRuntime_t *runtime,
     uint16_t copy_regs;
 
     runtime->module_error[module_idx] = 0;
+    runtime->module_offline[module_idx] = 0;                 /* 恢复在线: 清粘性离线标志 */
+    runtime->module_last_ok_ms[module_idx] = HAL_GetTick();  /* 刷新离线判决的时间基准 */
     runtime->link_mask |= (1UL << module_idx);
 
     MBRegHoldingBuf[runtime->holding_base] |= (1U << module_idx);
@@ -912,7 +1074,7 @@ static void uart_modbus_mark_online(UART_PortRuntime_t *runtime,
 
 /*======================================================================*/
 /*  uart_modbus_mark_offline                                             */
-/*  模块 Modbus 读取失败时调用: 连续 3 次失败后标记离线, 填充 0xFFFF,       */
+/*  模块 Modbus 读取失败时调用: 静默 ≥UART_MODULE_OFFLINE_MS 才标记离线,     */
 /*  清除 holding 寄存器.                                                  */
 /*======================================================================*/
 static void uart_modbus_mark_offline(UART_PortRuntime_t *runtime,
@@ -924,15 +1086,8 @@ static void uart_modbus_mark_offline(UART_PortRuntime_t *runtime,
     uint16_t holding_pos;
     uint16_t clear_regs;
 
-    if (runtime->module_error[module_idx] > 3U) {
-        /* 保持计数 ≥3 (不再清零), 与自定义/计轴/直流3对线处理器一致:
-         * 离线跳过机制 (uart_module_should_poll) 依赖 module_error>=3
-         * 维持跳过状态, 若在此清零会导致跳过状态在下一轮丢失、退回每轮
-         * 等待应答超时 (200ms), 无法满足 1s 轮询预算. */
-        runtime->link_mask &= ~(1UL << module_idx);
+    if (uart_module_check_offline(runtime, module_idx) != 0U) {
         MBRegHoldingBuf[runtime->holding_base] &= ~(1U << module_idx);
-    } else {
-        runtime->module_error[module_idx]++;
     }
 
     MBRegHoldingBuf[runtime->holding_base + 1U] &= ~(1U << module_idx);
@@ -978,7 +1133,8 @@ static void uart_process_custom_port(UART_PortRuntime_t *runtime)
         module_count = UART_MODULE_MAX_COUNT;
     }
 
-    runtime->link_mask = 0;
+    /* 乐观初值 = 全在线 - 已判离线的位 (见 uart_round_initial_link_mask) */
+    runtime->link_mask = uart_round_initial_link_mask(runtime);
     runtime->data_len = 0;
     flush_before = uart_custom_flush_cnt[runtime->port_idx];
 
@@ -1075,17 +1231,19 @@ static uint16_t uart_custom_module_exchange(uint8_t port_idx, uint8_t module_idx
     tx_buf[7] = (uint8_t)((tx_crc >> 8) & 0xFFU);
 
     /* 发送 + 接收, 直接写入 SerialDataBuf
-     * 字节间隔超时 10→50ms: 与计轴/DC3WIRE 路径对齐 (计轴处注释写明"丢包问题在
-     *   字节间隔", 一直是 50ms; DC3WIRE 是 20ms). 采集盒采样周期就是 40ms/点,
-     *   帧内某一段等一个采样节拍、或去处理另一路 485-2 的 1DQJ 开关量
-     *   (手册: 20ms/帧) 时, 段间空档完全可能超过 10ms → 主站在帧中间就判"帧
-     *   结束" → 半截帧 → CRC 失败/长度<4 → 该从机当轮离线. 帧尾判定要等满
-     *   该超时, 故每台多花 ~40ms (13 台 ≈ +0.5s/轮).
+     * 字节间隔超时 100ms (uart_custom_exchange 最后一个实参): 与计轴/DC3WIRE
+     *   路径对齐 —— 计轴处注释写明"丢包问题在字节间隔", DC3WIRE 是 20ms.
+     *   采集盒采样周期就是 40ms/点, 帧内某一段等一个采样节拍、或去处理另一路
+     *   485-2 的 1DQJ 开关量 (手册: 20ms/帧) 时, 段间空档完全可能超过 10ms →
+     *   主站在帧中间就判"帧结束" → 半截帧 → CRC 失败/长度<4 → 该从机当轮离线.
+     *   所以先把 10ms 提到 50ms, 现场实测后进一步放到 100ms (现取值) —— 这个值
+     *   是调出来的, 不要随手改回去. 帧尾判定要等满该超时, 故每台会多花这一个
+     *   超时的时间.
      * 首字节超时 600ms: 盒子手册标称动态响应 ≤250ms, 留 2 倍余量. */
     rx_len = uart_custom_exchange(port_idx, tx_buf, 8,
                                   resp,
                                   (uint16_t)(UART_SERIAL_BUF_SIZE - 11U),
-                                  600, 100);    //test:50->100
+                                  600, 100);
     if (rx_len < 4U) {
         printf("[DC-FAIL] port=%u addr=%u no response rx_len=%u",
                (unsigned)(port_idx + 1U),
@@ -1142,6 +1300,8 @@ static void uart_custom_module_online(UART_PortRuntime_t *runtime,
     ser_buf = (uint8_t *)&SerialDataBuf[runtime->port_idx][0];
 
     runtime->module_error[module_idx] = 0;
+    runtime->module_offline[module_idx] = 0;                 /* 恢复在线: 清粘性离线标志 */
+    runtime->module_last_ok_ms[module_idx] = HAL_GetTick();  /* 刷新离线判决的时间基准 */
     runtime->link_mask |= (1UL << module_idx);
     MBRegHoldingBuf[runtime->holding_base] |= (1U << module_idx);
 
@@ -1181,14 +1341,9 @@ static void uart_custom_module_online(UART_PortRuntime_t *runtime,
 
     /*
      * 注意: 此处**不要**把 runtime->link_mask 回写到 SerialDataBuf[7-10].
-     * uart_process_custom_port 每轮开始先把 runtime->link_mask 清 0, 再逐台
-     * 置位, 所以走到这里时它是"本轮已轮询过的模块"的半成品 —— 尚未轮询到的
-     * 模块位全是 0. 一旦在此回写: 曲线上传 (uart_handle_curve_end_frame 直接把
-     * ser_buf[0] 推 TCP) 和串口7的主机通信板在线检查都会读到这个半成品, 表现
-     * 为每轮里靠后的模块 (如 m4/m5) 随机报离线, 而实际通信完全正常, 且不会
-     * 有任何 [DC-FAIL] (因为压根没失败).
-     * 让 SerialDataBuf[7-10] 保持为"上一轮结束时的完整掩码"即可 —— 循环末尾会
-     * 写入本轮的完整掩码.
+     * 对外发布只在每轮末尾做一次 (见 uart_published_link_mask 说明): 轮内
+     * 模块还在陆续轮询, 中途发布会让串口7 先于点灯/响蜂鸣器, 而上位机那一轮
+     * 的数据帧还没发出去 —— 就是"本地报警、上位机正常"的错位.
      */
 
     /* 曲线帧分发 (使用完整 SerialDataBuf 中的绝对偏移) */
@@ -1213,11 +1368,8 @@ static void uart_custom_module_offline(UART_PortRuntime_t *runtime,
     uint16_t clear_regs;
     uint16_t i;
 
-    if (runtime->module_error[module_idx] > 3U) {
-        runtime->link_mask &= ~(1UL << module_idx);
+    if (uart_module_check_offline(runtime, module_idx) != 0U) {
         MBRegHoldingBuf[runtime->holding_base] &= ~(1U << module_idx);
-    } else {
-        runtime->module_error[module_idx]++;
     }
 
     /* SDRAM 区域填充 0xFFFF (离线标志) */
@@ -1323,15 +1475,17 @@ static void uart_handle_curve_frame_dispatch(uint8_t port_idx, uint8_t module_id
 /*======================================================================*/
 /*  uart_flush_realtime_frame                                            */
 /*  设置长度、帧标志, 推入 TCP 发送队列.                                   */
+/*  reset_flag 固定 0: 这是数据帧, 发送失败只该断链重连, 不该整机复位 ——   */
+/*  原来传的是 20+port*6, 一次发送失败就把"链路抖一下"升级成整机复位,      */
+/*  见 client.c 里 client_add_to_tcp_send_buf() 的 reset_flag 取值约定.     */
 /*======================================================================*/
-static void uart_flush_realtime_frame(uint8_t port_idx, uint16_t len,
-                                      uint8_t reset_flag)
+static void uart_flush_realtime_frame(uint8_t port_idx, uint16_t len)
 {
     *((uint16_t *)&SerialDataBuf[port_idx][5]) = (uint16_t)(len + 4U);
     SerialDataBuf[port_idx][3] =
         (BoardCfgTab[port_idx].PortType == UART_PORT_CUSTOM) ? 0x01 : 0x00;
     client_add_to_tcp_send_buf(&SerialDataBuf[port_idx][0],
-                               (uint16_t)(len + 11U), reset_flag, port_idx);
+                               (uint16_t)(len + 11U), 0U, port_idx);
 }
 
 
@@ -1697,7 +1851,7 @@ static void uart_axle_counter_upload_pulse(uint8_t port_idx, uint8_t module_idx,
         frame[9]  = (uint8_t)((link_mask >> 16) & 0xFFU);
         frame[10] = (uint8_t)((link_mask >> 24) & 0xFFU);
 
-        client_add_curve_to_tcp_send_buf(frame, off, 20U + port_idx * 6U);
+        client_add_curve_to_tcp_send_buf(frame, off, 0U);   /* 曲线帧不复位 */
     }
 }
 
@@ -1732,6 +1886,8 @@ static void uart_axle_counter_online(UART_PortRuntime_t *runtime,
     rt_bytes = profile->realtime_bytes;
 
     runtime->module_error[module_idx] = 0;
+    runtime->module_offline[module_idx] = 0;                 /* 恢复在线: 清粘性离线标志 */
+    runtime->module_last_ok_ms[module_idx] = HAL_GetTick();  /* 刷新离线判决的时间基准 */
     runtime->link_mask |= (1UL << module_idx);
 
     /* ---- 提取实时数据 rt_bytes 字节 (resp[2] = 跳过 addr+func, 无byte_count) ---- */
@@ -1822,7 +1978,7 @@ static void uart_axle_counter_online(UART_PortRuntime_t *runtime,
 
 /*======================================================================*/
 /*  uart_axle_counter_offline                                           */
-/*  计轴模块离线处理: SDRAM 填充 0xFFFF, 累计错误计数                    */
+/*  计轴模块离线处理: SDRAM 填充 0xFFFF, 离线判决见 uart_module_check_offline */
 /*======================================================================*/
 static void uart_axle_counter_offline(UART_PortRuntime_t *runtime,
                                       uint8_t module_idx,
@@ -1832,11 +1988,7 @@ static void uart_axle_counter_offline(UART_PortRuntime_t *runtime,
     uint16_t i;
     uint16_t rt_regs = profile->realtime_bytes / 2U;
 
-    if (runtime->module_error[module_idx] > 3U) {
-        runtime->link_mask &= ~(1UL << module_idx);
-    } else {
-        runtime->module_error[module_idx]++;
-    }
+    (void)uart_module_check_offline(runtime, module_idx);
 
     /* 填充 0xFFFF (离线标志), 按本模块实时寄存器个数 (普通10reg/高频28reg) */
     for (i = 0; i < rt_regs; i++) {
@@ -1872,7 +2024,8 @@ static void uart_process_axle_counter(UART_PortRuntime_t *runtime)
         module_count = UART_MODULE_MAX_COUNT;
     }
 
-    runtime->link_mask = 0;
+    /* 乐观初值 = 全在线 - 已判离线的位 (见 uart_round_initial_link_mask) */
+    runtime->link_mask = uart_round_initial_link_mask(runtime);
     runtime->data_len  = 0;
 
     for (m = 0; m < module_count; m++) {
@@ -2057,8 +2210,7 @@ static void uart_dc3wire_upload_curve(uint8_t port_idx, uint8_t module_idx,
         *((uint32_t *)&frame[7]) = link_mask;
 
         f_len = (uint16_t)(pkt_offset + 11U);
-        client_add_curve_to_tcp_send_buf(frame, f_len,
-                                         20U + port_idx * 6U);
+        client_add_curve_to_tcp_send_buf(frame, f_len, 0U);  /* 曲线帧不复位 */
     }
 }
 
@@ -2081,6 +2233,8 @@ static void uart_dc3wire_online(UART_PortRuntime_t *runtime,
     uint16_t kgl_val;
 
     runtime->module_error[module_idx] = 0;
+    runtime->module_offline[module_idx] = 0;                 /* 恢复在线: 清粘性离线标志 */
+    runtime->module_last_ok_ms[module_idx] = HAL_GetTick();  /* 刷新离线判决的时间基准 */
     runtime->link_mask |= (1UL << module_idx);
 
     /* 提取实时数据 24 字节 (resp[2] = 跳过 addr+func, 无 byte_count) */
@@ -2125,18 +2279,14 @@ static void uart_dc3wire_online(UART_PortRuntime_t *runtime,
 
 /*======================================================================*/
 /*  uart_dc3wire_offline                                                  */
-/*  离线处理: SDRAM 填充 0xFFFF, 累计错误计数                             */
+/*  离线处理: SDRAM 填充 0xFFFF, 离线判决见 uart_module_check_offline      */
 /*======================================================================*/
 static void uart_dc3wire_offline(UART_PortRuntime_t *runtime,
                                   uint8_t module_idx, uint16_t *dc_offset)
 {
     uint16_t i;
 
-    if (runtime->module_error[module_idx] > 3U) {
-        runtime->link_mask &= ~(1UL << module_idx);
-    } else {
-        runtime->module_error[module_idx]++;
-    }
+    (void)uart_module_check_offline(runtime, module_idx);
 
     for (i = 0; i < DC3WIRE_REALTIME_REGS; i++) {
         runtime->ssz_buf[*dc_offset + i] = 0xFFFFU;
@@ -2166,7 +2316,8 @@ static void uart_process_dc3wire(UART_PortRuntime_t *runtime)
         module_count = UART_MODULE_MAX_COUNT;
     }
 
-    runtime->link_mask = 0;
+    /* 乐观初值 = 全在线 - 已判离线的位 (见 uart_round_initial_link_mask) */
+    runtime->link_mask = uart_round_initial_link_mask(runtime);
     runtime->data_len  = 0;
 
     for (m = 0; m < module_count; m++) {

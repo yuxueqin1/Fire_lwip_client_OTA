@@ -43,7 +43,15 @@ extern uint8_t g_rs485_7_io_break;       /* 断接开关状态 (仅主机有效)
 extern uint8_t g_rs485_7_work_light;     /* 工作灯状态 (仅主机有效)     */
 extern uint8_t g_rs485_7_buzzer;         /* 蜂鸣器状态 (仅主机有效)     */
 extern uint8_t g_rs485_7_alarm_light;    /* 报警灯状态 (仅主机有效)     */
-extern uint8_t g_rs485_7_slave_present;  /* 1=已确认从机通信板在线 (现场诊断用) */
+
+/* ---- 状态日志 UDP 上报开关 (主/从机模式都有效, 运行期可改) ----
+ * 1 = 把串口7全部状态以变长帧发到 192.168.1.88:50000
+ *     (主机: 每写完IO模块DO后; 从机: 按 500ms 限流)
+ *     ⚠ 默认还叠了一层"只在报警时才发"的门槛, 见 task_rs485_7.c 里的
+ *       DBG_LOG_ALARM_ONLY —— 常态静默, 便于抓偶发瞬态报警。
+ * 0 = 关闭 (不建 socket, 不发包)
+ * 上电默认 1. */
+extern volatile uint8_t g_rs485_7_log_udp_enable;
 
 /* ---- 函数声明 ---- */
 void rs485_7_task_create(void);

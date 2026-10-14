@@ -80,6 +80,20 @@ uint32_t          Systemtime = 0;
  * 即旧实现会把残字节当应答首字节、导致整帧前移一字节而 CRC 失败的场景. */
 volatile uint16_t uart_custom_flush_cnt[UART_PORT_COUNT] = {0};
 
+/* ---- 诊断计数器: 本轮【实际发起过请求】的模块数 (每端口一个) ----
+ * 由 uart_module_should_poll() 维护 (它在四个端口处理器的轮询循环里,
+ * 每模块每轮恰好被调用一次), 串口7的 UDP 状态日志每轮读走.
+ *
+ * 为什么要它: 已发布的 link_mask 为 0 有两种完全不同的成因 ——
+ *   本轮请求都发出去了、但没有一台应答   → 真故障 (总线/盒子/干扰)
+ *   本轮压根没发请求 (全部模块处于"连续失败 ≥3 次后的跳过态") → 粘住,
+ *                                        连总线都没碰, 每 10 轮才探一次
+ * 光看 link_mask 分不出这两种, 必须知道"这一轮到底问了几台":
+ *   polled_cnt == 0 且 link_mask == 0  →  整路处于跳过态 (不是新故障)
+ *   polled_cnt > 0  且 link_mask == 0  →  问了 N 台一台都没答 (真故障)
+ * 等于"该端口 SlaveModuelNum"时说明本轮全量轮询, 没有模块被跳过. */
+volatile uint8_t  uart_polled_cnt[UART_PORT_COUNT] = {0};
+
 /* ---- 诊断计数器: 接收侧丢字节定位 (2026-09-28, 由 mbportserial.c 的 ISR 自增) ----
  * 现场已证实: 盒子回的 143B 帧在线上完整且 CRC 自洽, 主站只拿到 142B 且切帧后
  * 再等 300ms 也无字节到达 → 末字节丢在主站侧. 这三个计数器把"丢在哪一环"分开:
@@ -1293,15 +1307,10 @@ void uart_handle_curve_end_frame(uint8_t port_idx, uint8_t module_idx,
 
             /* 计算总帧长并推入 TCP 发送队列 */
             frame_len = final_weibo + 19U;
-            /*
-             * reset_flag = 3 + n*2:
-             *   曲线上传失败时, 看门狗复位码根据分支号变化.
-             *   AC_ZZJ 有 4 分支 → 复位码 3/5/7/9
-             *   DC_ZZJ4 有 1 分支 → 复位码 3
-             *   DC_ZZJ6 有 2 分支 → 复位码 3/5
-             */
-            client_add_curve_to_tcp_send_buf(&ser_buf[0], frame_len,
-                                             3U + (uint8_t)(n * 2U));
+            /* reset_flag = 0: 曲线帧是数据帧, 发送失败只该断链重连, 不该整机
+             * 复位 (原来是 3 + n*2 的分支号, 一次发送失败就复位, 见 client.c
+             * 里 client_add_to_tcp_send_buf() 的 reset_flag 取值约定). */
+            client_add_curve_to_tcp_send_buf(&ser_buf[0], frame_len, 0U);
         }
 
         /* 标记曲线上传完成, 触发日志上报 (由 checkSendLog 处理) */

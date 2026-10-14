@@ -87,4 +87,22 @@ void ota_task_wdt_progress(void);
 /* 给 main.c 的 App_TaskStart 判超时用: 1 = OTA 任务卡死, 应停止喂狗等复位 */
 uint8_t ota_task_wdt_timed_out(void);
 
+
+/* ==================================================================
+ *  诊断接口 (v42 临时加, 只为抓"复位码 31"的成因, 只读)
+ *
+ *  配合 ota_client_stage() 一起看:
+ *    report_cnt 不涨 + stage 停在 OTA_STAGE_LOOP   ⇒ 任务被饿死(排不上 CPU)
+ *    report_cnt 不涨 + stage 停在某个具体调用     ⇒ 任务卡在那个调用里
+ * ================================================================== */
+
+/* 累计上报次数(kick/busy/progress 都算), 只增不减 */
+uint32_t ota_task_wdt_report_cnt(void);
+
+/* 距"判卡死"还剩 ms: >0 还来得及; <=0 已判超时 */
+int32_t ota_task_wdt_left_ms(void);
+
+/* 1 = OTA 任务已经接管(arm 过了), 0 = 还没(此时 left 无意义) */
+uint8_t ota_task_wdt_armed(void);
+
 #endif /* __OTA_WDT_H */
